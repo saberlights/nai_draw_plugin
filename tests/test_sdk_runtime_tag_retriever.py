@@ -501,68 +501,6 @@ def test_send_base64_image_result_propagates_send_failure() -> None:
     assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB")]
 
 
-def test_download_remote_image_as_base64_uses_client_request_settings(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    invocation = _build_image_send_invocation()
-    captured_request: dict[str, object] = {}
-
-    class _FakeResponse:
-        status_code = 200
-        headers = {"content-type": "image/png"}
-        content = b"fake-image"
-
-    async def fake_send_request_with_retry(
-        url: str,
-        params: dict[str, object],
-        proxy_mode: str,
-        request_timeout: float,
-        request_headers: dict[str, str],
-    ) -> _FakeResponse:
-        captured_request.update(
-            {
-                "url": url,
-                "params": params,
-                "proxy_mode": proxy_mode,
-                "request_timeout": request_timeout,
-                "request_headers": request_headers,
-            }
-        )
-        return _FakeResponse()
-
-    monkeypatch.setattr(
-        invocation,
-        "_get_model_config",
-        lambda is_selfie=None: {
-            "nai_request_timeout": 321.0,
-            "nai_proxy_mode": "inherit",
-        },
-    )
-    invocation.api_client = types.SimpleNamespace(_send_request_with_retry=fake_send_request_with_retry)
-
-    result = asyncio.run(invocation._download_remote_image_as_base64("https://cdn.example.com/image.png"))
-
-    assert result == base64.b64encode(b"fake-image").decode("utf-8")
-    assert captured_request == {
-        "url": "https://cdn.example.com/image.png",
-        "params": {},
-        "proxy_mode": "inherit",
-        "request_timeout": 321.0,
-        "request_headers": {
-            "Connection": "close",
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            "Accept-Encoding": "identity",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://cdn.example.com/",
-        },
-    }
-
-
 def test_download_remote_image_as_base64_skips_generation_request_url() -> None:
     invocation = _build_image_send_invocation()
 

@@ -112,6 +112,7 @@ def _build_invocation(*, stream_id: str = "test-stream") -> NaiInvocation:
     invocation.stream_id = stream_id
     invocation.user_id = "user-1"
     invocation.log_prefix = "test"
+    invocation._cached_action_trigger_assessment = None
     return invocation
 
 
@@ -247,7 +248,7 @@ def test_guard_interval_block_after_recent_send(monkeypatch: pytest.MonkeyPatch)
 
     assert result["category"] == "explicit"
     assert result["should_generate"] is False
-    assert "等待" in result["detail"]
+    assert "节流" in result["detail"]
 
 
 # ==================== _fetch_last_user_text ====================
@@ -364,7 +365,7 @@ def test_auto_draw_blocked_when_explicit_recent(monkeypatch: pytest.MonkeyPatch)
 
     can_send, detail = invocation._check_action_image_interval("auto_draw")
     assert can_send is False
-    assert "等待" in detail
+    assert "节流" in detail
 
 
 def test_auto_draw_does_not_block_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
