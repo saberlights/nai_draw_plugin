@@ -38,13 +38,22 @@ EXPLICIT_IMAGE_REQUEST_KEYWORDS = [
 ]
 
 # 用户原话明确不要图/不要画。命中直接拦截（防止 Planner 偶发误调用）。
-NEGATIVE_IMAGE_INTENT_KEYWORDS = [
+# 拆两档：
+#   strong - 明显拒绝出图的指令，命中即永久拦截（无时效），无视消息距今多久。
+#   weak   - "用文字"这种弱化偏好，stale 后不再生效；仅在用户上一条很近时才阻止。
+NEGATIVE_IMAGE_INTENT_KEYWORDS_STRONG = [
     "不要画", "不用画", "别画", "别画图", "不画了",
     "不要图", "不用图", "别发图", "不要发图", "别配图", "不用配图",
     "别给我画", "别给我发", "不要给我画", "不要给我发",
     "不用给我画", "不用给我发",
+]
+
+NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK = [
     "文字就行", "文字回复就行", "文字说就行", "用文字",
 ]
+
+# 兼容旧引用：合并视图，仅供仍按"硬拦截"语义读取的旧代码使用。
+NEGATIVE_IMAGE_INTENT_KEYWORDS = NEGATIVE_IMAGE_INTENT_KEYWORDS_STRONG + NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK
 
 
 # ==================== 触发关键词 ====================
@@ -352,8 +361,29 @@ def detect_explicit_image_request(text: str) -> bool:
 
 
 def detect_negative_image_intent(text: str) -> bool:
-    """判断用户原话是否明确拒绝出图。命中即直接拦截，防止 Planner 偶发误调用。"""
+    """判断用户原话是否明确拒绝出图（strong + weak 合并视图）。
+
+    保留以兼容旧调用方；新代码请用 ``detect_negative_image_intent_strength``
+    拿到具体档位，按 stale 与否做差异化拦截。
+    """
     if not text:
         return False
     lowered = text.lower()
     return any(keyword.lower() in lowered for keyword in NEGATIVE_IMAGE_INTENT_KEYWORDS)
+
+
+def detect_negative_image_intent_strength(text: str) -> str:
+    """返回否定强度：``"strong"`` / ``"weak"`` / ``""``。
+
+    - strong：明确拒绝出图（"不要画" / "别画"），命中应永久拦截
+    - weak：偏好文字回复（"用文字" / "文字就行"），拦截前再做 stale 判定
+    - 空串：无否定信号
+    """
+    if not text:
+        return ""
+    lowered = text.lower()
+    if any(keyword.lower() in lowered for keyword in NEGATIVE_IMAGE_INTENT_KEYWORDS_STRONG):
+        return "strong"
+    if any(keyword.lower() in lowered for keyword in NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK):
+        return "weak"
+    return ""

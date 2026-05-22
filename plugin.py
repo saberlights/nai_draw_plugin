@@ -6,12 +6,18 @@ import inspect
 import os
 import tomllib
 
+import tomlkit
+
 from maibot_sdk import Action, Command, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ActivationType, HookMode
 
 from src.core.config_types import ConfigField
 
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
+from .core.rules.reply_auto_draw import (
+    compose_description_from_reply,
+    score_reply_for_auto_draw,
+)
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -34,6 +40,179 @@ def _merge_config_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[
     return merged
 
 
+_CONFIG_VALUE_MISSING = object()
+
+
+def _resolve_existing_config_value(
+    existing_doc: Any,
+    section: str,
+    field: str,
+    default: Any,
+) -> Any:
+    """读 existing_doc 里的字段值，缺则用 default。
+
+    existing_doc 可能是 tomlkit 的 Document/Table，也可能是普通 dict；都用 ``get``
+    访问。tomlkit 包装过的值通过 ``unwrap()`` 还原成 Python 原生类型，避免重写时
+    把内部对象写进新文档。
+    """
+    if existing_doc is None:
+        return default
+    section_value: Any
+    try:
+        section_value = existing_doc.get(section, _CONFIG_VALUE_MISSING)
+    except Exception:
+        return default
+    if section_value is _CONFIG_VALUE_MISSING:
+        return default
+    try:
+        raw = section_value.get(field, _CONFIG_VALUE_MISSING)
+    except Exception:
+        return default
+    if raw is _CONFIG_VALUE_MISSING:
+        return default
+    return raw.unwrap() if hasattr(raw, "unwrap") else raw
+
+
+def _dump_scalar_kv(key: str, value: Any) -> str:
+    """用 tomlkit 序列化单个 key=value 行，确保字符串转义、数字格式等正确。"""
+    import tomlkit as _tomlkit
+    try:
+        snippet = _tomlkit.dumps({key: value}).rstrip("\n")
+    except Exception:
+        # 兜底：value 不被 tomlkit 接受时，转字符串重试
+        snippet = _tomlkit.dumps({key: str(value)}).rstrip("\n")
+    return snippet
+
+
+def _is_array_of_tables(value: Any) -> bool:
+    """判断 list 是否为'数组表'（list of dict）形态，需要渲染成 [[..]] 块。"""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(isinstance(item, dict) for item in value)
+    )
+
+
+def _render_subtable(qualified_name: str, value: dict[str, Any]) -> str:
+    """渲染 [section.sub] 子表。嵌套 dict 递归处理，scalar 先输出。"""
+    if not isinstance(value, dict):
+        return ""
+    lines: list[str] = [f"[{qualified_name}]"]
+    scalar_items: list[tuple[str, Any]] = []
+    nested_dicts: list[tuple[str, dict]] = []
+    nested_aots: list[tuple[str, list]] = []
+    for k, v in value.items():
+        if isinstance(v, dict):
+            nested_dicts.append((k, v))
+        elif _is_array_of_tables(v):
+            nested_aots.append((k, v))
+        else:
+            scalar_items.append((k, v))
+    for k, v in scalar_items:
+        lines.append(_dump_scalar_kv(k, v))
+    for k, v in nested_dicts:
+        lines.append("")
+        lines.append(_render_subtable(f"{qualified_name}.{k}", v))
+    for k, v in nested_aots:
+        lines.append("")
+        lines.append(_render_array_of_tables(f"{qualified_name}.{k}", v))
+    return "\n".join(lines)
+
+
+def _render_array_of_tables(qualified_name: str, items: list[Any]) -> str:
+    """渲染 [[section.field]] 数组表。每个元素是 dict。"""
+    blocks: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        block_lines: list[str] = [f"[[{qualified_name}]]"]
+        for k, v in item.items():
+            if isinstance(v, dict):
+                block_lines.append("")
+                block_lines.append(_render_subtable(f"{qualified_name}.{k}", v))
+            elif _is_array_of_tables(v):
+                block_lines.append("")
+                block_lines.append(_render_array_of_tables(f"{qualified_name}.{k}", v))
+            else:
+                block_lines.append(_dump_scalar_kv(k, v))
+        blocks.append("\n".join(block_lines))
+    return "\n\n".join(blocks)
+
+
+def _render_section_with_comments(
+    *,
+    section_name: str,
+    fields: dict[str, Any],
+    section_desc: Any,
+    existing_doc: Any,
+) -> str:
+    """按 schema 顺序渲染一个 section：scalar 字段优先（带注释），dict / 数组表在末尾。"""
+    lines: list[str] = []
+    section_desc_text = section_desc.strip() if isinstance(section_desc, str) else ""
+    if section_desc_text:
+        lines.append(f"# {section_desc_text}")
+    lines.append(f"[{section_name}]")
+
+    scalar_fields: list[tuple[str, ConfigField, Any]] = []
+    dict_fields: list[tuple[str, ConfigField, dict]] = []
+    aot_fields: list[tuple[str, ConfigField, list]] = []
+
+    for field_name, field_def in fields.items():
+        if not isinstance(field_def, ConfigField):
+            continue
+        value = _resolve_existing_config_value(
+            existing_doc, section_name, field_name, field_def.default
+        )
+        if isinstance(value, dict):
+            dict_fields.append((field_name, field_def, value))
+        elif _is_array_of_tables(value):
+            aot_fields.append((field_name, field_def, value))
+        else:
+            scalar_fields.append((field_name, field_def, value))
+
+    for fname, fdef, fvalue in scalar_fields:
+        desc = (fdef.description or "").strip()
+        if desc:
+            lines.append(f"# {desc}")
+        lines.append(_dump_scalar_kv(fname, fvalue))
+
+    for fname, fdef, fvalue in dict_fields:
+        desc = (fdef.description or "").strip()
+        lines.append("")
+        if desc:
+            lines.append(f"# {desc}")
+        lines.append(_render_subtable(f"{section_name}.{fname}", fvalue))
+
+    for fname, fdef, fvalue in aot_fields:
+        desc = (fdef.description or "").strip()
+        lines.append("")
+        if desc:
+            lines.append(f"# {desc}")
+        lines.append(_render_array_of_tables(f"{section_name}.{fname}", fvalue))
+
+    return "\n".join(lines)
+
+
+def _format_comment_block(text: str) -> str:
+    """把一段可能多行的字符串渲染成 ``# ...`` 注释块；空行渲染为单独的 ``#``。
+
+    传入文本里以 ``#`` 开头的行原样保留（允许在 group header 里手写 ``# ----- xxx -----``
+    这种已经带 ``#`` 的样式，但当前调用方都没这么写）。
+    """
+    if not isinstance(text, str):
+        return ""
+    rendered: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.rstrip()
+        if not stripped:
+            rendered.append("#")
+        elif stripped.lstrip().startswith("#"):
+            rendered.append(stripped)
+        else:
+            rendered.append(f"# {stripped}")
+    return "\n".join(rendered)
+
+
 def _load_online_retriever_api() -> tuple[Any, Any] | None:
     """按需加载在线检索器，避免本地模式在缺依赖时阻塞插件注册。"""
     try:
@@ -49,34 +228,78 @@ class NaiPicPlugin(MaiBotPlugin):
     # 插件基本信息
     plugin_name = "nai_draw_plugin"
     plugin_version = "1.2.1"
-    plugin_author = "Rabbit"
+    plugin_author = "saberlight"
     enable_plugin = True
     dependencies: List[str] = []
     python_dependencies: List[str] = ["httpx", "requests"]
     config_file_name = "config.toml"
 
-    # 配置节描述
-    config_section_descriptions = {
-        "plugin": "插件基本配置",
-        "model": "NovelAI Web 请求连接与默认模型配置",
-        "prompt_generator": "提示词生成配置（/nai）",
-        "prompt_generator.custom_model": "提示词生成自定义模型配置",
-        "random_scene": "随机场景生成配置（/nai 随机）",
-        "random_scene.custom_model": "随机场景生成自定义模型配置",
-        "tagger": "图片打标配置（/打标）",
-        "tagger.custom_model": "图片打标自定义模型配置",
-        "components": "组件配置",
-        "prompt_show": "提示词显示配置",
-        "nsfw_filter": "NSFW 内容过滤配置",
-        "auto_recall": "自动撤回配置",
-        "action_guard": "自动出图触发保护配置",
-        "admin": "管理员权限配置",
-        "tag_retriever": "Danbooru Tag 检索增强配置",
-        "custom_prompt": "自定义系统提示词配置",
-        "model_nai4_5": "NovelAI V4.5 模型专用配置（nai-diffusion-4-5-full 等最新模型）",
-        "model_nai4": "NovelAI V4 模型专用配置（nai-diffusion-4-curated、nai-diffusion-4-full 等）",
-        "model_nai3": "NovelAI V3 模型专用配置（nai-diffusion-3 和 nai-diffusion-3-furry）",
+    # 配置文件顶部说明，渲染时挂在所有 section 之前（写 config.toml 时按行加 # 前缀）。
+    config_file_header = (
+        "nai_draw_plugin - 配置文件\n"
+        "与 nai_pic_plugin 共享同一套业务逻辑，底层请求改为 NewAPI 兼容 OpenAI 协议\n"
+        "（POST /v1/chat/completions，绘图参数以 JSON 字符串塞入 messages[0].content）。\n"
+        "支持 NAI 格式提示词（大括号权重），仅支持文生图。\n"
+        "\n"
+        "建议按这个顺序改：\n"
+        "1. [plugin] 是否启用插件\n"
+        "2. [model] NewAPI 地址 / 密钥 / 默认生图模型\n"
+        "3. [prompt_generator] 提示词生成模型\n"
+        "4. [model_nai4_5] 当前默认模型（V4.5）的专属参数\n"
+        "5. 其他功能按需开启"
+    )
+
+    # section 渲染顺序；schema 字典本身的顺序与历史代码相关，渲染另走这套清单，
+    # 保证配置文件读起来从'要先改的'到'通常不动的'。未列出的 section 走 schema 字典原顺序。
+    config_section_order = [
+        "plugin",
+        "model",
+        "prompt_generator",
+        "action_guard",
+        "auto_draw_on_reply",
+        "random_scene",
+        "tagger",
+        "components",
+        "prompt_show",
+        "nsfw_filter",
+        "auto_recall",
+        "admin",
+        "tag_retriever",
+        "custom_prompt",
+        "model_nai4_5",
+        "model_nai4",
+        "model_nai3",
+    ]
+
+    # 大段分隔符；key 是 section 名，value 是渲染在该 section 之前的多行注释块
+    # （每行自动加 # 前缀，空行渲染为 #）。仅在该 section 处开启一个新组，组内
+    # 其它 section 直接跟在后面，不再插入分隔符。
+    config_section_group_headers = {
+        "plugin": "========== 基础开关 ==========",
+        "model": "========== NewAPI 兼容网关连接与默认模型 ==========",
+        "prompt_generator": "========== 提示词生成（/nai） ==========",
+        "action_guard": "========== 自动出图触发保护 ==========",
+        "random_scene": "========== 随机场景生成（/nai 随机） ==========\n未配置的项会回退到 [prompt_generator]",
+        "tagger": "========== 图片打标（/打标） ==========\n用法：引用回复一张图片，然后发送 /打标",
+        "components": "========== 功能开关 ==========",
+        "custom_prompt": (
+            "========== 自定义系统提示词 ==========\n"
+            "这段通常不需要频繁修改；保留在文件末尾，避免影响日常配置体验。"
+        ),
+        "model_nai4_5": (
+            "========== 生图模型专属配置 ==========\n"
+            "下面三段会按当前模型自动选用。\n"
+            "你当前默认模型是 V4.5，所以优先看 [model_nai4_5]。\n"
+            "\n"
+            "----- NAI V4.5（当前默认模型） -----"
+        ),
+        "model_nai4": "----- NAI V4 -----",
+        "model_nai3": "----- NAI V3 / V3 Furry -----",
     }
+
+    # 配置节描述（兼容老逻辑用，新渲染不会再把它单独输出为 section 上方注释；
+    # 仅为 schema 内联 dict 字段做兜底，避免删后老代码崩）。
+    config_section_descriptions: dict[str, str] = {}
 
     # 配置Schema
     config_schema = {
@@ -84,12 +307,12 @@ class NaiPicPlugin(MaiBotPlugin):
             "name": ConfigField(
                 type=str,
                 default="nai_draw_plugin",
-                description="NovelAI Web 图片生成插件",
+                description="插件标识，通常不需要修改",
                 required=True
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.3.0",
+                default="1.4.0",
                 description="插件配置版本号"
             ),
             "enabled": ConfigField(
@@ -102,18 +325,18 @@ class NaiPicPlugin(MaiBotPlugin):
             "name": ConfigField(
                 type=str,
                 default="NovelAI NewAPI Gateway",
-                description="模型显示名称"
+                description="模型显示名称，仅用于展示"
             ),
             "base_url": ConfigField(
                 type=str,
                 default="https://api.tuercha.com",
-                description="NewAPI 兼容网关基础地址",
+                description="NewAPI 兼容网关基础地址（必填，由服务提供方给出）",
                 required=True
             ),
             "api_key": ConfigField(
                 type=str,
                 default="",
-                description="NewAPI 鉴权密钥（OpenAI 风格 Bearer Token）",
+                description="NewAPI 鉴权密钥（OpenAI 风格 Bearer Token，由服务提供方给出）",
                 required=False
             ),
             "available_models": ConfigField(
@@ -131,27 +354,27 @@ class NaiPicPlugin(MaiBotPlugin):
             "default_model": ConfigField(
                 type=str,
                 default="nai-diffusion-4-5-full",
-                description="当前使用的模型名称（从 available_models 中选择）"
+                description="当前默认使用的生图模型（从 available_models 中选择）"
             ),
             "nai_endpoint": ConfigField(
                 type=str,
                 default="/v1/chat/completions",
-                description="NewAPI 兼容生图端点路径"
+                description="生图端点路径（NewAPI 走 OpenAI 兼容 chat/completions）"
             ),
             "nai_request_timeout": ConfigField(
                 type=float,
                 default=600.0,
-                description="NewAPI 生图请求超时（秒）"
+                description="生图请求超时（秒）"
             ),
             "nai_proxy_mode": ConfigField(
                 type=str,
                 default="auto",
-                description="插件代理模式：auto=先继承环境代理，代理失败后回退直连；inherit=始终继承环境代理；direct=始终直连"
+                description="代理模式：auto=先继承环境代理，失败时回退直连；inherit=始终继承；direct=始终直连"
             ),
             "nai_max_tokens": ConfigField(
                 type=int,
                 default=100000,
-                description="单次绘图允许消耗的 token 预算（1 Anlas = 10000 tokens，推荐 100000=10 Anlas）"
+                description="单次绘图允许消耗的 token 预算（1 Anlas = 10000 tokens，推荐 100000=10 Anlas，超出会被网关拒绝）"
             ),
         },
         "model_nai3": {
@@ -161,87 +384,87 @@ class NaiPicPlugin(MaiBotPlugin):
                     {"name": "示例风格1", "prompt": "artist:example1, artist:example2, year 2023"},
                     {"name": "示例风格2", "prompt": "artist:example3, artist:example4, year 2024"}
                 ],
-                description="NAI V3 画师风格预设列表（可配置多个），每个预设包含 name（显示名称）、prompt（画师串内容），可选填写 negative_prompt_add（该预设专属负面提示词）"
+                description="画师预设；结构同 model_nai4_5.artist_presets"
             ),
             "default_artist_preset": ConfigField(
                 type=str,
                 default="",
-                description="NAI V3 默认画师风格预设，支持填写预设名称或序号；留空时默认使用第一个预设"
+                description="作用同 model_nai4_5.default_artist_preset"
             ),
             "nai_artist_prompt": ConfigField(
                 type=str,
                 default="",
-                description="NAI V3 专用画师风格提示词（可选，优先级低于 artist_presets）"
+                description="作用同 model_nai4_5.nai_artist_prompt"
             ),
             "nai_size": ConfigField(
                 type=str,
-                default="竖图",
-                description="NAI V3 专用图片尺寸"
+                default="832x1216",
+                description="作用同 model_nai4_5.nai_size（V3 默认尺寸）"
             ),
             "sampler": ConfigField(
                 type=str,
                 default="k_euler_ancestral",
-                description="NAI V3 专用采样器"
+                description="作用同 model_nai4_5.sampler"
             ),
             "num_inference_steps": ConfigField(
                 type=int,
-                default=28,
-                description="NAI V3 专用推理步数"
+                default=25,
+                description="作用同 model_nai4_5.num_inference_steps"
             ),
             "guidance_scale": ConfigField(
                 type=float,
-                default=5.0,
-                description="NAI V3 专用指导强度"
+                default=3.5,
+                description="作用同 model_nai4_5.guidance_scale"
             ),
             "seed": ConfigField(
                 type=int,
                 default=-1,
-                description="NAI V3 专用随机种子；小于 0 时每次随机"
+                description="作用同 model_nai4_5.seed"
             ),
             "quality_toggle": ConfigField(
                 type=bool,
                 default=True,
-                description="NAI V3 low-level qualityToggle"
+                description="作用同 model_nai4_5.quality_toggle"
             ),
             "auto_smea": ConfigField(
                 type=bool,
                 default=False,
-                description="NAI V3 low-level autoSmea"
+                description="作用同 model_nai4_5.auto_smea"
             ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
-                description="NAI V3 返回图片格式"
+                description="作用同 model_nai4_5.image_format"
             ),
             "default_size": ConfigField(
                 type=str,
-                default="1024x1280",
-                description="NAI V3 专用默认尺寸"
+                default="832x1216",
+                description="作用同 model_nai4_5.default_size"
             ),
             "custom_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V3 专用自动添加的提示词后缀"
+                description="作用同 model_nai4_5.custom_prompt_add"
             ),
             "negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V3 专用负面提示词"
+                description="作用同 model_nai4_5.negative_prompt_add"
             ),
             "selfie_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V3 专用自拍模式提示词"
+                description="作用同 model_nai4_5.selfie_prompt_add"
             ),
             "selfie_negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V3 专用自拍模式负面提示词，会追加到 negative_prompt_add 后面"
+                description="作用同 model_nai4_5.selfie_negative_prompt_add"
             ),
             "nai_extra_params": ConfigField(
                 type=dict,
                 default={},
-                description="NAI V3 low-level 原始 parameters 透传字段。可在此自定义任意底层参数；其中 width/height、steps、n_samples、qualityToggle 通常会影响点数，参考图相关字段可能也会影响点数。"
+                description="作用同 model_nai4_5.nai_extra_params"
             )
         },
         "model_nai4": {
@@ -251,87 +474,87 @@ class NaiPicPlugin(MaiBotPlugin):
                     {"name": "风格组合1", "prompt": "1.2::artist1::, 1.0::artist2::, 0.9::artist3::"},
                     {"name": "风格组合2", "prompt": "1.5::artist4::, 1.0::artist5::, 0.8::artist6::"}
                 ],
-                description="NAI V4 画师风格预设列表（可配置多个），每个预设包含 name（显示名称）、prompt（画师串内容），可选填写 negative_prompt_add（该预设专属负面提示词）"
+                description="画师预设；结构同 model_nai4_5.artist_presets"
             ),
             "default_artist_preset": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4 默认画师风格预设，支持填写预设名称或序号；留空时默认使用第一个预设"
+                description="作用同 model_nai4_5.default_artist_preset"
             ),
             "nai_artist_prompt": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4 专用画师风格提示词（可选，优先级低于 artist_presets）"
+                description="作用同 model_nai4_5.nai_artist_prompt"
             ),
             "nai_size": ConfigField(
                 type=str,
                 default="竖图",
-                description="NAI V4 专用图片尺寸"
+                description="作用同 model_nai4_5.nai_size"
             ),
             "sampler": ConfigField(
                 type=str,
                 default="k_euler_ancestral",
-                description="NAI V4 专用采样器"
+                description="作用同 model_nai4_5.sampler"
             ),
             "num_inference_steps": ConfigField(
                 type=int,
                 default=28,
-                description="NAI V4 专用推理步数"
+                description="作用同 model_nai4_5.num_inference_steps"
             ),
             "guidance_scale": ConfigField(
                 type=float,
                 default=5.0,
-                description="NAI V4 专用指导强度"
+                description="作用同 model_nai4_5.guidance_scale"
             ),
             "seed": ConfigField(
                 type=int,
                 default=-1,
-                description="NAI V4 专用随机种子；小于 0 时每次随机"
+                description="作用同 model_nai4_5.seed"
             ),
             "quality_toggle": ConfigField(
                 type=bool,
                 default=True,
-                description="NAI V4 low-level qualityToggle"
+                description="作用同 model_nai4_5.quality_toggle"
             ),
             "auto_smea": ConfigField(
                 type=bool,
                 default=False,
-                description="NAI V4 low-level autoSmea"
+                description="作用同 model_nai4_5.auto_smea"
             ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
-                description="NAI V4 返回图片格式"
+                description="作用同 model_nai4_5.image_format"
             ),
             "default_size": ConfigField(
                 type=str,
                 default="1024x1280",
-                description="NAI V4 专用默认尺寸"
+                description="作用同 model_nai4_5.default_size"
             ),
             "custom_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4 专用自动添加的提示词后缀"
+                description="作用同 model_nai4_5.custom_prompt_add"
             ),
             "negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4 专用负面提示词"
+                description="作用同 model_nai4_5.negative_prompt_add"
             ),
             "selfie_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4 专用自拍模式提示词"
+                description="作用同 model_nai4_5.selfie_prompt_add"
             ),
             "selfie_negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4 专用自拍模式负面提示词，会追加到 negative_prompt_add 后面"
+                description="作用同 model_nai4_5.selfie_negative_prompt_add"
             ),
             "nai_extra_params": ConfigField(
                 type=dict,
                 default={},
-                description="NAI V4 low-level 原始 parameters 透传字段。可在此自定义任意底层参数；其中 width/height、steps、n_samples、qualityToggle 通常会影响点数，参考图相关字段可能也会影响点数。"
+                description="作用同 model_nai4_5.nai_extra_params"
             )
         },
         "model_nai4_5": {
@@ -341,87 +564,87 @@ class NaiPicPlugin(MaiBotPlugin):
                     {"name": "风格示例1", "prompt": "1.2::artist:example1::, 1.0::artist:example2::, 0.8::artist:example3::"},
                     {"name": "风格示例2", "prompt": "1.5::artist:example4::, 1.3::artist:example5::"}
                 ],
-                description="NAI V4.5 画师风格预设列表（可配置多个），每个预设包含 name（显示名称）、prompt（画师串内容），可选填写 negative_prompt_add（该预设专属负面提示词）"
+                description="画师预设；每条可填 name / prompt 和可选的 negative_prompt_add（留空则继承本段的 negative_prompt_add）"
             ),
             "default_artist_preset": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4.5 默认画师风格预设，支持填写预设名称或序号；留空时默认使用第一个预设"
+                description="默认画师预设：可填名称，也可填序号；留空时使用第一个预设"
             ),
             "nai_artist_prompt": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4.5 专用画师风格提示词（可选，优先级低于 artist_presets）"
+                description="直接写死的画师串；只有不用 artist_presets 时才建议改这里"
             ),
             "nai_size": ConfigField(
                 type=str,
                 default="竖图",
-                description="NAI V4.5 专用图片尺寸"
+                description="图片尺寸：竖图 / 横图 / 方图（v/h/s），或直接写 832x1216 / 1024x1024 这种"
             ),
             "sampler": ConfigField(
                 type=str,
                 default="k_euler_ancestral",
-                description="NAI V4.5 专用采样器"
+                description="采样器；当前仓库只确认 k_euler / k_euler_ancestral"
             ),
             "num_inference_steps": ConfigField(
                 type=int,
                 default=28,
-                description="NAI V4.5 专用推理步数"
+                description="去噪步数；越高一般细节越多，但也更慢、更容易加点数"
             ),
             "guidance_scale": ConfigField(
                 type=float,
                 default=5.0,
-                description="NAI V4.5 专用指导强度"
+                description="提示词跟随强度；越高越听 prompt，也越容易僵硬"
             ),
             "seed": ConfigField(
                 type=int,
                 default=-1,
-                description="NAI V4.5 专用随机种子；小于 0 时每次随机"
+                description="随机种子；小于 0 表示每次随机"
             ),
             "quality_toggle": ConfigField(
                 type=bool,
                 default=True,
-                description="NAI V4.5 low-level qualityToggle"
+                description="更高质量路径；可能更慢、也更容易影响点数"
             ),
             "auto_smea": ConfigField(
                 type=bool,
                 default=False,
-                description="NAI V4.5 low-level autoSmea"
+                description="底层 SMEA 类增强"
             ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
-                description="NAI V4.5 返回图片格式"
+                description="返回图片格式；当前仓库只确认 png"
             ),
             "default_size": ConfigField(
                 type=str,
                 default="1024x1280",
-                description="NAI V4.5 专用默认尺寸"
+                description="当 nai_size 解析失败时的兜底尺寸"
             ),
             "custom_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4.5 专用自动添加的提示词后缀"
+                description="固定追加到正向提示词，影响整体画质词、风格词、通用修饰词"
             ),
             "negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4.5 专用负面提示词"
+                description="固定追加到负面提示词，主要用于压低坏手、多人乱入、水印等问题"
             ),
             "selfie_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4.5 专用自拍模式提示词"
+                description="自拍模式额外正向外貌词"
             ),
             "selfie_negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="NAI V4.5 专用自拍模式负面提示词，会追加到 negative_prompt_add 后面"
+                description="自拍模式额外负向外貌词，会追加到 negative_prompt_add 后面"
             ),
             "nai_extra_params": ConfigField(
                 type=dict,
                 default={},
-                description="NAI V4.5 low-level 原始 parameters 透传字段。可在此自定义任意底层参数；其中 width/height、steps、n_samples、qualityToggle 通常会影响点数，参考图相关字段可能也会影响点数。"
+                description="额外透传到 NewAPI 内层 draw_params 的字段；文档 §5 之外的字段不保证识别，需按服务方说明使用"
             )
         },
         "components": {
@@ -559,8 +782,40 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "proactive_min_interval_seconds": ConfigField(
                 type=int,
-                default=600,
+                default=240,
                 description="用户原话未含强信号、由 bot 主动判断要发图时的最小间隔（秒）；显著高于显式档以避免闲聊刷图"
+            ),
+            "weak_negative_ttl_seconds": ConfigField(
+                type=int,
+                default=60,
+                description="弱否定关键词（如'用文字''文字就行'）拦截的时效；超过此秒数视为 stale，不再拦截"
+            ),
+            "proactive_self_image_boost": ConfigField(
+                type=bool,
+                default=True,
+                description="Planner 主动出图（category=proactive）且 description 不含自拍/肖像关键词时，自动注入'肖像照 近景'，让主动出图更像 bot 本人分享"
+            ),
+        },
+        "auto_draw_on_reply": {
+            "enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="开启 reply 后置自动跟图：bot 写出的 reply 命中视觉自指/情感节点时，自动跟一张图"
+            ),
+            "score_threshold": ConfigField(
+                type=float,
+                default=0.6,
+                description="reply 评分 ≥ 阈值才触发跟图；阈值越高越保守。范围 0.0~1.0"
+            ),
+            "min_interval_seconds": ConfigField(
+                type=int,
+                default=180,
+                description="reply 自动跟图的独立最小间隔（秒）；与显式出图共享一次冷却但独立计时"
+            ),
+            "self_image_boost": ConfigField(
+                type=bool,
+                default=True,
+                description="跟图描述不含自拍/肖像关键词时，自动注入对应模式标签，让图更像 bot 本人分享"
             ),
         },
         "random_scene": {
@@ -717,10 +972,21 @@ class NaiPicPlugin(MaiBotPlugin):
         super().__init__()
         self._tasks: set[asyncio.Task[Any]] = set()
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
+        # reply 自动跟图：同一 session 在同一 reply 链路里只触发一次，避免 retry 重复出图。
+        # key=session_id, value=已触发的 reply 文本哈希集合
+        self._auto_draw_fired_signatures: dict[str, set[str]] = {}
 
     async def on_load(self) -> None:
         """处理插件加载。"""
         self._refresh_runtime_singletons()
+        # 主程序 _save_plugin_config 在整文件重写时不会把 ConfigField.description 渲染成注释。
+        # 在 on_load 兜底回填一次，保留用户已写入的值，仅在文件里完全没有注释时触发，
+        # 避免覆盖用户手写注释。
+        try:
+            self._regenerate_config_with_comments_if_needed()
+        except Exception as exc:  # noqa: BLE001
+            from src.common.logger import get_logger
+            get_logger("nai_draw_plugin").debug(f"config 注释回填失败（已忽略）：{exc!r}")
 
     async def on_unload(self) -> None:
         """处理插件卸载。"""
@@ -864,6 +1130,73 @@ class NaiPicPlugin(MaiBotPlugin):
         remember_sent_plugin_image_message(message, NAI_PIC_IMAGE_DISPLAY_MARKER)
         return None
 
+    @HookHandler(
+        "maisaka.replyer.after_response",
+        name="nai_draw_plugin_auto_draw_on_reply",
+        description="bot reply 命中视觉自指/情感节点时自动跟一张图",
+        mode=HookMode.OBSERVE,
+    )
+    async def handle_replyer_after_response_for_auto_draw(
+        self,
+        session_id: str = "",
+        response: str = "",
+        retry: bool = False,
+        attempt: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        """OBSERVE 模式：reply 文本生成成功时旁路评分，命中阈值就启动后台跟图。"""
+        del kwargs, attempt
+        if retry:
+            return
+
+        normalized_session = (session_id or "").strip()
+        reply_text = (response or "").strip()
+        if not normalized_session or not reply_text:
+            return
+
+        # 读插件配置：未开启就不做
+        try:
+            plugin_config = await self._load_plugin_config_data()
+        except Exception:
+            return
+        auto_cfg = plugin_config.get("auto_draw_on_reply") if isinstance(plugin_config, dict) else None
+        if not isinstance(auto_cfg, dict) or not auto_cfg.get("enabled", True):
+            return
+
+        threshold = float(auto_cfg.get("score_threshold", 0.6) or 0.6)
+        signal = score_reply_for_auto_draw(reply_text)
+        if signal.score < threshold or not signal.should_draw:
+            return
+
+        # 同一 session 同一 reply 文本只触发一次（防止 retry 流程重复出图）
+        signature = f"{len(reply_text)}:{hash(reply_text) & 0xFFFFFFFF:08x}"
+        fired = self._auto_draw_fired_signatures.setdefault(normalized_session, set())
+        if signature in fired:
+            return
+        fired.add(signature)
+        # 简单 LRU：每个 session 最多记 16 条最近触发签名，避免无界增长
+        if len(fired) > 16:
+            self._auto_draw_fired_signatures[normalized_session] = set(list(fired)[-16:])
+
+        description = compose_description_from_reply(reply_text, signal)
+        if not description:
+            return
+
+        invocation = await self._create_invocation(
+            normalized_session,
+            action_data={"description": description},
+            source="reply_auto_draw",
+        )
+
+        async def _runner() -> None:
+            try:
+                await invocation.handle_auto_draw_from_reply(description)
+            except Exception:
+                pass
+
+        # 走通用后台启动：同 session 已有生成任务则丢弃这次跟图（避免叠加）
+        self._start_image_generation_in_background(normalized_session, _runner)
+
     def _is_image_generation_pending(self, stream_id: str) -> bool:
         """检查当前会话是否已有进行中的图片任务。"""
         return bool(stream_id and session_state.get_pending_image_generation_started_at(stream_id) is not None)
@@ -919,6 +1252,125 @@ class NaiPicPlugin(MaiBotPlugin):
             return config_data if isinstance(config_data, dict) else {}
         except (OSError, tomllib.TOMLDecodeError):
             return {}
+
+    def _regenerate_config_with_comments_if_needed(self) -> None:
+        """把 `ConfigField.description` 渲染成 config.toml 顶部的 `#` 注释。
+
+        触发条件（保守，避免覆盖用户手写注释）：
+        - config.toml 存在
+        - 文件里目前一条 `#` 注释行都没有
+
+        策略：保留用户已设置的值，按 ``config_schema`` 顺序重写文件，每个字段上方挂
+        一行描述。主程序 ``_save_plugin_config`` 增量合并时会保留这些注释；只有完整
+        重写（用户删除文件、版本号 bump 触发 rebuild 等）才会再次清空，此时下次
+        ``on_load`` 会再回填一次。
+
+        注意：用 tomlkit 直接构造文档时，array-of-tables（如 ``artist_presets``）
+        会被强制放到 section 末尾，导致紧跟其后的 scalar 字段注释顺序错乱。改成
+        手写 TOML：标量字段先输出（带注释），dict / array-of-tables 在 section 末尾，
+        子表/数组本身的注释贴在它们前面。
+        """
+        plugin_file = inspect.getfile(self.__class__)
+        config_path = os.path.join(os.path.dirname(plugin_file), "config.toml")
+        if not os.path.isfile(config_path):
+            return
+
+        try:
+            existing_text = open(config_path, "r", encoding="utf-8").read()
+        except OSError:
+            return
+
+        if any(line.lstrip().startswith("#") for line in existing_text.splitlines()):
+            return  # 已经有注释，留给用户
+
+        try:
+            existing_doc = tomlkit.parse(existing_text)
+        except Exception:
+            return
+
+        new_text = self._compose_commented_config_text(existing_doc)
+        if not new_text or new_text == existing_text:
+            return
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as fp:
+                fp.write(new_text)
+        except OSError:
+            return
+
+    def _compose_commented_config_text(self, existing_doc: Any) -> str:
+        """按 schema 顺序手写 TOML，保留用户已有值，给每个字段挂 description 注释。
+
+        渲染骨架：
+        1. ``config_file_header``                   → 整个文件顶部说明（多行 # 注释）
+        2. ``config_section_group_headers[section]``→ 渲染在某 section 之前的大段分隔符
+        3. 每个 section 的字段                       → 上方挂 ``# {description}``，下面是 ``key = value``
+
+        section 顺序：先按 ``config_section_order`` 出现的顺序渲染；剩下的 schema
+        section 走字典原顺序兜底；最后是 existing_doc 里 schema 外的自定义 section。
+        """
+        schema = getattr(self, "config_schema", None) or {}
+        section_descs = getattr(self, "config_section_descriptions", None) or {}
+        if not isinstance(schema, dict) or not schema:
+            return ""
+
+        group_headers = getattr(self, "config_section_group_headers", None) or {}
+        order = getattr(self, "config_section_order", None) or []
+
+        # 按 config_section_order 先走一遍，再把 schema 里剩下的补在后面，避免漏掉新增字段
+        ordered: list[str] = []
+        seen_in_order: set[str] = set()
+        for name in order:
+            if name in schema and isinstance(schema[name], dict) and name not in seen_in_order:
+                ordered.append(name)
+                seen_in_order.add(name)
+        for name in schema:
+            if name in seen_in_order or not isinstance(schema[name], dict):
+                continue
+            ordered.append(name)
+            seen_in_order.add(name)
+
+        blocks: list[str] = []
+
+        # 顶部文件说明
+        file_header = getattr(self, "config_file_header", "") or ""
+        header_text = _format_comment_block(str(file_header)).strip()
+        if header_text:
+            blocks.append(header_text)
+
+        seen_sections: set[str] = set()
+        for section_name in ordered:
+            fields = schema.get(section_name)
+            if not isinstance(fields, dict):
+                continue
+            seen_sections.add(section_name)
+            group_header_text = group_headers.get(section_name)
+            if isinstance(group_header_text, str) and group_header_text.strip():
+                blocks.append(_format_comment_block(group_header_text))
+            blocks.append(
+                _render_section_with_comments(
+                    section_name=section_name,
+                    fields=fields,
+                    section_desc=section_descs.get(section_name),
+                    existing_doc=existing_doc,
+                )
+            )
+
+        # 未在 schema 中的 section 直接搬过来，避免误删用户自定义节
+        if hasattr(existing_doc, "items"):
+            for name, value in existing_doc.items():
+                if name in seen_sections:
+                    continue
+                try:
+                    tmp = tomlkit.document()
+                    tmp.add(name, value)
+                    snippet = tomlkit.dumps(tmp).strip()
+                    if snippet:
+                        blocks.append(snippet)
+                except Exception:
+                    continue
+
+        return "\n\n".join(s for s in blocks if s).rstrip() + "\n"
 
     async def _load_plugin_config_data(self) -> dict[str, Any]:
         """优先读取宿主提供的插件配置，不存在时回退本地文件。"""
@@ -1148,6 +1600,7 @@ class NaiPicPlugin(MaiBotPlugin):
         description=(
             "生成图片/照片/自拍/场景图。"
             "可以根据语境发送 bot 本人的自拍、非自拍肖像照，或符合对话场景的图片。"
+            "既可以响应用户明确的看图请求，也可以在 bot 自己说出视觉自指/进入情感互动节点时主动跟一张图。"
         ),
         activation_type=ActivationType.ALWAYS,
         parallel_action=True,
@@ -1155,10 +1608,16 @@ class NaiPicPlugin(MaiBotPlugin):
             "description": (
                 "【必须】先输出人数（如'一女''一男一女''两女'），再输出画面关键词。"
                 "关键词用空格分隔，只输出有视觉意义的核心词，禁止输出完整句子和虚词。"
-                "【意图对齐规则】description 必须优先符合用户这轮要求和当前上下文连续意图；"
-                "如果用户要看的是自拍、本人照片、穿搭、状态、环境、工作现场或上一张图的延续，就按那个意图写，"
+                "【意图对齐规则】"
+                "（A）若本轮是用户在要看图：description 必须优先符合用户这轮要求和当前上下文连续意图。"
+                "用户要看自拍/本人照片/穿搭/状态/环境/工作现场/上一张图的延续，就按那个意图写，"
                 "不要擅自改成别的题材、别的关注点、别的穿搭主题。"
-                "服装、场景、构图可以补全，但必须服务于用户当前想看的重点；"
+                "（B）若本轮是 bot 自己想主动发图（用户没明确开口，但你这一轮要回复的话里"
+                "提到了自身的穿着/姿态/动作/所处场景，或处在晚安/回家/想你了等亲密节点）："
+                "人物默认就是 bot 本人（'一女'）；优先写'自拍 近景'或'肖像照 近景'或'生活照'；"
+                "场景词沿用 bot 这轮要说的活动/位置（窗边、阳台、便利店、咖啡店…）。"
+                "不要把主动出图写成画一张陌生少女，要写成'她让你看一眼她现在'。"
+                "服装、场景、构图可以补全，但必须服务于当前的视觉重点；"
                 "即使用户没有明确写出衣服，也应该根据场景主动补出合理的服装款式、颜色、必要时的材质/质感细节，"
                 "让 description 对后续 tag 检索足够具体，而不是只写空泛的'衣服''穿搭''常服'。"
                 "但这种补全必须自然贴合场景与人物状态，不要每次都固定成同一种穿搭。"
@@ -1172,24 +1631,32 @@ class NaiPicPlugin(MaiBotPlugin):
                 "用户说'想看看你长什么样'→'一女 肖像照 正脸 近景'；"
                 "用户说'看看你穿黑丝的样子'→'一女 全身 黑丝 室内生活照'；"
                 "用户只说'看看你现在的样子'→ 可以补成'一女 室内生活照 靠窗 慵懒 近景'这类更具体但符合场景的描述；"
+                "bot 主动说'我刚洗完澡靠窗发呆'→'一女 肖像照 浴袍 窗边 近景'（主动跟图）；"
                 "用户说'画初音未来穿泳装'→'一女 初音未来 泳装 海边'（这是画图，不是自拍）。"
             ),
             "size": "图片尺寸（默认从配置获取）",
         },
         action_require=[
-            "满足以下任一条件时触发：",
+            "可以触发的典型时机：",
             "1. 用户明确要求看图/画图/发图/自拍/肖像/再来一张",
             "2. 用户明确想看 bot 本人的样子、穿搭、状态、某个身体/服饰视觉重点",
-            "3. bot 自己在角色扮演里产生了强视觉语境（描述自身当前穿搭、所在场景、刚做的事、手头的画面），"
-            "用配图比纯文字更自然时，可以主动发一张",
-            "不触发：知识问答、技术讨论、对图片的评价或询问、单纯活跃气氛、撩拨",
-            "频率约束：主动发图比用户显式要求更克制；刚发过图就不要再主动发，除非用户明确继续追图",
+            "3. bot 这一轮要回复的话里包含自身姿态、穿着、动作、所处场景的视觉描写"
+            "（例：我刚洗完澡靠在窗边、今天穿了新裙子、在便利店买东西、慵懒地躺在床上）"
+            "——这种时机配一张图比纯文字更自然，可以主动跟一张",
+            "4. 用户分享情绪、晚安、回家了、到家了、想你了、撒娇等亲密互动节点，"
+            "bot 想以一张近照/自拍作为情感回应",
+            "不触发：纯知识问答、技术讨论、bot 这一轮明显走理性解释/代码/列点风格的回复，"
+            "或者用户明确拒绝出图（'不要画''别画图'）",
+            "节奏建议：自然搭图，不刷屏。短间隔内连发要克制；但 bot 自己开口提到视觉细节时不要犹豫——"
+            "比起'刚发过图，先不发'，更应该判断'这句话本身配图是否自然'。",
         ],
         associated_types=["text"],
     )
     async def handle_nai_web_draw(
         self,
         stream_id: str = "",
+        user_id: str = "",
+        group_id: str = "",
         action_data: dict[str, Any] | None = None,
         reasoning: str = "",
         **kwargs: Any,
@@ -1198,6 +1665,8 @@ class NaiPicPlugin(MaiBotPlugin):
         del kwargs
         invocation = await self._create_invocation(
             stream_id,
+            user_id=user_id,
+            group_id=group_id,
             action_data=action_data,
             reasoning=reasoning,
             source="action",

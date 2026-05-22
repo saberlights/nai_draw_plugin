@@ -86,6 +86,25 @@
 
 ## 配置
 
+`config.toml` 第一次启动会自动生成；之后插件加载时如果文件里完全没有 `#` 注释，会按 schema 自动回填注释，已经有注释则尊重用户手写内容。
+
+文件结构按"先要改的 → 通常不动的"分块，用 `# ========== ... ==========` 大段分隔符把同类配置拢在一起，整体顺序大致是：
+
+```
+[plugin]                                # 启用/版本
+[model]                                 # NewAPI 网关与默认生图模型
+[prompt_generator] / [prompt_generator.custom_model]
+[action_guard] / [auto_draw_on_reply]   # 出图触发保护
+[random_scene] / [random_scene.custom_model]
+[tagger] / [tagger.custom_model]
+[components] / [prompt_show] / [nsfw_filter]
+[auto_recall] / [admin] / [tag_retriever]
+[custom_prompt]                         # 自定义系统提示词（不常改，放末尾）
+[model_nai4_5] / [[model_nai4_5.artist_presets]]   # 当前默认模型详细参数
+[model_nai4]  / [[model_nai4.artist_presets]]      # 作用同 model_nai4_5
+[model_nai3]  / [[model_nai3.artist_presets]]      # 作用同 model_nai4_5
+```
+
 编辑 `config.toml` 文件：
 
 ```toml
@@ -103,18 +122,23 @@ default_model = "nai-diffusion-4-5-full"   # 默认模型名称
 
 ### 打标配置（/打标）
 
-`/打标` 会读取你“引用回复”的那条图片消息，对图片做 Danbooru/NAI 风格打标，并输出一行可直接复制给 NAI 的 prompt（角色(作品)+tags）。
+`/打标` 会读取你"引用回复"的那条图片消息，对图片做 Danbooru/NAI 风格打标，并输出一行可直接复制给 NAI 的 prompt（角色(作品)+tags）。
 
-推荐使用 `custom_model` 单独配置打标模型（完全独立于其它任务；`model_list` 需为支持图像输入的多模态模型）：
+推荐用 `[tagger.custom_model]` 单独配置一个支持图像输入的多模态模型，完全独立于其它任务的 `model_task`：
 
 ```toml
 [tagger]
 enabled = true
+model_task = "vlm"     # 不用 custom_model 时，走全局 model_config.toml 的哪个任务
+temperature = 1.0
+max_tokens = 30000     # 请求上限，最终仍受模型自身限制
 
 # 单独配置打标模型（推荐）
-custom_model = { model_list = ["gemini-3-pro-preview"], max_tokens = 1200, temperature = 0.2, slow_threshold = 30.0 }
-
-# max_tokens 是“请求上限”，最终是否截断取决于模型/提供商自身上限；建议 800~4096
+[tagger.custom_model]
+model_list = ["g3f", "c3f", "u3f"]   # 必须是多模态模型，且 model_list 非空时优先使用
+max_tokens = 30000
+temperature = 1.0
+slow_threshold = 120.0
 ```
 
 ### 分版本模型配置
@@ -191,11 +215,37 @@ artist_presets = [
 
 ```toml
 [auto_recall]
-enabled = false  # 是否默认启用自动撤回
-delay_seconds = 5  # 撤回延迟时间（秒）
-id_wait_seconds = 15  # 等待正式消息ID的最长时间（秒）
-allowed_groups = []  # 允许使用自动撤回功能的会话白名单
+enabled = false             # 是否默认启用自动撤回
+delay_seconds = 30          # 撤回延迟时间（秒）
+id_wait_seconds = 15        # 等待正式消息 ID 的最长时间（秒）
+manual_max_age_seconds = 3600  # 手动撤回允许命中的最老图片年龄（秒）；超出视为不可撤回
+allowed_groups = []         # 允许使用自动撤回功能的会话白名单
 # 示例：allowed_groups = ["qq:123456789", "telegram:987654321"]
+```
+
+### 自动出图触发保护（action_guard）
+
+防止 Planner 在不合适的时机连续触发 `nai_web_draw` Action。包含**否定意图兜底**（用户说"不要画"仍调用时拦截）和**频率分级保护**（明确点名 vs Bot 主动出图分两档冷却）。
+
+```toml
+[action_guard]
+enabled = true                                # 是否启用保护
+explicit_request_min_interval_seconds = 45    # 用户明确要求画图 / 自拍时的最小间隔（秒）
+proactive_min_interval_seconds = 600          # Bot 主动出图最小间隔（秒），显著高于显式档
+weak_negative_ttl_seconds = 60                # 弱否定关键词（"用文字就行"）拦截时效
+proactive_self_image_boost = true             # 主动出图且不含自拍/肖像关键词时，自动注入"肖像照 近景"
+```
+
+### reply 后置自动跟图（auto_draw_on_reply）
+
+Bot 自己写出的 reply 命中视觉自指 / 情感节点时（"我刚换了新发型"、"今天穿了……"），自动跟一张图。
+
+```toml
+[auto_draw_on_reply]
+enabled = true               # 开启 reply 后置自动跟图
+score_threshold = 0.6        # reply 评分 ≥ 阈值才触发；越高越保守，范围 0.0~1.0
+min_interval_seconds = 180   # 独立最小间隔（秒），与显式出图共享一次冷却但独立计时
+self_image_boost = true      # 跟图描述不含自拍/肖像关键词时，自动注入对应模式标签
 ```
 
 ### 管理员权限配置
@@ -272,22 +322,38 @@ slow_threshold = 30.0
 
 ### Tag 检索增强配置
 
-插件支持使用 embedding 模型从 Danbooru 中文 tag 对照表（5481 条）中检索与用户描述相关的候选标签，注入 LLM 提示模板辅助生成更准确的 tag。
+插件支持两种检索模式：
 
-**首次使用准备**：
+- **`online`（默认）**：调用 [DanbooruSearchOnline](https://sakizuki-danboorusearch.hf.space) HF Space，无需本地 embedding 模型，开箱即用；HF Space 冷启动时首次请求可能要 60-90 秒。
+- **`local`（回退）**：使用本地 embedding 模型从 Danbooru 中文 tag 对照表（5481 条）检索。需要先生成 `data/danbooru_tags.json` 并配置 `model_config.toml` 的 embedding 模型。
+
+```toml
+[tag_retriever]
+enabled = true                                            # 是否启用 tag 检索增强
+mode = "online"                                           # online = 远程 API，local = 本地 embedding
+
+# --- online 模式（默认） ---
+api_url = "https://sakizuki-danboorusearch.hf.space/api"  # 远程 API 地址
+timeout = 90.0                                            # 请求超时（秒），HF Space 冷启动约 60-90 秒
+search_limit = 30                                         # /search 返回标签上限
+search_top_k = 5                                          # /search 每个分词段召回数
+related_limit = 20                                        # /related 返回推荐上限
+related_seed_count = 8                                    # 从 search 取多少个作为 related 种子
+show_nsfw = true                                          # 是否包含 NSFW 标签（会跟随 nsfw_filter 自动调整）
+popularity_weight = 0.15                                  # 标签热度对排序的影响权重 (0.0-1.0)
+
+# --- local 模式（回退用） ---
+top_k = 50           # 本地检索返回的候选 tag 数量
+min_score = 0.6      # 本地检索最低相似度阈值
+```
+
+**首次使用 `local` 模式准备**（仅当切到 `mode = "local"` 时需要）：
 1. 运行 `python core/utils/tag_data_builder.py` 从 xlsx 对照表生成 `data/danbooru_tags.json`
 2. 确保 `model_config.toml` 中已配置 embedding 模型（如 `bge-m3`）
 3. 首次启用时会自动调用 embedding API 为所有 tag 构建向量缓存（约 5481 次调用，需几分钟），之后从缓存加载
 
-```toml
-[tag_retriever]
-enabled = true       # 是否启用 tag 检索增强
-top_k = 40           # 返回候选 tag 数量
-min_score = 0.3      # 最低相似度阈值
-```
-
 **工作原理**：
-- 用户输入的关键词被拆分后，每个关键词并发调用 embedding API 进行语义检索
+- 用户输入的关键词被拆分后，向检索后端（HF Space 或本地 embedding）请求候选标签
 - 检索结果合并去重后，以 `<tag_candidates>` 块注入 LLM 提示模板
 - LLM 根据上下文从候选中选择最精确的标准 Danbooru tag，而非自行翻译
 
@@ -647,40 +713,39 @@ A:
 
 ```
 nai_draw_plugin/
-├── plugin.py              # 插件入口，注册组件
-├── config.toml            # 配置文件
-├── __init__.py            # 模块初始化
+├── plugin.py              # 插件入口：注册 Action / Command / Hook，挂 schema 与 config 渲染
+├── sdk_runtime.py         # NaiInvocation：单次命令/Action 的运行上下文（生图、自拍、撤回等）
+├── runtime_recall.py      # 运行时图片消息追踪 + 撤回 marker 注入
+├── legacy_llm_request.py  # 兼容旧 LLM 请求接口的薄封装
+├── config.toml            # 配置文件（首次启动自动生成；插件 on_load 时按需回填注释）
 ├── _manifest.json         # 插件清单
-└── core/
-    ├── generated_images/  # 生成的图片缓存目录
-    ├── actions/           # 动作组件（关键词触发生图）
-    │   └── nai_pic_action.py
-    ├── commands/          # 命令组件
-    │   ├── nai_draw_command.py        # /nai 命令（LLM 生图）
-    │   ├── nai_0_draw_command.py      # /nai0 命令（直接标签生图）
-    │   ├── nai_admin_command.py       # /nai st/sp/set/size/art 命令
-    │   ├── nai_recall_command.py      # /nai on/off 命令（自动撤回）
-    │   ├── nai_nsfw_command.py        # /nai nsfw 命令（NSFW过滤）
-    │   └── nai_prompt_show_command.py # /nai pt 命令（提示词显示）
-    ├── clients/           # API 客户端
-    │   └── nai_web_client.py
-    ├── mixins/            # 混入类（自动撤回、模型配置等）
-    │   ├── model_config_mixin.py
-    │   └── auto_recall_mixin.py
-    ├── rules/             # 提示词模板和规则
-    │   ├── prompt_rules.py            # LLM 提示词生成规则
-    │   └── selfie_rules.py            # 自拍模式规则（24关键词、5类型）
-    ├── services/          # 会话状态管理服务
-    │   ├── session_state.py
-    │   ├── prompt_generator.py
-    │   ├── tag_retriever.py           # Danbooru Tag 检索增强服务
-    │   └── image_generator.py
-    └── utils/             # 工具类
-        ├── danbooru_api.py            # Danbooru API 集成
-        ├── tag_data_builder.py        # xlsx→JSON tag 数据构建工具
-        ├── image_url_helper.py        # 图片处理工具
-        ├── prompt_output_parser.py    # LLM 结构化输出解析
-        └── prompt_postprocessor.py    # 提示词后处理（排序、外貌移除）
+├── core/
+│   ├── clients/
+│   │   ├── nai_web_client.py        # NewAPI 兼容网关 HTTP 客户端
+│   │   └── danbooru_online_client.py
+│   ├── commands/                    # 命令实现的散文件，部分逻辑已并入 plugin.py，但测试仍引用
+│   ├── mixins/                      # 自动撤回 / 模型配置等可复用 Mixin
+│   ├── rules/                       # 提示词与触发规则
+│   │   ├── prompt_rules.py
+│   │   ├── selfie_rules.py          # 自拍模式（24 关键词、5 类型）
+│   │   └── reply_auto_draw.py       # reply 后置自动跟图打分 / 描述合成
+│   ├── services/
+│   │   ├── session_state.py         # 会话级状态机
+│   │   ├── prompt_memory.py         # 上一轮提示词继承
+│   │   ├── tag_retriever.py         # tag 检索（online / local 两种模式）
+│   │   ├── danbooru_online_retriever.py
+│   │   ├── image_generator.py
+│   │   └── user_blacklist.py
+│   └── utils/
+│       ├── prompt_output_parser.py  # LLM 结构化输出解析
+│       ├── prompt_postprocessor.py  # 提示词后处理（排序、外貌移除）
+│       ├── tagger_utils.py          # /打标 prompt 拼装
+│       ├── random_scene_description.py
+│       ├── tag_data_builder.py      # xlsx → JSON tag 数据构建（local 模式用）
+│       ├── danbooru_api.py
+│       ├── image_url_helper.py
+│       └── display_message_helper.py
+└── tests/                           # 单元 / 集成测试
 ```
 
 ## 许可证
@@ -692,6 +757,13 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v1.4.0 (2026-05-22) - 配置注释与排版梳理
+- 重写 `config.toml` 自动生成器的注释口径：去掉历史遗留的 `NAI VX low-level qualityToggle/autoSmea` / `NovelAI Web` 等字样
+- `[model_nai4]` / `[model_nai3]` 段统一为"作用同 `model_nai4_5.xxx`"，避免每个模型段都把同一句话抄三遍
+- 新增 `config_file_header`（顶部"建议按这个顺序改"）+ `# ========== ... ==========` 大段分隔符 + V4.5 / V4 / V3 子分隔符
+- 明确章节渲染顺序（plugin → model → prompt_generator → action_guard → auto_draw_on_reply → … → model_nai4_5 → V4 → V3），跟 bak 风格对齐
+- 渲染两次幂等；schema 外用户自加的 section 仍原样保留
 
 ### v1.3.0 (NewAPI 重构)
 - 协议切换：底层请求从 NovelAI Web API（GET `/generate`）改为 NewAPI 兼容 OpenAI 协议（POST `/v1/chat/completions`）

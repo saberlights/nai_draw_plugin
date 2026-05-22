@@ -77,6 +77,9 @@ class SessionStateManager:
         # 最近一次自动出图时间（用于 Action 节流，避免连续频繁发图）
         self._last_action_image_sent_at: Dict[str, float] = {}
 
+        # 最近一次 reply-hook 自动跟图发送时间（独立间隔门，避免与 explicit/proactive 互相冻结）
+        self._last_auto_draw_sent_at: Dict[str, float] = {}
+
         # 当前仍在生成中的图片任务（用于拦截同会话重复启动）
         self._pending_image_generation_started_at: Dict[str, float] = {}
 
@@ -560,6 +563,19 @@ class SessionStateManager:
             return
         timestamp = float(sent_at if sent_at is not None else time.time())
         self._last_action_image_sent_at[chat_stream_id] = timestamp
+
+    def get_last_auto_draw_sent_at(self, chat_stream_id: str) -> Optional[float]:
+        """获取指定聊天流最近一次 reply-hook 自动跟图发送时间。"""
+        if not chat_stream_id:
+            return None
+        return self._last_auto_draw_sent_at.get(chat_stream_id)
+
+    def set_last_auto_draw_sent_at(self, chat_stream_id: str, sent_at: Optional[float] = None) -> None:
+        """记录指定聊天流最近一次 reply-hook 自动跟图发送时间。"""
+        if not chat_stream_id:
+            return
+        timestamp = float(sent_at if sent_at is not None else time.time())
+        self._last_auto_draw_sent_at[chat_stream_id] = timestamp
 
     # ==================== 图片生成中状态 ====================
 

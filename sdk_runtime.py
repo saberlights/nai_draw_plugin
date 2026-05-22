@@ -51,6 +51,7 @@ from .core.rules.prompt_rules import PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENER
 from .core.rules.selfie_rules import (
     detect_explicit_image_request,
     detect_negative_image_intent,
+    detect_negative_image_intent_strength,
     detect_selfie_from_output,
     get_selfie_hint,
     merge_selfie_prompt,
@@ -277,6 +278,137 @@ def _is_image_message(message: Any) -> bool:
         if _text_looks_like_image(getattr(message, key, None)):
             return True
     return False
+
+
+# Planner reasoning 中暗示"用户明确要求图片"的措辞。仅在拿不到用户原话时作为 fallback。
+# 选词保守：只覆盖明显指向"用户/对方请求"的转述，避免把 bot 自身视觉描写误判成 explicit。
+_REASONING_EXPLICIT_HINTS: tuple[str, ...] = (
+    "用户要求", "用户想看", "用户想要", "用户希望", "用户让",
+    "对方要求", "对方想看", "对方想要", "对方希望", "对方让",
+    "他要求", "他想看", "她要求", "她想看",
+    "明确要求", "明确想看", "明确请求",
+    "要我画", "让我画", "叫我画", "要我发", "让我发",
+    "追图", "继续画", "再画一张", "再来一张",
+)
+
+
+def _reasoning_implies_explicit_request(reasoning: str) -> bool:
+    """fallback：从 Planner reasoning 里识别用户显式请求语义。"""
+    if not reasoning:
+        return False
+    lowered = reasoning.lower()
+    return any(hint in reasoning or hint.lower() in lowered for hint in _REASONING_EXPLICIT_HINTS)
+
+
+def _row_age_seconds(row: Any) -> float | None:
+    """根据消息行的 timestamp 字段返回距今秒数；解析失败返回 None。"""
+    if isinstance(row, dict):
+        raw_ts = row.get("timestamp")
+    else:
+        raw_ts = getattr(row, "timestamp", None)
+    normalized = normalize_db_timestamp(raw_ts)
+    if normalized is None:
+        return None
+    return max(0.0, time.time() - float(normalized))
+
+
+# 主动出图时往 description 前置的自指标签。selfie 偏镜头近、肖像偏室内近景、
+# 场景偏生活照——目的都是让生成的图像感觉像"bot 在分享自己"而不是"画了张陌生人"。
+_SELF_IMAGE_HINT_BY_MODE: dict[str, str] = {
+    "selfie": "一女 自拍 近景",
+    "portrait": "一女 肖像照 近景",
+    "scene": "一女 生活照",
+}
+
+
+def _inject_self_image_hint(description: str, *, mode: str) -> str:
+    """把对应模式的 self-image 标签拼到 description 前面，避免后续 LLM 改写丢失意图。
+
+    已经包含人数（"一女" "一男一女"等）则不重复加。
+    """
+    hint = _SELF_IMAGE_HINT_BY_MODE.get(mode, _SELF_IMAGE_HINT_BY_MODE["portrait"])
+    desc = (description or "").strip()
+    if not desc:
+        return hint
+    # 若 description 已经写了人数前缀（一女/二女/一男一女/两女 等），不要重复堆叠
+    leading_persona_pattern = re.compile(r"^(?:一|二|两|三|1|2|3)(?:女|男|男一女|女一男)\b")
+    if leading_persona_pattern.match(desc):
+        # 仅在 hint 的"非人数部分"还没出现在 desc 时追加
+        hint_tail = " ".join(hint.split()[1:]).strip()
+        if hint_tail and hint_tail not in desc:
+            return f"{desc} {hint_tail}"
+        return desc
+    return f"{hint} {desc}"
+
+
+def _extract_message_sender_id(message: Any) -> str:
+    """从消息行（dict 或对象）中提取发送者 user_id。"""
+    if isinstance(message, dict):
+        direct = message.get("user_id")
+        if direct:
+            return str(direct)
+        for nested_key in ("user_info", "message_info"):
+            nested = message.get(nested_key)
+            if isinstance(nested, dict):
+                # message_info 自己可能再嵌一层 user_info
+                if nested_key == "message_info":
+                    mi_user_info = nested.get("user_info")
+                    if isinstance(mi_user_info, dict):
+                        user_id = mi_user_info.get("user_id")
+                        if user_id:
+                            return str(user_id)
+                else:
+                    user_id = nested.get("user_id")
+                    if user_id:
+                        return str(user_id)
+        return ""
+
+    user_info_obj = getattr(message, "user_info", None)
+    user_id_obj = getattr(user_info_obj, "user_id", None) if user_info_obj else None
+    if user_id_obj:
+        return str(user_id_obj)
+    legacy = getattr(message, "user_id", None)
+    return str(legacy) if legacy else ""
+
+
+def _resolve_bot_account(platform: str) -> str:
+    """读取当前 bot 的账号 ID，用于把 bot 自己发的消息排除。
+
+    保持最小依赖：直接读 ``global_config.bot``，QQ 用 ``qq_account``，其他平台
+    优先用 ``platforms`` 映射，否则回落到 ``qq_account``。重型的 platform 解析
+    工具不在这里调用，避免拖入额外模块。
+    """
+    try:
+        from src.config.config import global_config  # 延迟导入，避免测试时拖入重模块
+    except Exception:
+        return ""
+    bot_config = getattr(global_config, "bot", None)
+    if not bot_config:
+        return ""
+
+    qq_account = str(getattr(bot_config, "qq_account", "") or "").strip()
+    telegram_account = str(getattr(bot_config, "telegram_account", "") or "").strip()
+    platform_key = (platform or "").strip().lower()
+
+    # 从 platforms 配置中提取（结构可能是 list[dict] 也可能已被解析为映射）
+    platforms_raw = getattr(bot_config, "platforms", None) or []
+    if isinstance(platforms_raw, dict):
+        for k, v in platforms_raw.items():
+            if str(k).strip().lower() == platform_key and v:
+                return str(v).strip()
+    elif isinstance(platforms_raw, list):
+        for item in platforms_raw:
+            if isinstance(item, dict):
+                name = str(item.get("platform") or item.get("name") or "").strip().lower()
+                account = item.get("account") or item.get("id") or item.get("user_id")
+                if name == platform_key and account:
+                    return str(account).strip()
+
+    if platform_key in {"qq"} and qq_account:
+        return qq_account
+    if platform_key in {"telegram", "tg"} and telegram_account:
+        return telegram_account
+    return qq_account
 
 
 class NaiInvocation(ModelConfigMixin):
@@ -510,6 +642,46 @@ class NaiInvocation(ModelConfigMixin):
         if isinstance(result, list):
             return result
         return []
+
+    async def _fetch_last_user_text(self, *, lookback: int = 6) -> str:
+        """从最近消息中取一条真实用户原话，供 Action Guard 关键词分级。"""
+        text, _ = await self._fetch_last_user_text_with_age(lookback=lookback)
+        return text
+
+    async def _fetch_last_user_text_with_age(
+        self,
+        *,
+        lookback: int = 6,
+    ) -> tuple[str, float | None]:
+        """同 ``_fetch_last_user_text``，但额外返回消息距今的秒数（None 表示未知）。
+
+        Action 入口拿到的 action_data["description"] 是 Planner LLM 生成的关键词串，
+        不是用户原话。这里回查消息库，跳过 bot 自己的消息与图片消息，取最新一条
+        用户文本及其发生时间，供调用方做弱否定关键词的 staleness 判断。
+        """
+        if not self.stream_id:
+            return "", None
+
+        platform = self._get_target_platform()
+        bot_account = _resolve_bot_account(platform)
+
+        rows = await self._find_recent_messages(limit=max(2, lookback) * 3, hours=2.0)
+        if not rows:
+            return "", None
+
+        for row in rows:
+            if _is_image_message(row):
+                continue
+            sender_id = _extract_message_sender_id(row)
+            if bot_account and sender_id and sender_id == bot_account:
+                continue
+            for key in ("processed_plain_text", "display_message", "raw_message"):
+                value = row.get(key) if isinstance(row, dict) else getattr(row, key, None)
+                if isinstance(value, str):
+                    text = value.strip()
+                    if text:
+                        return text, _row_age_seconds(row)
+        return "", None
 
     async def _find_last_plugin_image_message_id(
         self,
@@ -988,8 +1160,20 @@ class NaiInvocation(ModelConfigMixin):
         )
         return False, "手动撤回失败", True
 
-    async def _send_image_result(self, result: str, description: str = "") -> tuple[bool, str | None, bool]:
-        """发送图片结果。"""
+    async def _send_image_result(
+        self,
+        result: str,
+        description: str = "",
+        *,
+        track_as_auto_draw: bool = False,
+    ) -> tuple[bool, str | None, bool]:
+        """发送图片结果。
+
+        Args:
+            track_as_auto_draw: 若为 True，把这次发送计入 auto_draw 独立间隔门，
+                不刷新 explicit/proactive 共用的最近出图时间——这样 reply hook
+                自动跟图不会冻结后续用户的明确出图请求。
+        """
         final_image_data = self._process_api_response(result)
         if not final_image_data:
             await self.send_text("API 返回了无效的数据")
@@ -1025,7 +1209,10 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text("图片发送失败")
             return False, "发送失败", True
 
-        session_state.set_last_action_image_sent_at(self.stream_id, self._last_send_timestamp)
+        if track_as_auto_draw:
+            session_state.set_last_auto_draw_sent_at(self.stream_id, self._last_send_timestamp)
+        else:
+            session_state.set_last_action_image_sent_at(self.stream_id, self._last_send_timestamp)
         await self._schedule_auto_recall()
         return True, "图片生成成功", True
 
@@ -1713,26 +1900,40 @@ class NaiInvocation(ModelConfigMixin):
             return False, "没有权限"
 
         description = str(self.action_data.get("description", "") or "").strip()
-        raw_description = description
         size = str(self.action_data.get("size", "") or "").strip()
 
-        if not description and not raw_description:
+        # Planner 极少数情况下不给 description，回落到 reasoning 仅作生图素材；
+        # Action Guard 判定独立走真实用户原话，与这里的 fallback 无关。
+        if not description:
             description = self.reasoning.strip()
-            raw_description = description
 
-        trigger_assessment = self._assess_action_trigger(
-            raw_description=raw_description,
-            reasoning=self.reasoning,
-        )
+        # raw_description 在后续自拍/外观策略里被当作"本轮请求文本"使用，需保留
+        # LLM 改写前的版本（与最终 description 区分）。
+        raw_description = description
+
+        trigger_assessment = await self._assess_action_trigger(reasoning=self.reasoning)
         if self._is_action_guard_enabled() and not trigger_assessment["should_generate"]:
             logger.info(
-                "%s Action 出图已拦截: category=%s detail=%s text=%s",
+                "%s Action 出图已拦截: category=%s detail=%s signal=%s text=%s",
                 self.log_prefix,
                 trigger_assessment["category"],
                 trigger_assessment["detail"],
-                (raw_description or self.reasoning)[:120],
+                trigger_assessment.get("signal_source", ""),
+                trigger_assessment.get("signal_text", ""),
             )
             return False, trigger_assessment["detail"]
+
+        # 主动出图自动 self-image 增强：bot 自己想发图时，让出来的图更像"她给你看一眼自己"
+        # 而不是"画了一张陌生女孩"。explicit 路径不动，保持用户原意。
+        if (
+            trigger_assessment["category"] == "proactive"
+            and bool(self.get_config("action_guard.proactive_self_image_boost", True))
+            and description
+            and not detect_selfie_from_output(description)
+        ):
+            description = _inject_self_image_hint(description, mode="portrait")
+            raw_description = description
+            logger.debug("%s 主动出图已注入 self-image 提示: %s", self.log_prefix, description[:80])
 
         generated_prompt = await self._generate_prompt_with_llm(
             description,
@@ -1809,11 +2010,134 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text("图片生成完成！")
         return send_result[0], send_result[1] or ""
 
+    async def handle_auto_draw_from_reply(self, seed_description: str) -> tuple[bool, str]:
+        """reply 后置 hook 触发的自动跟图。
+
+        与 handle_action 区别：
+        - description 由 reply 评分模块拼好（``seed_description``），不依赖 Planner 写参数
+        - guard 走 ``category="auto_draw"``，使用独立间隔门
+        - 发送计入 ``last_auto_draw_sent_at``，不会冻结后续显式请求
+        - 失败不发用户可见报错（OBSERVE hook 静默兜底）
+        """
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户"
+        if not await self.ensure_generation_permission():
+            return False, "没有权限"
+
+        description = (seed_description or "").strip()
+        if not description:
+            return False, "空 description"
+
+        # auto_draw 单独跑 guard：负向用户原话仍要兜底，间隔走 auto_draw 档
+        guard_state = await self._assess_auto_draw_trigger()
+        if self._is_action_guard_enabled() and not guard_state["should_generate"]:
+            logger.info(
+                "%s reply 自动跟图被拦截: detail=%s text=%s",
+                self.log_prefix,
+                guard_state["detail"],
+                guard_state.get("signal_text", ""),
+            )
+            return False, guard_state["detail"]
+
+        # 自动 self-image 增强：description 不含自拍/肖像/生活照标签时补一个
+        if (
+            bool(self.get_config("auto_draw_on_reply.self_image_boost", True))
+            and not detect_selfie_from_output(description)
+        ):
+            description = _inject_self_image_hint(description, mode="portrait")
+
+        raw_description = description
+
+        generated_prompt = await self._generate_prompt_with_llm(
+            description,
+            allow_inherit=True,
+            include_custom_system_prompt=True,
+        )
+        if generated_prompt:
+            description = generated_prompt.strip()
+        elif not description:
+            return False, "图片描述为空"
+
+        is_selfie = detect_selfie_from_output(description)
+        if is_selfie:
+            description = self._process_selfie_prompt(
+                description,
+                raw_description,
+                include_selfie_prompt_add=True,
+                log_changes=True,
+            )
+            session_state.set_last_selfie_context(
+                self.stream_id,
+                description,
+                raw_description,
+            )
+
+        if self.get_config("prompt_generator.enforce_tag_order", False):
+            description = normalize_prompt_order(description)
+
+        description = self._sanitize_prompt_for_sfw_mode(description)
+
+        model_config = self._get_model_config(is_selfie=is_selfie)
+        if not model_config or not model_config.get("base_url"):
+            return False, "模型配置无效"
+
+        image_size = model_config.get("nai_size") or model_config.get("default_size", "")
+
+        try:
+            success, result = await self.api_client.generate_image(
+                prompt=description,
+                model_config=model_config,
+                size=image_size,
+            )
+        except Exception as exc:
+            logger.error("%s reply 自动跟图生成失败: %r", self.log_prefix, exc, exc_info=True)
+            return False, str(exc)
+
+        if not success:
+            logger.info("%s reply 自动跟图未成功: %s", self.log_prefix, result)
+            return False, str(result)
+
+        send_result = await self._send_image_result(
+            result,
+            raw_description or description,
+            track_as_auto_draw=True,
+        )
+        return send_result[0], send_result[1] or ""
+
+    async def _assess_auto_draw_trigger(self) -> dict[str, Any]:
+        """auto_draw 用的 guard：保留负向用户原话兜底 + auto_draw 档间隔。"""
+        user_text, age_seconds = await self._fetch_last_user_text_with_age()
+        if user_text:
+            negative_strength = detect_negative_image_intent_strength(user_text)
+            if negative_strength == "strong":
+                return {
+                    "should_generate": False,
+                    "detail": "用户明确表示不需要图片",
+                    "signal_text": user_text[:120],
+                }
+            if negative_strength == "weak":
+                weak_ttl = max(
+                    0,
+                    int(self.get_config("action_guard.weak_negative_ttl_seconds", 60) or 60),
+                )
+                if age_seconds is None or age_seconds <= weak_ttl:
+                    return {
+                        "should_generate": False,
+                        "detail": "用户刚才偏好文字回复",
+                        "signal_text": user_text[:120],
+                    }
+        can_send, detail = self._check_action_image_interval("auto_draw")
+        return {
+            "should_generate": can_send,
+            "detail": detail,
+            "signal_text": (user_text or "")[:120],
+        }
+
     def _is_action_guard_enabled(self) -> bool:
         """检查是否启用自动出图保护。"""
         return bool(self.get_config("action_guard.enabled", True))
 
-    def _assess_action_trigger(self, raw_description: str, reasoning: str = "") -> dict[str, Any]:
+    async def _assess_action_trigger(self, reasoning: str = "") -> dict[str, Any]:
         """评估当前 Action 是否真的适合出图，并应用频率保护。
 
         设计原则：
@@ -1821,30 +2145,62 @@ class NaiInvocation(ModelConfigMixin):
         - Guard 只负责两件事：
           ① 否定意图黑名单兜底（用户明确说"不要画"也调用了，按 Planner 误判处理）
           ② 频率保护，按"用户原话强度"分级 explicit / proactive 两档
-        - 不再字面匹配 reasoning：不同 Planner 模型 reasoning 风格差异大，匹配率极低反而造成误拦
+        - 判定输入必须是用户原话，不能是 action_data["description"]（那是 LLM 生成的关键词）
+          原话取不到时回落 Planner reasoning：reasoning 含"用户/对方/他说/明确/要求"等显式信号视为 explicit
+        - 否定关键词区分强弱：strong（"不要画"）永久阻断；weak（"用文字"）仅在新鲜（< 60s）且
+          是最近一条消息时阻断，避免 stale 偏好一直冻结。
         """
-        del reasoning  # 不再使用 reasoning 做字面匹配，保留参数以兼容调用方
-        user_text = str(raw_description or "").strip()
+        user_text, age_seconds = await self._fetch_last_user_text_with_age()
+        signal_source = "user_text"
+        signal_text = user_text
 
-        # 否定意图兜底：Planner 偶发误调用
-        if detect_negative_image_intent(user_text):
-            return {
-                "should_generate": False,
-                "explicit_request": False,
-                "category": "blocked",
-                "detail": "用户明确表示不需要图片",
-            }
+        if user_text:
+            negative_strength = detect_negative_image_intent_strength(user_text)
+            if negative_strength == "strong":
+                return {
+                    "should_generate": False,
+                    "explicit_request": False,
+                    "category": "blocked",
+                    "detail": "用户明确表示不需要图片",
+                    "signal_source": "user_text",
+                    "signal_text": user_text[:120],
+                }
+            if negative_strength == "weak":
+                weak_ttl = max(
+                    0,
+                    int(self.get_config("action_guard.weak_negative_ttl_seconds", 60) or 60),
+                )
+                # age 未知时保守按"未过期"处理，仍然阻断；明确过期才放行
+                if age_seconds is None or age_seconds <= weak_ttl:
+                    return {
+                        "should_generate": False,
+                        "explicit_request": False,
+                        "category": "blocked",
+                        "detail": "用户刚才偏好文字回复",
+                        "signal_source": "user_text",
+                        "signal_text": user_text[:120],
+                    }
 
-        # 用户原话强度分级：含强信号 → 显式请求；否则 → bot 主动发图
-        is_explicit = detect_explicit_image_request(user_text)
+        if user_text and detect_explicit_image_request(user_text):
+            is_explicit = True
+        elif user_text:
+            is_explicit = False
+        else:
+            # 拿不到用户原话时退化到 Planner reasoning：仅当 reasoning 出现明确指向用户请求的措辞才升级到 explicit
+            reasoning_text = str(reasoning or "").strip()
+            signal_source = "reasoning" if reasoning_text else "none"
+            signal_text = reasoning_text
+            is_explicit = bool(reasoning_text) and _reasoning_implies_explicit_request(reasoning_text)
+
         category = "explicit" if is_explicit else "proactive"
-
         can_send, detail = self._check_action_image_interval(category)
         return {
             "should_generate": can_send,
             "explicit_request": is_explicit,
             "category": category,
             "detail": detail,
+            "signal_source": signal_source,
+            "signal_text": signal_text[:120],
         }
 
     def _check_action_image_interval(self, category: str) -> tuple[bool, str]:
@@ -1852,24 +2208,44 @@ class NaiInvocation(ModelConfigMixin):
 
         分档：
         - explicit:  用户原话明确要求看图/画图/自拍/追图 → 短间隔（默认 45s）
-        - proactive: bot 主动判断需要配图（角色扮演里描述自身/场景）→ 长间隔（默认 600s）
+        - proactive: bot 主动判断需要配图 → 中间隔（默认 240s）
+        - auto_draw: reply 后置 hook 自动跟图 → 独立间隔（默认 180s），同时尊重
+          action_image_sent_at 与 auto_draw_sent_at 中较新的那次出图
         """
-        last_sent_at = session_state.get_last_action_image_sent_at(self.stream_id)
-        if last_sent_at is None:
-            return True, "首次出图"
-
-        elapsed = max(0.0, time.time() - last_sent_at)
         explicit_interval = max(
             0,
             int(self.get_config("action_guard.explicit_request_min_interval_seconds", 45) or 45),
         )
         proactive_interval = max(
             0,
-            int(self.get_config("action_guard.proactive_min_interval_seconds", 600) or 600),
+            int(self.get_config("action_guard.proactive_min_interval_seconds", 240) or 240),
+        )
+        auto_draw_interval = max(
+            0,
+            int(self.get_config("auto_draw_on_reply.min_interval_seconds", 180) or 180),
         )
 
-        required_interval = explicit_interval if category == "explicit" else proactive_interval
+        last_action_at = session_state.get_last_action_image_sent_at(self.stream_id)
+        last_auto_draw_at = session_state.get_last_auto_draw_sent_at(self.stream_id)
 
+        if category == "auto_draw":
+            # 自动跟图：尊重所有最近出图时间，取最近的一次做间隔判定
+            effective_last = max(
+                (ts for ts in (last_action_at, last_auto_draw_at) if ts is not None),
+                default=None,
+            )
+            required_interval = auto_draw_interval
+        elif category == "explicit":
+            effective_last = last_action_at
+            required_interval = explicit_interval
+        else:
+            effective_last = last_action_at
+            required_interval = proactive_interval
+
+        if effective_last is None:
+            return True, "首次出图"
+
+        elapsed = max(0.0, time.time() - effective_last)
         if elapsed >= required_interval:
             return True, "触发条件满足"
 
