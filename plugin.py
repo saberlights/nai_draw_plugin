@@ -258,7 +258,6 @@ class NaiPicPlugin(MaiBotPlugin):
         "action_guard",
         "auto_draw_on_reply",
         "random_scene",
-        "tagger",
         "components",
         "prompt_show",
         "nsfw_filter",
@@ -280,7 +279,6 @@ class NaiPicPlugin(MaiBotPlugin):
         "prompt_generator": "========== 提示词生成（/nai） ==========",
         "action_guard": "========== 自动出图触发保护 ==========",
         "random_scene": "========== 随机场景生成（/nai 随机） ==========\n未配置的项会回退到 [prompt_generator]",
-        "tagger": "========== 图片打标（/打标） ==========\n用法：引用回复一张图片，然后发送 /打标",
         "components": "========== 功能开关 ==========",
         "custom_prompt": (
             "========== 自定义系统提示词 ==========\n"
@@ -431,6 +429,11 @@ class NaiPicPlugin(MaiBotPlugin):
                 default=False,
                 description="作用同 model_nai4_5.auto_smea"
             ),
+            "variety_boost": ConfigField(
+                type=bool,
+                default=False,
+                description="作用同 model_nai4_5.variety_boost"
+            ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
@@ -521,6 +524,11 @@ class NaiPicPlugin(MaiBotPlugin):
                 default=False,
                 description="作用同 model_nai4_5.auto_smea"
             ),
+            "variety_boost": ConfigField(
+                type=bool,
+                default=False,
+                description="作用同 model_nai4_5.variety_boost"
+            ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
@@ -610,6 +618,11 @@ class NaiPicPlugin(MaiBotPlugin):
                 type=bool,
                 default=False,
                 description="底层 SMEA 类增强"
+            ),
+            "variety_boost": ConfigField(
+                type=bool,
+                default=False,
+                description="多样性增强；开启后画面构图/姿势更随机，适合避免反复同一构图（透传到 inner.variety_boost）"
             ),
             "image_format": ConfigField(
                 type=str,
@@ -777,13 +790,13 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "explicit_request_min_interval_seconds": ConfigField(
                 type=int,
-                default=45,
-                description="用户原话含明确画图/自拍/肖像/追图等强信号时的最小间隔（秒）"
+                default=5,
+                description="用户原话含明确画图/自拍/肖像/追图等强信号时的最小间隔（秒）；默认 5 秒只防同一秒内重复触发，不再做长冷却"
             ),
             "proactive_min_interval_seconds": ConfigField(
                 type=int,
-                default=240,
-                description="用户原话未含强信号、由 bot 主动判断要发图时的最小间隔（秒）；显著高于显式档以避免闲聊刷图"
+                default=10,
+                description="用户原话未含强信号、由 bot 主动判断要发图时的最小间隔（秒）；默认 10 秒，给 Planner 两轮 reasoning 之间一点缓冲"
             ),
             "weak_negative_ttl_seconds": ConfigField(
                 type=int,
@@ -809,8 +822,8 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "min_interval_seconds": ConfigField(
                 type=int,
-                default=180,
-                description="reply 自动跟图的独立最小间隔（秒）；与显式出图共享一次冷却但独立计时"
+                default=15,
+                description="reply 自动跟图的独立最小间隔（秒）；默认 15 秒，与显式出图独立计时，关键词召回噪音大故略高于 explicit/proactive"
             ),
             "self_image_boost": ConfigField(
                 type=bool,
@@ -838,43 +851,6 @@ class NaiPicPlugin(MaiBotPlugin):
                     "slow_threshold": 30.0
                 },
                 description="随机场景生成自定义模型配置（可选），model_list 中的模型名称必须是系统 model_config 中已定义的模型"
-            ),
-        },
-        "tagger": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用 /打标 命令"
-            ),
-            "model_task": ConfigField(
-                type=str,
-                default="vlm",
-                description="打标使用的模型任务名（对应 model_config.model_task_config.<name>，默认 vlm）"
-            ),
-            "custom_model": ConfigField(
-                type=dict,
-                default={
-                    "model_list": [],
-                    "max_tokens": 1024,
-                    "temperature": 0.2,
-                    "slow_threshold": 30.0
-                },
-                description=(
-                    "打标专用自定义模型配置（可选）。"
-                    "当 model_list 非空时将优先使用该配置，完全独立于 model_task。"
-                    "若未显式设置 tagger.max_tokens/tagger.temperature，将默认采用这里的同名值。"
-                    "注意：所选模型必须支持图像输入。"
-                )
-            ),
-            "temperature": ConfigField(
-                type=float,
-                default=0.2,
-                description="打标模型温度（越低越稳定）"
-            ),
-            "max_tokens": ConfigField(
-                type=int,
-                default=1200,
-                description="打标模型最大输出 token"
             ),
         },
         "custom_prompt": {
@@ -1140,13 +1116,14 @@ class NaiPicPlugin(MaiBotPlugin):
         self,
         session_id: str = "",
         response: str = "",
-        retry: bool = False,
-        attempt: int = 0,
+        attempt: int = 1,
         **kwargs: Any,
     ) -> None:
         """OBSERVE 模式：reply 文本生成成功时旁路评分，命中阈值就启动后台跟图。"""
-        del kwargs, attempt
-        if retry:
+        del kwargs
+        # 主程序 LLM retry 时本 hook 会被反复触发（attempt>=2 表示当前是 retry 后的版本）；
+        # 中间被丢弃的版本不应该启动跟图，否则会污染签名集合并浪费一次评分。
+        if attempt > 1:
             return
 
         normalized_session = (session_id or "").strip()
@@ -1190,7 +1167,10 @@ class NaiPicPlugin(MaiBotPlugin):
 
         async def _runner() -> None:
             try:
-                await invocation.handle_auto_draw_from_reply(description)
+                await invocation.handle_auto_draw_from_reply(
+                    description,
+                    reply_context_text=reply_text,
+                )
             except Exception:
                 pass
 
@@ -1601,38 +1581,48 @@ class NaiPicPlugin(MaiBotPlugin):
             "生成图片/照片/自拍/场景图。"
             "可以根据语境发送 bot 本人的自拍、非自拍肖像照，或符合对话场景的图片。"
             "既可以响应用户明确的看图请求，也可以在 bot 自己说出视觉自指/进入情感互动节点时主动跟一张图。"
+            "【调用语义 - 重要】本 Action 是 fire-and-forget 异步任务："
+            "调用成功只代表'图片任务已提交后台'，图片由插件自行通过会话发送，"
+            "不会出现在本次 tool_result 的 content 里。"
+            "因此：调用本 Action 后，禁止再调用 send_image / 引用本次 call_id 的 media_index，"
+            "也禁止调用 wait 等待图片——图片到时会自行送达，按文字正常推进对话即可。"
         ),
         activation_type=ActivationType.ALWAYS,
         parallel_action=True,
         action_parameters={
+            # 五个结构化字段：每个字段只承担一类信息，强制 Planner 分维度思考，
+            # 避免一锅炖成关键词堆砌。下游会按字段顺序拼成单行 request；若 Planner
+            # 兼容性原因只填了 description，则按整段兜底使用。
+            "subject_and_pov": (
+                "主体与视角，不写其它。"
+                "格式：'一女' / '一男一女' / '两女'，可加视角：'POV' / '自拍' / '第三视角'。"
+                "区分：对方看 bot 做事=POV；bot 自己举手机=自拍；旁观叙事=第三视角或留空。"
+            ),
+            "action": (
+                "本轮核心动作，必须用用户原话/reasoning 里的动词，禁止软化。"
+                "如'揉胸'写'揉胸'、不要写'轻捧'；'骑'写'骑乘'、不要写'坐在身上'。"
+                "纯静态画面可留空或写'站立'。"
+                "禁词：轻捧/触碰/贴近/迷离/陶醉/挑逗。"
+            ),
+            "emotion": (
+                "情绪状态，必须贴 reasoning 里 bot 当前心境，不要默认套'迷离咬唇'。"
+                "示例：'不情愿 害羞'、'撒娇 期待'、'紧张 微微低头'、'慵懒 半眯眼'。"
+                "无明显情绪可留空。"
+            ),
+            "scene_delta": (
+                "本轮相对上一张图新增/变化的场景或服装动作，没变化就留空。"
+                "沿用元素（卧室/床上等）由系统自动继承，不要在这里重复。"
+                "服装变化（脱/穿/掀）写这里；外貌锚点（长发/瞳色/choker）由配置注入，禁写。"
+            ),
+            "framing": (
+                "构图镜头，1-2 个词："
+                "近景/特写/全身/胸部以上/俯视/仰视/侧面/肖像照/生活照/pov_hands。"
+                "默认不要每次写'近景'，按本轮重点选。"
+            ),
             "description": (
-                "【必须】先输出人数（如'一女''一男一女''两女'），再输出画面关键词。"
-                "关键词用空格分隔，只输出有视觉意义的核心词，禁止输出完整句子和虚词。"
-                "【意图对齐规则】"
-                "（A）若本轮是用户在要看图：description 必须优先符合用户这轮要求和当前上下文连续意图。"
-                "用户要看自拍/本人照片/穿搭/状态/环境/工作现场/上一张图的延续，就按那个意图写，"
-                "不要擅自改成别的题材、别的关注点、别的穿搭主题。"
-                "（B）若本轮是 bot 自己想主动发图（用户没明确开口，但你这一轮要回复的话里"
-                "提到了自身的穿着/姿态/动作/所处场景，或处在晚安/回家/想你了等亲密节点）："
-                "人物默认就是 bot 本人（'一女'）；优先写'自拍 近景'或'肖像照 近景'或'生活照'；"
-                "场景词沿用 bot 这轮要说的活动/位置（窗边、阳台、便利店、咖啡店…）。"
-                "不要把主动出图写成画一张陌生少女，要写成'她让你看一眼她现在'。"
-                "服装、场景、构图可以补全，但必须服务于当前的视觉重点；"
-                "即使用户没有明确写出衣服，也应该根据场景主动补出合理的服装款式、颜色、必要时的材质/质感细节，"
-                "让 description 对后续 tag 检索足够具体，而不是只写空泛的'衣服''穿搭''常服'。"
-                "但这种补全必须自然贴合场景与人物状态，不要每次都固定成同一种穿搭。"
-                "如果上下文是在延续上一张图，就优先延续同一人物状态、场景和视觉重点，而不是突然换成固定套路。"
-                "尤其是连续发图时，若用户没有明确要求换衣服、换颜色、换材质、换风格，就默认沿用上一张的服装款式、主色和材质，不要自己把白衣换成黑衣。"
-                "【图片类型规则】先判断这轮更适合 自拍、非自拍肖像/生活照，还是普通画图。"
-                "只有用户明确想要自拍、镜拍、前置、拍给他看时，才必须包含'自拍'二字；"
-                "如果只是想看bot本人的样子、穿搭、状态，也可以输出不带'自拍'的肖像照/生活照描述；"
-                "如果重点是当前环境、手头在做的事、某个视觉场景，也可以输出更合适的场景图描述。"
-                "例如：用户说'发张自拍'→'一女 自拍'；"
-                "用户说'想看看你长什么样'→'一女 肖像照 正脸 近景'；"
-                "用户说'看看你穿黑丝的样子'→'一女 全身 黑丝 室内生活照'；"
-                "用户只说'看看你现在的样子'→ 可以补成'一女 室内生活照 靠窗 慵懒 近景'这类更具体但符合场景的描述；"
-                "bot 主动说'我刚洗完澡靠窗发呆'→'一女 肖像照 浴袍 窗边 近景'（主动跟图）；"
-                "用户说'画初音未来穿泳装'→'一女 初音未来 泳装 海边'（这是画图，不是自拍）。"
+                "兜底字段，正常留空。"
+                "只有当本轮内容无法拆进上面 5 个字段时，才在这里写一行完整关键词串。"
+                "格式：人数 + 视角 + 动作 + 情绪 + 场景 + 构图；禁写外貌锚点和画质词。"
             ),
             "size": "图片尺寸（默认从配置获取）",
         },
@@ -1673,9 +1663,22 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         if not await invocation.ensure_user_not_blacklisted():
             return False, "黑名单用户"
+
+        # Action Guard 同步预检：让 Planner 第一时间拿到拦截原因，避免后台默默吞掉
+        # 评估结果会缓存到 invocation，后台 handle_action 复用同一次结论，不会重复读消息库
+        guard_state = await invocation.preflight_action_guard()
+        if guard_state is not None and not guard_state["should_generate"]:
+            return False, guard_state["detail"]
+
         if not self._start_image_generation_in_background(stream_id, invocation.handle_action):
-            return False, ""
-        return True, "已开始生成图片"
+            return False, (
+                "同会话已有图片任务在后台进行中，本轮跳过出图、按文字回复推进；"
+                "请不要调用 send_image 或 wait，正在生成的那张图会自行送达"
+            )
+        return True, (
+            "图片任务已提交后台，图片由插件异步发送到会话，本次 tool_result 不包含 image 内容；"
+            "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可"
+        )
 
 
 def create_plugin():

@@ -228,6 +228,10 @@ class NaiWebClient:
         if "sm_dyn" in model_config and model_config["sm_dyn"] not in (None, ""):
             inner["sm_dyn"] = bool(model_config["sm_dyn"])
 
+        # 多样性增强（透传到上游 NovelAI，文档 §5 表外字段）
+        if bool(model_config.get("variety_boost", False)):
+            inner["variety_boost"] = True
+
         # nai_extra_params 透传（用户在 config.toml 显式声明的扩展字段）
         extra_params = model_config.get("nai_extra_params") or {}
         if isinstance(extra_params, dict):

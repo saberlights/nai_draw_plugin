@@ -340,6 +340,46 @@ def _inject_self_image_hint(description: str, *, mode: str) -> str:
     return f"{hint} {desc}"
 
 
+def _render_reply_context_block(reply_context_text: str) -> str:
+    """渲染 reply 后置跟图专用的"bot 即将说出的回复原文"语境块。
+
+    Reply hook 链路里，description 是关键词拼接（"一女 自拍 近景 窗边"），LLM 看不到 bot
+    实际要说的那句话。这个块把原文塞回 prompt，让 LLM 基于具体语境补全画面细节（衣着/光照/
+    姿态），避免图与文脱节。其他链路（command / Planner Action）调用方传空字符串即可。
+    """
+    text = (reply_context_text or "").strip()
+    if not text:
+        return ""
+    return (
+        "<bot_reply_context>\n"
+        "（这是 bot 本人这一轮即将说出去的回复原文。请基于这段语境扩展画面细节"
+        "——衣着、姿态、光照、室内陈设等——让生成的图与文匹配，"
+        "而不是仅看 user_request 的关键词。）\n"
+        f"{text}\n"
+        "</bot_reply_context>"
+    )
+
+
+def _render_reasoning_context_block(reasoning_context_text: str) -> str:
+    """渲染 Planner Action 链路专用的"Planner reasoning"语境块。
+
+    Action 链路里，``description`` / 5 个结构化字段都是 Planner 关键词化的二手语义；
+    reasoning 才是原始动机和动词/情绪/关系。把 reasoning 塞回模板，让下游 LLM 在
+    user_request 失真时能回到原意，避免动作被软化、情绪被默认套模板。
+    其他入口（command / reply 自动跟图）传空字符串即可。
+    """
+    text = (reasoning_context_text or "").strip()
+    if not text:
+        return ""
+    return (
+        "<planner_reasoning>\n"
+        "（Planner 本轮 reasoning。与 user_request 冲突时以本块为准："
+        "动词保持原意，情绪贴 reasoning，不要默认套'迷离/陶醉'。）\n"
+        f"{text}\n"
+        "</planner_reasoning>"
+    )
+
+
 def _extract_message_sender_id(message: Any) -> str:
     """从消息行（dict 或对象）中提取发送者 user_id。"""
     if isinstance(message, dict):
@@ -446,6 +486,8 @@ class NaiInvocation(ModelConfigMixin):
         self.log_prefix = "nai_draw_plugin"
         self.api_client = NaiWebClient(self)
         self._last_send_timestamp: float | None = None
+        # Action Guard 评估缓存：主路径同步预检后，后台 handle_action 复用结果，避免重复读消息库
+        self._cached_action_trigger_assessment: dict[str, Any] | None = None
 
     def close(self) -> None:
         """释放当前调用持有的可关闭资源。"""
@@ -1320,6 +1362,8 @@ class NaiInvocation(ModelConfigMixin):
         last_selfie_request: str = "",
         last_selfie_scene: str = "",
         last_selfie_anchor: Optional[dict[str, list[str]]] = None,
+        reply_context_text: str = "",
+        reasoning_context_text: str = "",
     ) -> str:
         """渲染提示词生成模板。"""
         custom_system_prompt = ""
@@ -1336,8 +1380,12 @@ class NaiInvocation(ModelConfigMixin):
             last_selfie_scene=last_selfie_scene,
             last_selfie_anchor=last_selfie_anchor,
         )
+        reply_context_block = _render_reply_context_block(reply_context_text)
+        reasoning_context_block = _render_reasoning_context_block(reasoning_context_text)
         prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_system_prompt).strip()
         prompt = prompt.replace("<<PREVIOUS_PROMPT>>", previous_block).strip()
+        prompt = prompt.replace("<<REPLY_CONTEXT>>", reply_context_block).strip()
+        prompt = prompt.replace("<<REASONING_CONTEXT>>", reasoning_context_block).strip()
         prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", self._build_current_time_context()).strip()
         prompt = prompt.replace("<<SELFIE_HINT>>", get_selfie_hint()).strip()
         prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context).strip()
@@ -1432,8 +1480,16 @@ class NaiInvocation(ModelConfigMixin):
         *,
         allow_inherit: bool,
         include_custom_system_prompt: bool = True,
+        reply_context_text: str = "",
+        reasoning_context_text: str = "",
     ) -> str | None:
-        """将自然语言描述转换为提示词。"""
+        """将自然语言描述转换为提示词。
+
+        ``reply_context_text`` 仅在 reply 后置自动跟图链路传入，作为 bot 即将说出的回复
+        原文喂给 LLM；``reasoning_context_text`` 仅在 Planner Action 链路传入，作为本轮
+        出图的原始动机/动词/情绪语义喂给 LLM。其他入口传空字符串即可，渲染时占位符会被
+        消解为空。
+        """
         request_text = str(request_text or "").strip()
         if not request_text:
             return None
@@ -1482,6 +1538,8 @@ class NaiInvocation(ModelConfigMixin):
             last_selfie_request=last_selfie_request if allow_inherit else "",
             last_selfie_scene=last_selfie_scene if allow_inherit else "",
             last_selfie_anchor=last_selfie_anchor if allow_inherit else None,
+            reply_context_text=reply_context_text,
+            reasoning_context_text=reasoning_context_text,
         )
         tag_candidates = await self._retrieve_tag_candidates(request_text)
         prompt = prompt.replace("<<TAG_CANDIDATES>>", tag_candidates).strip()
@@ -1842,6 +1900,32 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text(f"执行失败：{str(exc)[:100]}")
             return False, f"执行失败: {exc}", True
 
+    # 结构化字段顺序固定为：主体视角 → 动作 → 情绪 → 场景增量 → 构图。
+    # 这个顺序与 NAI tag 标准排序对齐，下游 prompt 模板里"tag 顺序"硬规则也基于此排序解析。
+    _STRUCTURED_DESCRIPTION_FIELDS = (
+        "subject_and_pov",
+        "action",
+        "emotion",
+        "scene_delta",
+        "framing",
+    )
+
+    def _compose_description_from_action_data(self) -> str:
+        """把 Planner 拆分的 5 个结构化字段拼成单行 request 文本。
+
+        - 5 字段全空时回落到旧版 ``description`` 字段，保持对 Planner 偶发只填 description 的兼容。
+        - 拼接时各字段之间用空格连接，与原 description 关键词串风格保持一致。
+        - 任何一个字段非空都视为"走结构化路径"，此时忽略 description（防止 Planner 同时填 6 个字段导致重复）。
+        """
+        structured_parts: list[str] = []
+        for key in self._STRUCTURED_DESCRIPTION_FIELDS:
+            value = str(self.action_data.get(key, "") or "").strip()
+            if value:
+                structured_parts.append(value)
+        if structured_parts:
+            return " ".join(structured_parts)
+        return str(self.action_data.get("description", "") or "").strip()
+
     async def handle_action(self) -> tuple[bool, str]:
         """处理 `nai_web_draw` Action。"""
         if not await self.ensure_user_not_blacklisted():
@@ -1849,7 +1933,7 @@ class NaiInvocation(ModelConfigMixin):
         if not await self.ensure_generation_permission():
             return False, "没有权限"
 
-        description = str(self.action_data.get("description", "") or "").strip()
+        description = self._compose_description_from_action_data()
         size = str(self.action_data.get("size", "") or "").strip()
 
         # Planner 极少数情况下不给 description，回落到 reasoning 仅作生图素材；
@@ -1889,6 +1973,7 @@ class NaiInvocation(ModelConfigMixin):
             description,
             allow_inherit=True,
             include_custom_system_prompt=True,
+            reasoning_context_text=self.reasoning,
         )
         if generated_prompt:
             description = generated_prompt.strip()
@@ -1960,7 +2045,12 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text("图片生成完成！")
         return send_result[0], send_result[1] or ""
 
-    async def handle_auto_draw_from_reply(self, seed_description: str) -> tuple[bool, str]:
+    async def handle_auto_draw_from_reply(
+        self,
+        seed_description: str,
+        *,
+        reply_context_text: str = "",
+    ) -> tuple[bool, str]:
         """reply 后置 hook 触发的自动跟图。
 
         与 handle_action 区别：
@@ -1968,6 +2058,10 @@ class NaiInvocation(ModelConfigMixin):
         - guard 走 ``category="auto_draw"``，使用独立间隔门
         - 发送计入 ``last_auto_draw_sent_at``，不会冻结后续显式请求
         - 失败不发用户可见报错（OBSERVE hook 静默兜底）
+
+        ``reply_context_text`` 是 bot 即将说出的回复原文：description 只是关键词拼接，LLM
+        看不到 reply 的具体语境（"刚洗完澡"暗示的浴袍/湿发等）；这段原文会注入 prompt 模板，
+        让生成的图与文匹配。
         """
         if not await self.ensure_user_not_blacklisted():
             return False, "黑名单用户"
@@ -2002,6 +2096,7 @@ class NaiInvocation(ModelConfigMixin):
             description,
             allow_inherit=True,
             include_custom_system_prompt=True,
+            reply_context_text=reply_context_text,
         )
         if generated_prompt:
             description = generated_prompt.strip()
@@ -2087,7 +2182,26 @@ class NaiInvocation(ModelConfigMixin):
         """检查是否启用自动出图保护。"""
         return bool(self.get_config("action_guard.enabled", True))
 
+    async def preflight_action_guard(self) -> dict[str, Any] | None:
+        """Action Guard 同步预检：让 Planner 在 RPC 返回时就能拿到拦截原因。
+
+        返回 None 表示 guard 未启用，调用方应放行；返回 dict 表示 guard 结论，
+        ``should_generate`` 为 False 时 ``detail`` 给出可透传给 Planner 的失败原因。
+        结果会缓存到 invocation 上，后台 ``handle_action`` 复用同一次评估，避免重复读消息库。
+        """
+        if not self._is_action_guard_enabled():
+            return None
+        return await self._assess_action_trigger(reasoning=self.reasoning)
+
     async def _assess_action_trigger(self, reasoning: str = "") -> dict[str, Any]:
+        """Action Guard 评估入口；结果缓存供 handle_action 后台复用。"""
+        if self._cached_action_trigger_assessment is not None:
+            return self._cached_action_trigger_assessment
+        result = await self._compute_action_trigger_assessment(reasoning=reasoning)
+        self._cached_action_trigger_assessment = result
+        return result
+
+    async def _compute_action_trigger_assessment(self, reasoning: str = "") -> dict[str, Any]:
         """评估当前 Action 是否真的适合出图，并应用频率保护。
 
         设计原则：
@@ -2162,17 +2276,19 @@ class NaiInvocation(ModelConfigMixin):
         - auto_draw: reply 后置 hook 自动跟图 → 独立间隔（默认 180s），同时尊重
           action_image_sent_at 与 auto_draw_sent_at 中较新的那次出图
         """
+        # 三档间隔走 ``get_config`` 的 default 兜底，不再用 ``or X`` 二次兜底——
+        # 否则用户显式配 0（"完全不节流"）会被当成 falsy 顶替成默认值
         explicit_interval = max(
             0,
-            int(self.get_config("action_guard.explicit_request_min_interval_seconds", 45) or 45),
+            int(self.get_config("action_guard.explicit_request_min_interval_seconds", 5)),
         )
         proactive_interval = max(
             0,
-            int(self.get_config("action_guard.proactive_min_interval_seconds", 240) or 240),
+            int(self.get_config("action_guard.proactive_min_interval_seconds", 10)),
         )
         auto_draw_interval = max(
             0,
-            int(self.get_config("auto_draw_on_reply.min_interval_seconds", 180) or 180),
+            int(self.get_config("auto_draw_on_reply.min_interval_seconds", 15)),
         )
 
         last_action_at = session_state.get_last_action_image_sent_at(self.stream_id)
@@ -2200,7 +2316,14 @@ class NaiInvocation(ModelConfigMixin):
             return True, "触发条件满足"
 
         remaining_seconds = int(required_interval - elapsed + 0.999)
-        return False, f"距离上次出图过近，还需等待约 {remaining_seconds} 秒"
+        logger.debug(
+            "%s Action 出图节流命中: category=%s required=%ds remaining=%ds",
+            self.log_prefix, category, required_interval, remaining_seconds,
+        )
+        # 给 Planner 的 detail 不含具体秒数、不出现"等待"字样：之前写成"还需等待约 X 秒"
+        # 会被 Planner LLM 直接联想到主程序的 wait 工具，进而调 wait(seconds=120) 把整个
+        # 对话循环锁死。这里改成只描述"本轮跳过 + 走文字"，并明确禁止 wait。
+        return False, "图片节流中，本轮跳过出图、直接用文字回复推进；插件会自行解除冷却，请不要使用 wait 工具"
 
     async def handle_admin_command(self, action: str, param: str) -> tuple[bool, str | None, bool]:
         """处理 `/nai st|sp|set|art|size|help`。"""
@@ -2222,42 +2345,40 @@ class NaiInvocation(ModelConfigMixin):
 /nai 随机自拍 - 随机生成一张 NSFW 自拍图片
 /nai0 <英文标签> - 直接使用英文标签生成图片
   示例：/nai0 1girl, hatsune miku, smile
+💡 描述含「自拍/镜子/合照/手机拍」走自拍路径；
+   含「肖像/生活照/立绘/portrait」走肖像路径；
+   其它走普通画图。
 
-【模型管理】（仅管理员可用）
-/nai set - 查看当前模型和可用模型列表
-/nai set <代号> - 切换生图模型
-  可用模型：3=V3, f3=Furry V3, 4=V4, 4.5=V4.5 Full, 4.5p=V4.5 Preview
+【模型 / 尺寸 / 画师】（所有人可用，会话级，重启回退默认）
+/nai set [代号] - 查看/切换模型
+  代号：3=V3, f3=Furry V3, 4=V4, 4.5=V4.5 Full, 4.5p=V4.5 Preview
+/nai size [代号] - 查看/切换尺寸
+  代号：竖/v、横/h、方/s
+/nai art [编号] - 查看/切换画师风格预设
 
-【画师风格预设】
-/nai art - 查看当前画师串列表
-/nai art <编号> - 切换画师风格预设
-
-【图片尺寸】
-/nai size - 查看当前尺寸
-/nai size <尺寸> - 切换图片尺寸
-
-【自动撤回】
-/nai on - 开启图片自动撤回功能（仅管理员可用）
-/nai off - 关闭图片自动撤回功能（仅管理员可用）
+【自动撤回】（仅管理员）
+/nai on - 开启图片自动撤回
+/nai off - 关闭图片自动撤回
 
 【手动撤回】
 /nai 撤回 - 撤回最近一张本插件发送的图片
 
 【提示词显示】
-/nai pt on - 开启提示词显示
-/nai pt off - 关闭提示词显示
+/nai pt on/off - 开关提示词显示
 
-【NSFW过滤】
-/nai nsfw - 查看当前 NSFW 过滤状态
-/nai nsfw on - 开启 NSFW 过滤
-/nai nsfw off - 关闭 NSFW 过滤
+【NSFW 过滤】（会话级）
+/nai nsfw - 查看当前状态
+/nai nsfw on/off - 开关 NSFW 过滤
 
 【管理员功能】
 /nai st - 开启管理员模式
 /nai sp - 关闭管理员模式
 /nai ban <用户ID> - 拉黑指定用户
 /nai unban <用户ID> - 取消拉黑指定用户
-/nai banlist - 查看黑名单"""
+/nai banlist - 查看黑名单
+
+【其它】
+/nai help - 显示本帮助"""
             await self.send_text(help_text)
             return True, "显示帮助信息", True
 
