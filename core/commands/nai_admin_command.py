@@ -207,9 +207,6 @@ class NaiAdminControlCommand(BaseCommand):
 /nai st - 开启管理员模式
 /nai sp - 关闭管理员模式
 
-【图片打标】
-/打标 - 回复一张图片，使用VLM生成NAI格式标签
-
 【其他】
 /nai help - 显示此帮助信息
 

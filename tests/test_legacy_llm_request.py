@@ -99,7 +99,7 @@ class LegacyLLMRequestTest(unittest.TestCase):
     def test_generate_response_for_image_should_prefer_vlm_task(self):
         import asyncio
 
-        request = LegacyLLMRequest(model_set=object(), request_type="nai_draw_plugin.tagger")
+        request = LegacyLLMRequest(model_set=object(), request_type="nai_draw_plugin.vlm")
         response, result = asyncio.run(
             request.generate_response_for_image(
                 prompt="tag this",
