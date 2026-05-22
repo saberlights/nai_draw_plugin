@@ -743,7 +743,6 @@ nai_draw_plugin/
 │       ├── random_scene_description.py
 │       ├── tag_data_builder.py      # xlsx → JSON tag 数据构建（local 模式用）
 │       ├── danbooru_api.py
-│       ├── image_url_helper.py
 │       └── display_message_helper.py
 └── tests/                           # 单元 / 集成测试
 ```

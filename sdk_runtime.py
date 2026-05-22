@@ -61,7 +61,6 @@ from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever
 from .core.services.user_blacklist import user_blacklist
 from .core.utils.display_message_helper import build_action_image_display_message
-from .core.utils.image_url_helper import save_base64_image_to_file
 from .core.utils.prompt_output_parser import parse_prompt_from_structured_output
 from .core.utils.prompt_postprocessor import (
     normalize_prompt_order,
@@ -963,61 +962,12 @@ class NaiInvocation(ModelConfigMixin):
         return base64.b64encode(content).decode("utf-8")
 
     async def _send_base64_image_result(self, image_base64: str, display_message: str) -> bool:
-        """发送 Base64 图片结果。
+        """以 Base64 image 段直发图片到平台。
 
-        注意：单一 send_custom 调用即视为一次最终投递。即使返回 False，下层
-        Platform IO 仍可能已成功派发（例如 maim_message 报 "未找到目标平台" 但
-        send_service 通过备用 driver 派发成功），此时如果再以另一种格式重发，会
-        在用户侧产生同一张图重复出现的现象。因此 False 返回不再触发同一图片的
-        二次发送，只有保存失败或 send 抛异常时才走另一路径，避免重复投递。
+        maim_message + napcat 协议原生支持 base64 image segment，napcat 自行落盘
+        后再投递；插件无需也不应当依赖 ``file://`` 本地路径——一旦 napcat 与本插件
+        不在同一文件系统（如 napcat 跑在容器内），``file://`` 引用就无法被读取。
         """
-        target_platform = self._get_target_platform()
-        if target_platform == "qq":
-            image_path = save_base64_image_to_file(image_base64)
-            if image_path:
-                file_reference = f"file://{image_path}"
-                try:
-                    return await self.send_custom(
-                        "imageurl",
-                        file_reference,
-                        display_message=display_message,
-                    )
-                except Exception as exc:
-                    logger.warning("%s QQ 本地图片文件发送异常，回退为 Base64: %r", self.log_prefix, exc)
-            else:
-                logger.warning("%s QQ 图片保存失败，回退为直接发送 Base64", self.log_prefix)
-
-            return await self.send_custom(
-                "image",
-                image_base64,
-                display_message=display_message,
-            )
-
-        if not target_platform:
-            logger.warning("%s 无法识别目标平台，优先尝试直接发送 Base64 图片", self.log_prefix)
-            try:
-                return await self.send_custom(
-                    "image",
-                    image_base64,
-                    display_message=display_message,
-                )
-            except Exception as exc:
-                logger.warning("%s 直接发送 Base64 图片异常，回退为本地文件 URL: %r", self.log_prefix, exc)
-
-        image_path = save_base64_image_to_file(image_base64)
-        if image_path:
-            file_reference = f"file://{image_path}"
-            try:
-                return await self.send_custom(
-                    "imageurl",
-                    file_reference,
-                    display_message=display_message,
-                )
-            except Exception as exc:
-                logger.warning("%s 本地图片文件发送异常，回退为 Base64: %r", self.log_prefix, exc)
-        else:
-            logger.warning("%s 图片保存失败，回退为直接发送 Base64", self.log_prefix)
-
         return await self.send_custom(
             "image",
             image_base64,

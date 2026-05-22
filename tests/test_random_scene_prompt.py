@@ -108,10 +108,6 @@ class _DummyAutoRecallMixin:
 auto_recall_mixin_module.AutoRecallMixin = _DummyAutoRecallMixin
 sys.modules["core.mixins.auto_recall_mixin"] = auto_recall_mixin_module
 
-image_url_helper_module = types.ModuleType("core.utils.image_url_helper")
-image_url_helper_module.save_base64_image_to_file = lambda *_args, **_kwargs: ""
-sys.modules["core.utils.image_url_helper"] = image_url_helper_module
-
 model_config_mixin_module = types.ModuleType("core.mixins.model_config_mixin")
 
 

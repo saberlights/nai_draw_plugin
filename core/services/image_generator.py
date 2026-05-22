@@ -162,7 +162,7 @@ class ImageGenerationService:
             是否发送成功
         """
         try:
-            # URL 格式
+            # URL 格式：交给适配器自行拉取
             if image_data.startswith(("http://", "https://")):
                 try:
                     return await self.component.send_custom(
@@ -173,32 +173,7 @@ class ImageGenerationService:
                 except TypeError:
                     return await self.component.send_custom("imageurl", image_data)
 
-            # Base64 格式
-            if image_data.startswith(("iVBORw", "/9j/", "UklGR", "R0lGOD")):
-                # 尝试保存为文件再发送
-                image_path = self._save_base64_to_file(image_data)
-                if image_path:
-                    try:
-                        return await self.component.send_custom(
-                            "imageurl",
-                            f"file://{image_path}",
-                            display_message=NAI_PIC_IMAGE_DISPLAY_MARKER,
-                        )
-                    except TypeError:
-                        return await self.component.send_custom("imageurl", f"file://{image_path}")
-                else:
-                    # 回退为直接发送 Base64
-                    logger.warning(f"{self.log_prefix} 图片保存失败，回退为Base64发送")
-                    try:
-                        return await self.component.send_custom(
-                            "image",
-                            image_data,
-                            display_message=NAI_PIC_IMAGE_DISPLAY_MARKER,
-                        )
-                    except TypeError:
-                        return await self.component.send_image(image_data)
-
-            # 其他格式尝试直接发送
+            # Base64 / 其它格式：以 image 段直发，napcat 等适配器原生支持
             try:
                 return await self.component.send_custom(
                     "image",
@@ -211,20 +186,6 @@ class ImageGenerationService:
         except Exception as e:
             logger.error(f"{self.log_prefix} 图片发送失败: {e!r}")
             return False
-
-    def _save_base64_to_file(self, base64_data: str) -> Optional[str]:
-        """保存 Base64 图片到文件"""
-        try:
-            # 尝试从新路径导入
-            try:
-                from ..utils.image_url_helper import save_base64_image_to_file
-            except ImportError:
-                # 兼容旧路径
-                from ..image_url_helper import save_base64_image_to_file
-            return save_base64_image_to_file(base64_data)
-        except Exception as e:
-            logger.warning(f"{self.log_prefix} 保存图片失败: {e}")
-            return None
 
     def process_selfie_prompt(self, prompt: str, model_config: dict) -> str:
         """

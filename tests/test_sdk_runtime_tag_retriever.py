@@ -227,9 +227,10 @@ def test_retrieve_tag_candidates_falls_back_to_local_when_online_returns_empty(
     assert local_retriever.calls == [("画一张猫耳少女", 6, 0.45)]
 
 
-def test_send_image_result_skips_direct_send_for_generation_url_and_uses_local_file(
+def test_send_image_result_downloads_generation_url_then_sends_base64_for_unknown_platform(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """未知平台 + generation URL：跳过直发，下载后以 base64 image 段直发。"""
     invocation = _build_image_send_invocation()
     send_calls: list[tuple[str, str, str]] = []
     sent_texts: list[str] = []
@@ -245,9 +246,6 @@ def test_send_image_result_skips_direct_send_for_generation_url_and_uses_local_f
         storage_message: bool = True,
     ) -> bool:
         send_calls.append((message_type, content, display_message))
-        # 模拟未知平台直发 base64 抛异常，触发回退到本地文件 URL
-        if message_type == "image":
-            raise RuntimeError("simulated direct image dispatch error")
         return True
 
     async def fake_send_text(text: str, storage_message: bool = True) -> bool:
@@ -270,7 +268,6 @@ def test_send_image_result_skips_direct_send_for_generation_url_and_uses_local_f
         "discard_pending_plugin_image_send",
         lambda *_args, **_kwargs: pytest.fail("unexpected pending-image discard"),
     )
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: "/tmp/fallback.png")
     monkeypatch.setattr(
         sdk_runtime_module.session_state,
         "set_last_action_image_sent_at",
@@ -287,18 +284,17 @@ def test_send_image_result_skips_direct_send_for_generation_url_and_uses_local_f
     result = asyncio.run(invocation._send_image_result("https://std.loliyc.com/generate?tag=test", "test"))
 
     assert result == (True, "图片生成成功", True)
-    assert [message_type for message_type, _, _ in send_calls] == ["image", "imageurl"]
-    assert send_calls[0][1] == "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
-    assert send_calls[1][1] == "file:///tmp/fallback.png"
+    assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]")]
     assert sent_texts == []
     assert len(remember_calls) == 1
     assert len(session_marks) == 1
     assert schedule_calls == [True]
 
 
-def test_send_image_result_downloads_generation_url_for_qq_when_direct_url_disabled(
+def test_send_image_result_downloads_generation_url_for_qq_after_direct_url_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """QQ 平台 + generation URL：QQ 直发 URL 失败后下载并以 base64 image 段重发。"""
     invocation = _build_image_send_invocation()
     send_calls: list[tuple[str, str, str]] = []
     sent_texts: list[str] = []
@@ -313,7 +309,10 @@ def test_send_image_result_downloads_generation_url_for_qq_when_direct_url_disab
         storage_message: bool = True,
     ) -> bool:
         send_calls.append((message_type, content, display_message))
-        return content == "file:///tmp/qq-fallback.png"
+        # QQ 远程 URL 直发失败，触发下载回退
+        if message_type == "imageurl":
+            return False
+        return True
 
     async def fake_send_text(text: str, storage_message: bool = True) -> bool:
         sent_texts.append(text)
@@ -336,11 +335,6 @@ def test_send_image_result_downloads_generation_url_for_qq_when_direct_url_disab
         lambda *_args, **_kwargs: pytest.fail("unexpected pending-image discard"),
     )
     monkeypatch.setattr(
-        sdk_runtime_module,
-        "save_base64_image_to_file",
-        lambda _data: "/tmp/qq-fallback.png",
-    )
-    monkeypatch.setattr(
         sdk_runtime_module.session_state,
         "set_last_action_image_sent_at",
         lambda stream_id, send_timestamp: session_marks.append((stream_id, send_timestamp)),
@@ -358,16 +352,17 @@ def test_send_image_result_downloads_generation_url_for_qq_when_direct_url_disab
     assert result == (True, "图片生成成功", True)
     assert send_calls == [
         ("imageurl", "https://std.loliyc.com/generate?tag=test", "[nai-image]"),
-        ("imageurl", "file:///tmp/qq-fallback.png", "[nai-image]"),
+        ("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"),
     ]
     assert len(session_marks) == 1
     assert schedule_calls == [True]
     assert sent_texts == []
 
 
-def test_send_image_result_falls_back_to_local_file_after_remote_url_exception(
+def test_send_image_result_falls_back_to_base64_after_remote_url_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """普通 CDN URL：直发抛异常 → 下载 → base64 image 段重发。"""
     invocation = _build_image_send_invocation()
     send_calls: list[tuple[str, str]] = []
     session_marks: list[tuple[str, float]] = []
@@ -399,7 +394,6 @@ def test_send_image_result_falls_back_to_local_file_after_remote_url_exception(
         "discard_pending_plugin_image_send",
         lambda *_args, **_kwargs: pytest.fail("unexpected pending-image discard"),
     )
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: "/tmp/fallback.png")
     monkeypatch.setattr(
         sdk_runtime_module.session_state,
         "set_last_action_image_sent_at",
@@ -461,14 +455,31 @@ def test_manual_recall_skips_stale_images_without_attempting_recall(
     assert sent_texts == ["❌ 找不到近期可撤回的图片（图片可能已超过平台撤回时限）"]
 
 
-def test_send_base64_image_result_does_not_fall_back_when_unknown_platform_image_send_returns_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """未知平台分支：image(base64) 直发返回 False 不应再尝试 imageurl(file://)。
+def test_send_base64_image_result_sends_image_segment_directly() -> None:
+    """_send_base64_image_result 始终以 image 段直发 base64，不依赖本地文件路径。"""
+    invocation = _build_image_send_invocation()
+    send_calls: list[tuple[str, str, str]] = []
 
-    Platform IO 在 send_custom 报 False 时仍可能已实际派发，二次发送会重复。
-    只有抛异常或没有可用文件路径时才尝试另一种格式。
-    """
+    async def fake_send_custom(
+        message_type: str,
+        content: str,
+        *,
+        display_message: str = "",
+        storage_message: bool = True,
+    ) -> bool:
+        send_calls.append((message_type, content, display_message))
+        return True
+
+    invocation.send_custom = fake_send_custom
+
+    result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
+
+    assert result is True
+    assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]")]
+
+
+def test_send_base64_image_result_propagates_send_failure() -> None:
+    """send_custom 返回 False 时函数直接返回 False，不再尝试任何 file:// 二次发送。"""
     invocation = _build_image_send_invocation()
     send_calls: list[tuple[str, str]] = []
 
@@ -482,171 +493,11 @@ def test_send_base64_image_result_does_not_fall_back_when_unknown_platform_image
         send_calls.append((message_type, content))
         return False
 
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: "/tmp/fallback.png")
-
     invocation.send_custom = fake_send_custom
-    invocation._get_target_platform = lambda: ""
 
     result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
 
     assert result is False
-    assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB")]
-
-
-def test_send_base64_image_result_unknown_platform_falls_back_to_file_when_direct_image_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """未知平台分支：image(base64) 抛异常时回退为 imageurl(file://)。"""
-    invocation = _build_image_send_invocation()
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send_custom(
-        message_type: str,
-        content: str,
-        *,
-        display_message: str = "",
-        storage_message: bool = True,
-    ) -> bool:
-        send_calls.append((message_type, content))
-        if message_type == "image":
-            raise RuntimeError("simulated dispatch error")
-        return True
-
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: "/tmp/fallback.png")
-
-    invocation.send_custom = fake_send_custom
-    invocation._get_target_platform = lambda: ""
-
-    result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
-
-    assert result is True
-    assert send_calls == [
-        ("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"),
-        ("imageurl", "file:///tmp/fallback.png"),
-    ]
-
-
-def test_send_base64_image_result_uses_local_file_for_qq(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    invocation = _build_image_send_invocation()
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send_custom(
-        message_type: str,
-        content: str,
-        *,
-        display_message: str = "",
-        storage_message: bool = True,
-    ) -> bool:
-        send_calls.append((message_type, content))
-        return True
-
-    monkeypatch.setattr(
-        sdk_runtime_module,
-        "save_base64_image_to_file",
-        lambda _data: "/tmp/fallback.png",
-    )
-
-    invocation.send_custom = fake_send_custom
-    invocation._get_target_platform = lambda: "qq"
-
-    result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
-
-    assert result is True
-    assert send_calls == [("imageurl", "file:///tmp/fallback.png")]
-
-
-def test_send_base64_image_result_qq_does_not_fall_back_when_file_send_returns_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """QQ 分支：imageurl(file://) 返回 False 不应再以 image(base64) 重发。
-
-    Platform IO 在 send_custom 报 False 时仍可能已实际派发，二次发送会让
-    用户在群里看到同一张图重复出现。只有保存失败或抛异常时才尝试 base64。
-    """
-    invocation = _build_image_send_invocation()
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send_custom(
-        message_type: str,
-        content: str,
-        *,
-        display_message: str = "",
-        storage_message: bool = True,
-    ) -> bool:
-        send_calls.append((message_type, content))
-        return False
-
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: "/tmp/fallback.png")
-
-    invocation.send_custom = fake_send_custom
-    invocation._get_target_platform = lambda: "qq"
-
-    result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
-
-    assert result is False
-    assert send_calls == [("imageurl", "file:///tmp/fallback.png")]
-
-
-def test_send_base64_image_result_qq_falls_back_to_direct_image_when_file_send_raises(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """QQ 分支：imageurl(file://) 抛异常时回退到 image(base64)。"""
-    invocation = _build_image_send_invocation()
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send_custom(
-        message_type: str,
-        content: str,
-        *,
-        display_message: str = "",
-        storage_message: bool = True,
-    ) -> bool:
-        send_calls.append((message_type, content))
-        if message_type == "imageurl":
-            raise RuntimeError("simulated dispatch error")
-        return True
-
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: "/tmp/fallback.png")
-
-    invocation.send_custom = fake_send_custom
-    invocation._get_target_platform = lambda: "qq"
-
-    result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
-
-    assert result is True
-    assert send_calls == [
-        ("imageurl", "file:///tmp/fallback.png"),
-        ("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"),
-    ]
-
-
-def test_send_base64_image_result_qq_falls_back_to_direct_image_when_save_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """QQ 分支：base64 保存失败时直接发送 image(base64)。"""
-    invocation = _build_image_send_invocation()
-    send_calls: list[tuple[str, str]] = []
-
-    async def fake_send_custom(
-        message_type: str,
-        content: str,
-        *,
-        display_message: str = "",
-        storage_message: bool = True,
-    ) -> bool:
-        send_calls.append((message_type, content))
-        return True
-
-    monkeypatch.setattr(sdk_runtime_module, "save_base64_image_to_file", lambda _data: None)
-
-    invocation.send_custom = fake_send_custom
-    invocation._get_target_platform = lambda: "qq"
-
-    result = asyncio.run(invocation._send_base64_image_result("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"))
-
-    assert result is True
     assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB")]
 
 

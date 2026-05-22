@@ -13,7 +13,6 @@ from src.plugin_system import llm_api
 
 from ..clients.nai_web_client import NaiWebClient
 from ..mixins.auto_recall_mixin import AutoRecallMixin
-from ..utils.image_url_helper import save_base64_image_to_file
 from ..mixins.model_config_mixin import ModelConfigMixin
 from ..rules.prompt_rules import PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_TEMPLATE
 from ..rules.selfie_rules import (
@@ -193,22 +192,12 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
                         await self.send_text(f"图片发送失败: {str(e)[:100]}")
                         return False, "发送失败", True
                 elif final_image_data.startswith(("iVBORw", "/9j/", "UklGR", "R0lGOD")):
-                    # Base64 格式 -> 保存为文件并以URL方式发送
-                    image_path = save_base64_image_to_file(final_image_data)
-                    if image_path:
-                        send_success = await self.send_custom(
-                            "imageurl",
-                            f"file://{image_path}",
-                            display_message=NAI_PIC_IMAGE_DISPLAY_MARKER,
-                        )
-                    else:
-                        logger.warning(f"{self.log_prefix} [LLM生图] 图片保存失败，回退为Base64发送")
-                        # 这里改用 send_custom("image", ...) 以便写入 display_message 标记
-                        send_success = await self.send_custom(
-                            "image",
-                            final_image_data,
-                            display_message=NAI_PIC_IMAGE_DISPLAY_MARKER,
-                        )
+                    # Base64 格式 -> 以 image 段直发，napcat 等适配器原生支持
+                    send_success = await self.send_custom(
+                        "image",
+                        final_image_data,
+                        display_message=NAI_PIC_IMAGE_DISPLAY_MARKER,
+                    )
 
                     if send_success:
                         self._last_send_timestamp = send_time

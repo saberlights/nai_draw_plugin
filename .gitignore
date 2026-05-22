@@ -10,9 +10,6 @@ __pycache__/
 *.so
 .Python
 
-# 生成的图片
-generated_images/
-
 # 生成的数据文件
 data/
 
