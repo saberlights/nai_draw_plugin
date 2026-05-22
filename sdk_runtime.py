@@ -1,0 +1,2239 @@
+"""NAI Low 插件新版 SDK 运行辅助。
+
+将旧版命令与 Action 的主要业务逻辑迁移到新版 `MaiBotPlugin` 调用方式。
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import tomllib
+from collections.abc import Callable
+from uuid import uuid4
+from typing import Any, Optional
+
+import asyncio
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import requests
+from aiohttp import ClientSession, ClientTimeout
+
+from src.common.logger import get_logger
+from src.config.model_configs import TaskConfig
+from src.llm_models.utils_model import LLMOrchestrator
+from src.services import llm_service
+
+from .runtime_recall import (
+    MANUAL_RECALL_TTL_SECONDS,
+    discard_pending_plugin_image_send,
+    extract_plugin_row_message_id,
+    is_napcat_action_accepted,
+    load_recent_plugin_image_rows,
+    load_recent_session_image_rows,
+    load_recent_tracked_plugin_image_rows,
+    normalize_db_timestamp,
+    prune_recent_ids,
+    remember_pending_plugin_image_send,
+    remember_recent_id,
+    resolve_db_path,
+    select_recent_plugin_image_row,
+    wait_for_formal_message_id,
+)
+
+from .core.clients.nai_web_client import NaiWebClient
+from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
+from .core.mixins.model_config_mixin import ModelConfigMixin
+from .core.rules.prompt_rules import PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_TEMPLATE
+from .core.rules.selfie_rules import (
+    detect_explicit_image_request,
+    detect_negative_image_intent,
+    detect_selfie_from_output,
+    get_selfie_hint,
+    merge_selfie_prompt,
+)
+from .core.services.prompt_memory import render_previous_prompt_block
+from .core.services.session_state import session_state
+from .core.services.tag_retriever import get_tag_retriever
+from .core.services.user_blacklist import user_blacklist
+from .core.utils.display_message_helper import build_action_image_display_message
+from .core.utils.image_url_helper import save_base64_image_to_file
+from .core.utils.prompt_output_parser import parse_prompt_from_structured_output
+from .core.utils.prompt_postprocessor import (
+    normalize_prompt_order,
+    remove_selfie_appearance_tags,
+    sanitize_sfw_prompt,
+    user_mentions_appearance,
+)
+from .core.utils.random_scene_description import (
+    get_random_scene_similarity_score,
+    is_random_scene_too_similar,
+    normalize_random_scene_description,
+)
+
+logger = get_logger("nai_draw_plugin")
+_DB_PATH = resolve_db_path(__file__)
+_RECENT_MANUAL_RECALL_IDS: dict[str, dict[str, float]] = {}
+_NAPCAT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "MaiBot-Napcat-Adapter" / "config.toml"
+
+
+def _load_napcat_server_config() -> dict[str, Any] | None:
+    """读取 Napcat 连接配置，供撤回动作直连使用。"""
+    if not _NAPCAT_CONFIG_PATH.is_file():
+        return None
+
+    try:
+        with _NAPCAT_CONFIG_PATH.open("rb") as fp:
+            config_data = tomllib.load(fp)
+    except Exception as exc:
+        logger.warning("[nai_low] 读取 Napcat 配置失败: %r", exc)
+        return None
+
+    server_config = config_data.get("napcat_server")
+    if not isinstance(server_config, dict):
+        return None
+
+    host = str(server_config.get("host") or "").strip()
+    port = server_config.get("port")
+    token = str(server_config.get("token") or "").strip()
+    timeout = server_config.get("action_timeout_sec", 15.0)
+
+    try:
+        normalized_port = int(port)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        action_timeout = max(1.0, float(timeout))
+    except (TypeError, ValueError):
+        action_timeout = 15.0
+
+    if not host or normalized_port <= 0:
+        return None
+
+    return {
+        "ws_url": f"ws://{host}:{normalized_port}",
+        "token": token,
+        "action_timeout_sec": action_timeout,
+    }
+
+
+class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
+    """仅在 nai_low 自定义模型调用中使用的固定模型调度器。"""
+
+    def __init__(self, task_config: TaskConfig, request_type: str = "") -> None:
+        self._pinned_task_config = task_config
+        super().__init__(task_name="planner", request_type=request_type)
+
+    def _get_task_config_or_raise(self) -> TaskConfig:
+        return self._pinned_task_config
+
+    def _refresh_task_config(self) -> TaskConfig:
+        latest = self._pinned_task_config
+        if latest is not self.model_for_task:
+            self.model_for_task = latest
+        if list(self.model_usage.keys()) != latest.model_list:
+            self.model_usage = {model: self.model_usage.get(model, (0, 0, 0)) for model in latest.model_list}
+        return self.model_for_task
+
+
+async def _find_last_plugin_image_row(
+    invocation: "NaiInvocation",
+    *,
+    limit: int = 120,
+    target_send_timestamp: float | None = None,
+    exclude_message_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """从宿主消息库中读取最近一条本插件图片消息。"""
+    if not getattr(invocation, "stream_id", ""):
+        return None
+
+    tracked_rows = load_recent_tracked_plugin_image_rows(
+        invocation.stream_id,
+        limit=limit,
+    )
+    tracked_row = select_recent_plugin_image_row(
+        tracked_rows,
+        target_send_timestamp=target_send_timestamp,
+        exclude_message_ids=exclude_message_ids,
+    )
+    if tracked_row is not None:
+        return tracked_row
+
+    marked_rows = load_recent_plugin_image_rows(
+        _DB_PATH,
+        invocation.stream_id,
+        NAI_PIC_IMAGE_DISPLAY_MARKER,
+        limit=limit,
+    )
+    marked_row = select_recent_plugin_image_row(
+        marked_rows,
+        target_send_timestamp=target_send_timestamp,
+        exclude_message_ids=exclude_message_ids,
+    )
+    if marked_row is not None:
+        return marked_row
+
+    fallback_rows = load_recent_session_image_rows(
+        _DB_PATH,
+        invocation.stream_id,
+        limit=limit,
+    )
+    return select_recent_plugin_image_row(
+        fallback_rows,
+        target_send_timestamp=target_send_timestamp,
+        exclude_message_ids=exclude_message_ids,
+    )
+
+
+def _get_nested_config_value(config_data: dict[str, Any], key: str, default: Any = None) -> Any:
+    """从插件配置中读取点分路径。"""
+    current: Any = config_data
+    for part in str(key or "").split("."):
+        if not isinstance(current, dict) or part not in current:
+            return default
+        current = current[part]
+    return current
+
+
+def _extract_message_field(message: Any, field: str) -> Any:
+    """兼容字典消息的字段读取。"""
+    if isinstance(message, dict):
+        return message.get(field)
+    return getattr(message, field, None)
+
+
+def _text_looks_like_image(text: Any) -> bool:
+    """判断文本是否像图片消息。"""
+    if not isinstance(text, str):
+        return False
+    normalized = text.strip()
+    if not normalized:
+        return False
+    return normalized.startswith(("[图片", "[NAI图片", "[image", "[imageurl", "[picid", "picid:"))
+
+
+def _looks_like_generation_request_url(url: Any) -> bool:
+    """识别误被当成图片直链的生成接口 URL。"""
+    if not isinstance(url, str):
+        return False
+
+    normalized = url.strip()
+    if not normalized.startswith(("http://", "https://")):
+        return False
+
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return False
+
+    path = parsed.path.rstrip("/").lower()
+    if not path.endswith("/generate"):
+        return False
+
+    query = parsed.query.lower()
+    return any(
+        token in query
+        for token in (
+            "tag=",
+            "model=",
+            "negative=",
+            "artist=",
+            "token=",
+            "sampler=",
+            "steps=",
+            "cfg=",
+            "scale=",
+            "size=",
+        )
+    )
+
+
+def _is_image_message(message: Any) -> bool:
+    """判断消息是否为图片。"""
+    if isinstance(message, dict):
+        if message.get("is_picid") or message.get("is_picture"):
+            return True
+        segment = message.get("message_segment")
+        if isinstance(segment, dict):
+            segment_type = segment.get("type")
+            if segment_type in {"image", "imageurl"}:
+                return True
+            if segment_type == "seglist":
+                for child in segment.get("data") or []:
+                    if isinstance(child, dict) and child.get("type") in {"image", "imageurl"}:
+                        return True
+        for key in ("processed_plain_text", "display_message", "raw_message"):
+            if _text_looks_like_image(message.get(key)):
+                return True
+        return False
+
+    if getattr(message, "is_picid", False) or getattr(message, "is_picture", False):
+        return True
+    for key in ("processed_plain_text", "display_message", "raw_message"):
+        if _text_looks_like_image(getattr(message, key, None)):
+            return True
+    return False
+
+
+class NaiInvocation(ModelConfigMixin):
+    """一次命令或 Action 调用的上下文封装。"""
+
+    _recent_random_scenes: list[str] = []
+    _max_recent_scenes = 5
+    _max_random_scene_attempts = 4
+    _random_scene_repeat_threshold = 0.6
+
+    def __init__(
+        self,
+        plugin: Any,
+        plugin_config: dict[str, Any],
+        stream_id: str,
+        *,
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: Optional[dict[str, str]] = None,
+        action_data: Optional[dict[str, Any]] = None,
+        reasoning: str = "",
+        text: str = "",
+        source: str = "command",
+    ) -> None:
+        self.plugin = plugin
+        self.ctx = plugin.ctx
+        self.plugin_config = plugin_config
+        self.stream_id = str(stream_id or "")
+        self.group_id = str(group_id or "")
+        self.user_id = str(user_id or "")
+        self.matched_groups = matched_groups or {}
+        self.action_data = action_data or {}
+        self.reasoning = str(reasoning or "")
+        self.text = str(text or "")
+        self.source = source
+        self.log_prefix = "nai_draw_plugin"
+        self.api_client = NaiWebClient(self)
+        self._last_send_timestamp: float | None = None
+
+    def close(self) -> None:
+        """释放当前调用持有的可关闭资源。"""
+        self.api_client.close()
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        """兼容旧逻辑的同步配置读取接口。"""
+        return _get_nested_config_value(self.plugin_config, key, default)
+
+    def _get_chat_identity(self) -> tuple[str, str, str]:
+        """返回兼容旧状态管理的会话标识。
+
+        新版 SDK Command/Action 目前不会直接注入平台信息，这里统一使用
+        `stream` 作为逻辑平台，并用 `stream_id` 作为会话主键。
+        """
+        chat_id = self.stream_id or self.user_id
+        return "stream", chat_id, self.user_id
+
+    def _get_target_platform(self) -> str:
+        """读取当前发送目标的平台标识。"""
+        if not self.stream_id:
+            return ""
+
+        try:
+            from src.chat.message_receive.chat_manager import chat_manager
+
+            session = chat_manager.get_existing_session_by_session_id(self.stream_id)
+            if session is None:
+                session = chat_manager.get_session_by_session_id(self.stream_id)
+        except Exception as exc:
+            logger.debug("%s 读取目标平台失败: %r", self.log_prefix, exc)
+            return ""
+
+        return str(getattr(session, "platform", "") or "").strip().lower()
+
+    async def send_text(self, text: str, storage_message: bool = True) -> bool:
+        """发送文本。"""
+        if not self.stream_id:
+            return False
+        return bool(await self.ctx.send.text(text, self.stream_id, storage_message=storage_message))
+
+    async def send_custom(
+        self,
+        message_type: str,
+        content: Any,
+        *,
+        display_message: str = "",
+        storage_message: bool = True,
+    ) -> bool:
+        """发送自定义消息。"""
+        if not self.stream_id:
+            return False
+        return bool(
+            await self.ctx.send.custom(
+                message_type,
+                content,
+                self.stream_id,
+                display_message=display_message,
+                storage_message=storage_message,
+            )
+        )
+
+    async def send_command(
+        self,
+        command: str,
+        data: dict[str, Any],
+        *,
+        display_message: str = "",
+        storage_message: bool = True,
+    ) -> Any:
+        """发送平台命令。"""
+        if not self.stream_id:
+            return False
+        return await self.ctx.send.command(
+            command,
+            self.stream_id,
+            data=data,
+            display_message=display_message,
+            storage_message=storage_message,
+        )
+
+    @property
+    def action_name(self) -> str:
+        """兼容旧 Action 的名称访问。"""
+        return "nai_web_draw"
+
+    def _build_image_display_message(self, description: str = "") -> str:
+        """构造可供撤回逻辑识别的展示文案。"""
+        readable = build_action_image_display_message(description)
+        return f"{NAI_PIC_IMAGE_DISPLAY_MARKER} {readable}".strip()
+
+    def _chat_type_text(self) -> str:
+        """返回用户可读的聊天类型。"""
+        return "群聊" if self.group_id else "私聊"
+
+    def _check_user_permission(self) -> bool:
+        """检查当前用户是否有权限触发生图。"""
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            return True
+        if not user_id:
+            return True
+        return session_state.check_user_permission(platform, chat_id, user_id, self.get_config)
+
+    async def ensure_generation_permission(self) -> bool:
+        """检查当前用户是否有权限使用生图能力，并在失败时返回提示。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False
+
+        if self._check_user_permission():
+            return True
+
+        await self.send_text(
+            "❌ 当前会话已开启管理员模式，仅管理员可以使用 NAI 生图功能",
+            storage_message=False,
+        )
+        return False
+
+    async def ensure_user_not_blacklisted(self) -> bool:
+        """检查当前用户是否被插件黑名单封禁。"""
+        if not self.user_id:
+            return True
+        if not user_blacklist.is_blacklisted(self.user_id):
+            return True
+
+        await self.send_text(
+            "❌ 你已被加入 NAI 插件黑名单，无法使用本插件任何功能",
+            storage_message=False,
+        )
+        return False
+
+    def _is_prompt_show_enabled(self) -> bool:
+        """检查是否开启提示词显示。"""
+        platform, chat_id, _ = self._get_chat_identity()
+        if not chat_id:
+            return False
+        return session_state.is_prompt_show_enabled(platform, chat_id, self.get_config)
+
+    def _sanitize_prompt_for_sfw_mode(self, prompt: str) -> str:
+        """在启用 NSFW 过滤时进一步剔除擦边/色情标签。"""
+        if not prompt:
+            return prompt
+        if not session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
+            return prompt
+        return sanitize_sfw_prompt(prompt)
+
+    async def _find_recent_messages(self, limit: int = 120, hours: float = 24.0) -> list[Any]:
+        """读取当前会话最近消息。
+
+        优先通过 database.query 直接查库（避免 message.get_recent 的 datetime 序列化问题），
+        失败时回退到 message.get_recent。
+        """
+        if not self.stream_id:
+            logger.debug("%s _find_recent_messages: stream_id 为空", self.log_prefix)
+            return []
+
+        # 方式1: 直接查数据库，绕过 _serialize_messages 的 datetime bug
+        try:
+            db_result = await self.ctx.call_capability(
+                "database.query",
+                model_name="Messages",
+                query_type="get",
+                filters={"session_id": self.stream_id},
+                order_by=["-timestamp"],
+                limit=limit,
+            )
+            if isinstance(db_result, dict) and db_result.get("success"):
+                rows = db_result.get("result")
+                if isinstance(rows, list) and rows:
+                    logger.debug("%s 通过 database.query 获取到 %d 条消息", self.log_prefix, len(rows))
+                    return rows
+        except Exception as exc:
+            logger.debug("%s database.query 方式获取消息失败: %r", self.log_prefix, exc)
+
+        # 方式2: 回退到 message.get_recent（可能因 datetime 序列化失败）
+        try:
+            result = await self.ctx.call_capability(
+                "message.get_recent",
+                chat_id=self.stream_id,
+                limit=limit,
+                hours=hours,
+                filter_mai=False,
+            )
+        except Exception as exc:
+            logger.warning("%s 获取最近消息失败（可能是序列化问题）: %r", self.log_prefix, exc)
+            return []
+        if isinstance(result, dict):
+            if not result.get("success", True):
+                logger.warning("%s 获取最近消息返回失败: %s", self.log_prefix, result.get("error", "未知"))
+            messages = result.get("messages")
+            if isinstance(messages, list):
+                return messages
+        if isinstance(result, list):
+            return result
+        return []
+
+    async def _find_last_plugin_image_message_id(
+        self,
+        *,
+        limit: int = 120,
+        target_send_timestamp: float | None = None,
+        exclude_message_ids: Optional[set[str]] = None,
+    ) -> str | None:
+        """查找最近一条本插件发送的图片消息。"""
+        try:
+            row = await _find_last_plugin_image_row(
+                self,
+                limit=limit,
+                target_send_timestamp=target_send_timestamp,
+                exclude_message_ids=exclude_message_ids,
+            )
+        except Exception as exc:
+            logger.warning("%s 读取本地消息库失败: %r", self.log_prefix, exc)
+            row = None
+
+        if row:
+            message_id = extract_plugin_row_message_id(row)
+            if message_id:
+                return message_id
+
+        return None
+
+    def _get_recent_manual_recall_ids(self) -> set[str]:
+        """获取当前会话最近已经尝试手动撤回过的消息 ID。"""
+        return prune_recent_ids(
+            _RECENT_MANUAL_RECALL_IDS,
+            getattr(self, "stream_id", ""),
+            ttl_seconds=MANUAL_RECALL_TTL_SECONDS,
+        )
+
+    def _remember_recent_manual_recall_id(self, message_id: str) -> None:
+        """记录当前会话刚尝试手动撤回过的消息 ID。"""
+        remember_recent_id(
+            _RECENT_MANUAL_RECALL_IDS,
+            getattr(self, "stream_id", ""),
+            message_id,
+        )
+
+    def _get_manual_recall_max_age_seconds(self) -> float:
+        """读取手动撤回允许命中的最老图片年龄。"""
+        try:
+            raw_value = self.get_config("auto_recall.manual_max_age_seconds", 3600)
+        except Exception:
+            raw_value = 3600
+
+        try:
+            max_age_seconds = float(raw_value)
+        except (TypeError, ValueError):
+            return 3600.0
+
+        return max(0.0, max_age_seconds)
+
+    async def _resolve_local_plugin_image_message_id(
+        self,
+        *,
+        limit: int = 120,
+        target_send_timestamp: float | None = None,
+        exclude_message_ids: set[str] | None = None,
+        initial_row: dict[str, Any] | None = None,
+        id_wait_seconds: float | None = None,
+    ) -> str | None:
+        """围绕目标时间轮询本地消息库，等待占位 ID 变为正式 ID。"""
+        if id_wait_seconds is None:
+            try:
+                id_wait_seconds = max(0.0, float(self.get_config("auto_recall.id_wait_seconds", 15) or 15))
+            except (TypeError, ValueError):
+                id_wait_seconds = 15.0
+        else:
+            id_wait_seconds = max(0.0, float(id_wait_seconds))
+
+        async def _row_loader() -> dict[str, Any] | None:
+            try:
+                return await _find_last_plugin_image_row(
+                    self,
+                    limit=limit,
+                    target_send_timestamp=target_send_timestamp,
+                    exclude_message_ids=exclude_message_ids,
+                )
+            except Exception as exc:
+                logger.warning("%s 轮询本地消息库失败: %r", self.log_prefix, exc)
+                return None
+
+        return await wait_for_formal_message_id(
+            _row_loader,
+            initial_row=initial_row,
+            id_wait_seconds=id_wait_seconds,
+        )
+
+    async def _try_recall_message(self, message_id: str) -> bool:
+        """优先使用 Napcat API 撤回消息。"""
+        normalized_message_id = str(message_id or "").strip()
+        if not normalized_message_id or not getattr(self, "stream_id", ""):
+            return False
+
+        async def _try_direct_napcat_action() -> bool:
+            if not normalized_message_id.isdigit():
+                logger.warning("%s 撤回失败：消息ID不是纯数字: %s", self.log_prefix, normalized_message_id)
+                return False
+
+            server_config = _load_napcat_server_config()
+            if server_config is None:
+                logger.warning("%s 未找到可用的 Napcat 连接配置，无法直连撤回", self.log_prefix)
+                return False
+
+            headers = {"Authorization": f"Bearer {server_config['token']}"} if server_config.get("token") else {}
+            timeout = float(server_config.get("action_timeout_sec", 15.0))
+            echo_id = uuid4().hex
+            payload = {
+                "action": "delete_msg",
+                "params": {"message_id": int(normalized_message_id)},
+                "echo": echo_id,
+            }
+
+            try:
+                async with ClientSession(headers=headers, timeout=ClientTimeout(total=None, connect=10)) as session:
+                    async with session.ws_connect(
+                        str(server_config["ws_url"]),
+                        heartbeat=None,
+                    ) as ws:
+                        await ws.send_str(json.dumps(payload, ensure_ascii=False))
+
+                        deadline = asyncio.get_running_loop().time() + timeout
+                        while True:
+                            remaining = deadline - asyncio.get_running_loop().time()
+                            if remaining <= 0:
+                                raise TimeoutError(f"Napcat delete_msg 超时 ({timeout}s)")
+
+                            message = await asyncio.wait_for(ws.receive(), timeout=remaining)
+                            if message.type.name != "TEXT":
+                                continue
+
+                            response = json.loads(message.data)
+                            if str(response.get("echo") or "").strip() != echo_id:
+                                continue
+
+                            logger.debug("%s 撤回(napcat-ws) 结果: %r", self.log_prefix, response)
+                            return is_napcat_action_accepted(response)
+            except Exception as exc:
+                logger.warning("%s 撤回(napcat-ws) 失败: %r", self.log_prefix, exc)
+                return False
+
+        async def _capability_api_call(api_name: str, **api_args: Any) -> Any:
+            api_proxy = getattr(self.ctx, "api", None)
+            if api_proxy is not None and hasattr(api_proxy, "call"):
+                return await api_proxy.call(api_name, **api_args)
+
+            call_capability = getattr(self.ctx, "call_capability", None)
+            if callable(call_capability):
+                return await call_capability("api.call", api_name=api_name, args=api_args)
+
+            raise AttributeError("当前上下文不支持 API 能力调用")
+
+        async def _try_napcat_delete_api() -> bool:
+            if not normalized_message_id.isdigit():
+                logger.warning(
+                    "%s 撤回失败：消息ID不是纯数字，无法调用 napcat 删除 API: %s",
+                    self.log_prefix,
+                    normalized_message_id,
+                )
+                return False
+
+            try:
+                result = await _capability_api_call(
+                    "adapter.napcat.message.delete_msg",
+                    message_id=int(normalized_message_id),
+                )
+                logger.debug("%s 撤回(napcat-api) 结果: %r", self.log_prefix, result)
+                if not is_napcat_action_accepted(result):
+                    return False
+                return True
+            except Exception as exc:
+                logger.warning("%s 撤回(napcat-api) 失败: %r", self.log_prefix, exc)
+                return False
+
+        if await _try_direct_napcat_action():
+            return True
+        return await _try_napcat_delete_api()
+
+    async def _schedule_auto_recall(self) -> None:
+        """调度自动撤回。"""
+        platform, chat_id, _ = self._get_chat_identity()
+        if not chat_id:
+            return
+        if not session_state.is_recall_enabled(platform, chat_id, self.get_config):
+            return
+
+        try:
+            delay_seconds = max(0.0, float(self.get_config("auto_recall.delay_seconds", 5) or 5))
+        except (TypeError, ValueError):
+            delay_seconds = 5.0
+        try:
+            id_wait_seconds = max(0.0, float(self.get_config("auto_recall.id_wait_seconds", 15) or 15))
+        except (TypeError, ValueError):
+            id_wait_seconds = 15.0
+
+        target_send_timestamp = getattr(self, "_last_send_timestamp", None)
+
+        async def _job() -> None:
+            await asyncio.sleep(delay_seconds)
+            message_id = await self._resolve_local_plugin_image_message_id(
+                limit=120,
+                target_send_timestamp=target_send_timestamp,
+                id_wait_seconds=id_wait_seconds,
+            )
+            if not message_id:
+                logger.warning("%s 自动撤回未命中消息", self.log_prefix)
+                return
+            success = await self._try_recall_message(message_id)
+            if success:
+                logger.info("%s 已自动撤回消息 %s", self.log_prefix, message_id)
+            else:
+                logger.warning("%s 自动撤回失败: %s", self.log_prefix, message_id)
+
+        self.plugin._track_task(asyncio.create_task(_job()))
+
+    async def _download_remote_image_as_base64(self, url: str) -> str | None:
+        """下载远程图片并转为 Base64。"""
+        if _looks_like_generation_request_url(url):
+            logger.warning("%s 远程图片URL仍是生成接口，停止自动补拉以避免重复扣费", self.log_prefix)
+            return None
+
+        try:
+            model_config = self._get_model_config()
+            if not isinstance(model_config, dict):
+                model_config = {}
+
+            parsed_url = urlsplit(url)
+            request_base_url = ""
+            if parsed_url.scheme and parsed_url.netloc:
+                request_base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+            elif isinstance(model_config.get("base_url"), str):
+                request_base_url = str(model_config.get("base_url") or "").strip()
+
+            request_headers = (
+                NaiWebClient._build_request_headers(request_base_url)
+                if request_base_url
+                else dict(NaiWebClient._DEFAULT_REQUEST_HEADERS)
+            )
+            request_timeout = NaiWebClient._resolve_request_timeout(model_config)
+            proxy_mode = NaiWebClient._resolve_proxy_mode(model_config)
+            response = await self.api_client._send_request_with_retry(
+                url,
+                {},
+                proxy_mode,
+                request_timeout,
+                request_headers,
+            )
+        except requests.RequestException as exc:
+            logger.error("%s 下载远程图片失败: %r", self.log_prefix, exc, exc_info=True)
+            return None
+        except Exception as exc:
+            logger.error("%s 下载远程图片异常: %r", self.log_prefix, exc, exc_info=True)
+            return None
+
+        if response.status_code != 200:
+            logger.warning("%s 下载远程图片返回 HTTP %s", self.log_prefix, response.status_code)
+            return None
+
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if not content_type.startswith("image/"):
+            response_text = NaiWebClient._get_response_text(response)
+            if "application/json" in content_type or NaiWebClient._looks_like_html_response(
+                content_type,
+                response_text,
+            ):
+                logger.warning("%s 下载远程图片收到非图片响应: %s", self.log_prefix, content_type or "unknown")
+                return None
+
+        content = response.content
+        if not content:
+            logger.warning("%s 下载远程图片内容为空", self.log_prefix)
+            return None
+
+        return base64.b64encode(content).decode("utf-8")
+
+    async def _send_base64_image_result(self, image_base64: str, display_message: str) -> bool:
+        """发送 Base64 图片结果。
+
+        注意：单一 send_custom 调用即视为一次最终投递。即使返回 False，下层
+        Platform IO 仍可能已成功派发（例如 maim_message 报 "未找到目标平台" 但
+        send_service 通过备用 driver 派发成功），此时如果再以另一种格式重发，会
+        在用户侧产生同一张图重复出现的现象。因此 False 返回不再触发同一图片的
+        二次发送，只有保存失败或 send 抛异常时才走另一路径，避免重复投递。
+        """
+        target_platform = self._get_target_platform()
+        if target_platform == "qq":
+            image_path = save_base64_image_to_file(image_base64)
+            if image_path:
+                file_reference = f"file://{image_path}"
+                try:
+                    return await self.send_custom(
+                        "imageurl",
+                        file_reference,
+                        display_message=display_message,
+                    )
+                except Exception as exc:
+                    logger.warning("%s QQ 本地图片文件发送异常，回退为 Base64: %r", self.log_prefix, exc)
+            else:
+                logger.warning("%s QQ 图片保存失败，回退为直接发送 Base64", self.log_prefix)
+
+            return await self.send_custom(
+                "image",
+                image_base64,
+                display_message=display_message,
+            )
+
+        if not target_platform:
+            logger.warning("%s 无法识别目标平台，优先尝试直接发送 Base64 图片", self.log_prefix)
+            try:
+                return await self.send_custom(
+                    "image",
+                    image_base64,
+                    display_message=display_message,
+                )
+            except Exception as exc:
+                logger.warning("%s 直接发送 Base64 图片异常，回退为本地文件 URL: %r", self.log_prefix, exc)
+
+        image_path = save_base64_image_to_file(image_base64)
+        if image_path:
+            file_reference = f"file://{image_path}"
+            try:
+                return await self.send_custom(
+                    "imageurl",
+                    file_reference,
+                    display_message=display_message,
+                )
+            except Exception as exc:
+                logger.warning("%s 本地图片文件发送异常，回退为 Base64: %r", self.log_prefix, exc)
+        else:
+            logger.warning("%s 图片保存失败，回退为直接发送 Base64", self.log_prefix)
+
+        return await self.send_custom(
+            "image",
+            image_base64,
+            display_message=display_message,
+        )
+
+    async def _send_image_url_with_fallback(self, image_url: str, display_message: str) -> bool:
+        """优先发送远程图片 URL，失败时回退为本地下载再发送 Base64。"""
+        target_platform = self._get_target_platform()
+        if target_platform == "qq":
+            try:
+                if await self.send_custom(
+                    "imageurl",
+                    image_url,
+                    display_message=display_message,
+                ):
+                    return True
+                logger.warning("%s QQ 远程图片 URL 发送失败，回退为 Base64", self.log_prefix)
+            except Exception as exc:
+                logger.warning("%s QQ 远程图片 URL 发送异常，回退为 Base64: %r", self.log_prefix, exc)
+
+        elif _looks_like_generation_request_url(image_url):
+            logger.warning(
+                "%s 远程图片 URL 看起来像生成接口，跳过直接外发，改为本地下载",
+                self.log_prefix,
+            )
+        else:
+            try:
+                if await self.send_custom(
+                    "imageurl",
+                    image_url,
+                    display_message=display_message,
+                ):
+                    return True
+                logger.warning("%s 远程图片 URL 发送失败，回退为 Base64", self.log_prefix)
+            except Exception as exc:
+                logger.warning("%s 远程图片 URL 发送异常，回退为 Base64: %r", self.log_prefix, exc)
+
+        image_base64 = await self._download_remote_image_as_base64(image_url)
+        if not image_base64:
+            return False
+
+        logger.info("%s 远程图片 URL 已回退为 Base64 发送", self.log_prefix)
+        return await self._send_base64_image_result(image_base64, display_message)
+
+    async def manual_recall(self) -> tuple[bool, str | None, bool]:
+        """执行 `/nai 撤回`。"""
+        logger.info("%s [手动撤回] 收到撤回请求, stream_id=%s", self.log_prefix, self.stream_id)
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+        try:
+            return await self._do_manual_recall()
+        except Exception as exc:
+            logger.error("%s [手动撤回] 未预期异常: %r", self.log_prefix, exc, exc_info=True)
+            try:
+                await self.send_text("❌ 撤回过程出现内部错误", storage_message=False)
+            except Exception:
+                pass
+            return False, "撤回内部错误", True
+
+    async def _do_manual_recall(self) -> tuple[bool, str | None, bool]:
+        """手动撤回的核心逻辑。"""
+        recent_excludes = self._get_recent_manual_recall_ids()
+        attempted_ids: set[str] = set(recent_excludes)
+        max_attempts = 5
+        max_age_seconds = self._get_manual_recall_max_age_seconds()
+        current_time = time.time()
+        skipped_stale_rows = False
+        attempted_recall = False
+
+        for _ in range(max_attempts):
+            row = await _find_last_plugin_image_row(
+                self,
+                limit=300,
+                exclude_message_ids=attempted_ids,
+            )
+            initial_message_id = extract_plugin_row_message_id(row)
+            if not initial_message_id:
+                break
+
+            target_send_timestamp = normalize_db_timestamp(row.get("timestamp")) if row else None
+            if (
+                max_age_seconds > 0
+                and target_send_timestamp is not None
+                and current_time - target_send_timestamp > max_age_seconds
+            ):
+                skipped_stale_rows = True
+                attempted_ids.add(initial_message_id)
+                logger.info(
+                    "%s [手动撤回] 跳过超出撤回窗口的图片: %s age=%.1fs",
+                    self.log_prefix,
+                    initial_message_id,
+                    current_time - target_send_timestamp,
+                )
+                continue
+
+            resolved_message_id = await self._resolve_local_plugin_image_message_id(
+                limit=300,
+                target_send_timestamp=target_send_timestamp,
+                exclude_message_ids=attempted_ids,
+                initial_row=row,
+            )
+            message_id = str(resolved_message_id or initial_message_id).strip()
+
+            current_attempt_ids = {
+                str(initial_message_id or "").strip(),
+                str(message_id or "").strip(),
+            }
+            current_attempt_ids.discard("")
+            attempted_ids.update(current_attempt_ids)
+
+            logger.info("%s [手动撤回] 准备撤回消息: %s", self.log_prefix, message_id)
+            attempted_recall = True
+            success = await self._try_recall_message(message_id)
+            if success:
+                for recent_id in current_attempt_ids:
+                    self._remember_recent_manual_recall_id(recent_id)
+                await self.send_text("✅ 已撤回", storage_message=False)
+                return True, "手动撤回成功", True
+
+            logger.warning("%s [手动撤回] 撤回失败，尝试上一条图片", self.log_prefix)
+
+        for recent_id in attempted_ids:
+            self._remember_recent_manual_recall_id(recent_id)
+
+        if attempted_ids == recent_excludes or (skipped_stale_rows and not attempted_recall):
+            logger.info("%s [手动撤回] 未找到可撤回的图片消息", self.log_prefix)
+            not_found_text = "❌ 找不到可撤回的图片（直接发送 /nai 撤回 即可按顺序撤回最近一张）"
+            if skipped_stale_rows:
+                not_found_text = "❌ 找不到近期可撤回的图片（图片可能已超过平台撤回时限）"
+            await self.send_text(
+                not_found_text,
+                storage_message=False,
+            )
+            return False, "找不到可撤回的消息", True
+
+        await self.send_text(
+            "❌ 撤回失败（可能消息已被删除、超过撤回时限、或 bot 无权撤回）",
+            storage_message=False,
+        )
+        return False, "手动撤回失败", True
+
+    async def _send_image_result(self, result: str, description: str = "") -> tuple[bool, str | None, bool]:
+        """发送图片结果。"""
+        final_image_data = self._process_api_response(result)
+        if not final_image_data:
+            await self.send_text("API 返回了无效的数据")
+            return False, "数据格式错误", True
+
+        display_message = self._build_image_display_message(description)
+        self._last_send_timestamp = time.time()
+
+        try:
+            if final_image_data.startswith(("http://", "https://")):
+                remember_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
+                send_ok = await self._send_image_url_with_fallback(
+                    final_image_data,
+                    display_message,
+                )
+            elif final_image_data.startswith(("iVBORw", "/9j/", "UklGR", "R0lGOD")):
+                remember_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
+                send_ok = await self._send_base64_image_result(
+                    final_image_data,
+                    display_message,
+                )
+            else:
+                await self.send_text("API 返回了无法识别的图片格式")
+                return False, "数据格式错误", True
+        except Exception as exc:
+            discard_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
+            logger.error("%s 图片发送失败: %r", self.log_prefix, exc, exc_info=True)
+            await self.send_text(f"图片发送失败: {str(exc)[:100]}")
+            return False, "发送失败", True
+
+        if not send_ok:
+            discard_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
+            await self.send_text("图片发送失败")
+            return False, "发送失败", True
+
+        session_state.set_last_action_image_sent_at(self.stream_id, self._last_send_timestamp)
+        await self._schedule_auto_recall()
+        return True, "图片生成成功", True
+
+    def _process_api_response(self, result: str) -> Optional[str]:
+        """归一化 API 返回。"""
+        if not result:
+            return None
+        if result.startswith(("http://", "https://")):
+            return result
+        if result.startswith(("iVBORw", "/9j/", "UklGR", "R0lGOD")):
+            return result
+        if "," in result and result.startswith("data:image"):
+            return result.split(",", 1)[1]
+        return result
+
+    def _process_selfie_prompt(
+        self,
+        description: str,
+        raw_request: str = "",
+        *,
+        include_selfie_prompt_add: bool = True,
+        log_changes: bool = True,
+    ) -> str:
+        """处理自拍模式的附加提示词。"""
+        model_config = self._get_model_config(is_selfie=True)
+        selfie_prompt_add = model_config.get("selfie_prompt_add", "") if model_config else ""
+
+        policy = str(self.get_config("prompt_generator.selfie_appearance_policy", "auto") or "auto").strip().lower()
+        user_specified = user_mentions_appearance(raw_request)
+        original_description = description
+
+        if policy == "auto" and not user_specified:
+            description = remove_selfie_appearance_tags(description)
+
+        if include_selfie_prompt_add and selfie_prompt_add:
+            description = merge_selfie_prompt(description, selfie_prompt_add)
+
+        if policy == "never" and not user_specified:
+            description = remove_selfie_appearance_tags(description)
+
+        if log_changes and description != original_description:
+            logger.debug(
+                "%s 自拍提示词后处理已生效：policy=%s user_specified=%s",
+                self.log_prefix,
+                policy,
+                user_specified,
+            )
+
+        return description
+
+    def _get_prompt_generator_config(self) -> dict[str, Any]:
+        """返回提示词生成配置。"""
+        config = self.get_config("prompt_generator", {})
+        return config if isinstance(config, dict) else {}
+
+    def _get_random_scene_config(self) -> dict[str, Any]:
+        """返回随机场景配置。"""
+        config = self.get_config("random_scene", {})
+        return config if isinstance(config, dict) else {}
+
+    def _resolve_task_name(self, preferred_name: str) -> str | None:
+        """解析当前可用的任务名。"""
+        models = llm_service.get_available_models()
+        if not models:
+            return None
+
+        for candidate in [preferred_name, "planner", "replyer"]:
+            normalized = str(candidate or "").strip()
+            if normalized and normalized in models:
+                return normalized
+
+        return next(iter(models.keys()), None)
+
+    async def _request_llm_text(
+        self,
+        prompt: str,
+        *,
+        request_type: str,
+        generator_config: dict[str, Any],
+        default_model_name: str,
+        default_temperature: float,
+        default_max_tokens: int,
+    ) -> str | None:
+        """统一发起文本生成请求。"""
+        custom_model = generator_config.get("custom_model")
+        temperature_raw = generator_config.get("temperature", default_temperature)
+        max_tokens_raw = generator_config.get("max_tokens", default_max_tokens)
+
+        try:
+            temperature = float(temperature_raw)
+        except (TypeError, ValueError):
+            temperature = default_temperature
+
+        try:
+            max_tokens = int(max_tokens_raw)
+        except (TypeError, ValueError):
+            max_tokens = default_max_tokens
+
+        if isinstance(custom_model, dict) and custom_model.get("model_list"):
+            try:
+                model_list = custom_model.get("model_list", [])
+                normalized_model_list = [str(item).strip() for item in (model_list if isinstance(model_list, list) else [model_list])]
+                normalized_model_list = [item for item in normalized_model_list if item]
+                if normalized_model_list:
+                    pinned_task = TaskConfig(
+                        model_list=normalized_model_list,
+                        max_tokens=int(custom_model.get("max_tokens", max_tokens) or max_tokens),
+                        temperature=float(custom_model.get("temperature", temperature) or temperature),
+                        slow_threshold=float(custom_model.get("slow_threshold", 30.0) or 30.0),
+                        selection_strategy="random",
+                    )
+                    orchestrator = _PinnedTaskLLMOrchestrator(pinned_task, request_type=request_type)
+                    result = await orchestrator.generate_response_async(
+                        prompt=prompt,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                    response_text = (result.response or "").strip()
+                    if response_text:
+                        return response_text
+                    logger.warning("%s 自定义提示词模型返回空响应，回退到宿主任务模型", self.log_prefix)
+            except Exception as exc:
+                logger.warning(
+                    "%s 自定义提示词模型调用失败，回退到宿主任务模型: %s",
+                    self.log_prefix,
+                    exc,
+                )
+
+        task_name = self._resolve_task_name(str(generator_config.get("model_name", "") or default_model_name))
+        if not task_name:
+            return None
+
+        result = await llm_service.generate(
+            llm_service.LLMServiceRequest(
+                task_name=task_name,
+                request_type=request_type,
+                prompt=prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        )
+        if not result.success or not result.completion.response:
+            return None
+        return result.completion.response.strip()
+
+    def _render_generator_prompt(
+        self,
+        template: str,
+        request_text: str,
+        *,
+        include_custom_system_prompt: bool = True,
+        previous_prompt: str = "",
+        previous_request: str = "",
+        last_selfie_prompt: str = "",
+        last_selfie_request: str = "",
+        last_selfie_scene: str = "",
+        last_selfie_anchor: Optional[dict[str, list[str]]] = None,
+    ) -> str:
+        """渲染提示词生成模板。"""
+        custom_system_prompt = ""
+        if include_custom_system_prompt:
+            custom_system_prompt = str(self.get_config("custom_prompt.system_prompt", "") or "").strip()
+        if custom_system_prompt:
+            custom_system_prompt = custom_system_prompt + "\n\n"
+
+        previous_block = render_previous_prompt_block(previous_prompt, previous_request)
+        selfie_scene_context = self._build_selfie_scene_context(
+            request_text,
+            last_selfie_prompt=last_selfie_prompt,
+            last_selfie_request=last_selfie_request,
+            last_selfie_scene=last_selfie_scene,
+            last_selfie_anchor=last_selfie_anchor,
+        )
+        prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_system_prompt).strip()
+        prompt = prompt.replace("<<PREVIOUS_PROMPT>>", previous_block).strip()
+        prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", self._build_current_time_context()).strip()
+        prompt = prompt.replace("<<SELFIE_HINT>>", get_selfie_hint()).strip()
+        prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context).strip()
+        prompt = prompt.replace("<<USER_REQUEST>>", request_text.strip() or "N/A")
+        return prompt
+
+    async def _retrieve_tag_candidates(self, request_text: str) -> str:
+        """执行 Danbooru tag 检索增强。"""
+        try:
+            retriever_config = self.get_config("tag_retriever", {}) or {}
+            if not isinstance(retriever_config, dict) or not retriever_config.get("enabled", False):
+                return ""
+
+            mode = str(retriever_config.get("mode", "local") or "local").strip().lower()
+            logger.info(f"{self.log_prefix} Tag 检索已启用，模式={mode}，query='{request_text[:30]}'")
+
+            if mode == "online":
+                return await self._retrieve_online_tag_candidates(request_text, retriever_config)
+            return await self._retrieve_local_tag_candidates(request_text, retriever_config)
+        except Exception as exc:
+            logger.warning(f"{self.log_prefix} Tag 检索失败，已跳过: {exc}")
+            return ""
+
+    async def _retrieve_online_tag_candidates(
+        self,
+        request_text: str,
+        retriever_config: dict[str, Any],
+    ) -> str:
+        """执行在线 Danbooru 检索，失败时回退到本地检索。"""
+        try:
+            from .core.services.danbooru_online_retriever import get_online_retriever
+        except Exception as exc:
+            logger.warning(f"{self.log_prefix} Tag 在线检索初始化失败，回退到本地检索: {exc}")
+            return await self._retrieve_local_tag_candidates(request_text, retriever_config)
+
+        retriever = get_online_retriever(
+            enabled=True,
+            base_url=retriever_config.get("api_url", "https://sakizuki-danboorusearch.hf.space/api"),
+            timeout=retriever_config.get("timeout", 90.0),
+            search_limit=retriever_config.get("search_limit", 30),
+            search_top_k=retriever_config.get("search_top_k", 5),
+            related_limit=retriever_config.get("related_limit", 20),
+            related_seed_count=retriever_config.get("related_seed_count", 8),
+            show_nsfw=retriever_config.get("show_nsfw", True),
+            popularity_weight=retriever_config.get("popularity_weight", 0.15),
+        )
+        if not retriever:
+            return ""
+
+        results = await retriever.retrieve(query=request_text)
+        search_count = len(results.get("search", []))
+        related_count = len(results.get("related", []))
+        if search_count == 0 and related_count == 0:
+            logger.info(f"{self.log_prefix} Tag 在线检索无结果，回退到本地检索")
+            return await self._retrieve_local_tag_candidates(request_text, retriever_config)
+
+        logger.info(
+            f"{self.log_prefix} Tag 在线检索命中："
+            f"query='{request_text[:30]}' search={search_count} related={related_count}"
+        )
+        return retriever.format_candidates(results)
+
+    async def _retrieve_local_tag_candidates(
+        self,
+        request_text: str,
+        retriever_config: dict[str, Any],
+    ) -> str:
+        """执行本地 Danbooru 检索。"""
+        retriever = get_tag_retriever(
+            enabled=True,
+            top_k=retriever_config.get("top_k", 20),
+            min_score=retriever_config.get("min_score", 0.3),
+        )
+        if not retriever:
+            return ""
+
+        results = await retriever.retrieve(
+            query=request_text,
+            top_k=retriever_config.get("top_k", 20),
+            min_score=retriever_config.get("min_score", 0.3),
+        )
+        if not results:
+            return ""
+
+        tag_list = ", ".join(f"{item['cn']}→{item['tag']}({item['score']})" for item in results)
+        logger.info(f"{self.log_prefix} Tag 本地检索命中：{tag_list}")
+        return retriever.format_candidates(results)
+
+    async def _generate_prompt_with_llm(
+        self,
+        request_text: str,
+        *,
+        allow_inherit: bool,
+        include_custom_system_prompt: bool = True,
+    ) -> str | None:
+        """将自然语言描述转换为提示词。"""
+        request_text = str(request_text or "").strip()
+        if not request_text:
+            return None
+
+        generator_config = self._get_prompt_generator_config()
+        output_format = str(generator_config.get("output_format", "json") or "json").strip().lower()
+        nsfw_enabled = session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config)
+
+        if output_format == "json":
+            from .core.rules.prompt_rules import PROMPT_GENERATOR_JSON_TEMPLATE, SFW_PROMPT_GENERATOR_JSON_TEMPLATE
+
+            default_template = SFW_PROMPT_GENERATOR_JSON_TEMPLATE if nsfw_enabled else PROMPT_GENERATOR_JSON_TEMPLATE
+        else:
+            default_template = SFW_PROMPT_GENERATOR_TEMPLATE if nsfw_enabled else PROMPT_GENERATOR_TEMPLATE
+
+        previous_prompt = ""
+        previous_request = ""
+        last_selfie_prompt = ""
+        last_selfie_request = ""
+        last_selfie_scene = ""
+        last_selfie_anchor: dict[str, list[str]] = {}
+        if allow_inherit and self.stream_id:
+            inherit_ttl_raw = self.get_config("prompt_generator.inherit_ttl", 0)
+            try:
+                inherit_ttl = float(inherit_ttl_raw or 0)
+            except (TypeError, ValueError):
+                inherit_ttl = 0.0
+            previous_prompt, previous_request = session_state.get_last_nai_context(self.stream_id, ttl=inherit_ttl)
+            (
+                last_selfie_prompt,
+                last_selfie_request,
+                last_selfie_scene,
+                last_selfie_anchor,
+            ) = session_state.get_last_selfie_context(self.stream_id, ttl=inherit_ttl)
+            previous_prompt = previous_prompt or ""
+            previous_request = previous_request or ""
+
+        prompt_template = str(generator_config.get("prompt_template") or default_template)
+        prompt = self._render_generator_prompt(
+            prompt_template,
+            request_text,
+            include_custom_system_prompt=include_custom_system_prompt,
+            previous_prompt=previous_prompt if allow_inherit else "",
+            previous_request=previous_request if allow_inherit else "",
+            last_selfie_prompt=last_selfie_prompt if allow_inherit else "",
+            last_selfie_request=last_selfie_request if allow_inherit else "",
+            last_selfie_scene=last_selfie_scene if allow_inherit else "",
+            last_selfie_anchor=last_selfie_anchor if allow_inherit else None,
+        )
+        tag_candidates = await self._retrieve_tag_candidates(request_text)
+        prompt = prompt.replace("<<TAG_CANDIDATES>>", tag_candidates).strip()
+
+        response = await self._request_llm_text(
+            prompt,
+            request_type="nai_draw_plugin.prompt_generator",
+            generator_config=generator_config,
+            default_model_name="planner",
+            default_temperature=0.2,
+            default_max_tokens=200,
+        )
+        if not response:
+            return None
+
+        cleaned_prompt = self._cleanup_llm_prompt(response)
+        if not cleaned_prompt:
+            return None
+
+        if allow_inherit and self.stream_id:
+            session_state.set_last_nai_context(self.stream_id, cleaned_prompt, request_text)
+        return cleaned_prompt
+
+    async def _generate_random_description(self, *, selfie: bool = False) -> str | None:
+        """生成随机场景描述。"""
+        random_config = self._get_random_scene_config()
+
+        best_candidate: str | None = None
+        best_score: float | None = None
+        rejected_candidates: list[str] = []
+
+        for attempt in range(self._max_random_scene_attempts):
+            prompt = self._build_random_scene_prompt(selfie=selfie, rejected_candidates=rejected_candidates)
+            response = await self._request_llm_text(
+                prompt,
+                request_type="nai_draw_plugin.random_scene",
+                generator_config=random_config,
+                default_model_name="planner",
+                default_temperature=1.0,
+                default_max_tokens=200,
+            )
+            if not response:
+                continue
+
+            lines = [line.strip() for line in response.splitlines() if line.strip()]
+            if not lines:
+                continue
+
+            candidate = normalize_random_scene_description(lines[0])
+            score = get_random_scene_similarity_score(candidate, self._recent_random_scenes)
+            if not is_random_scene_too_similar(
+                candidate,
+                self._recent_random_scenes,
+                threshold=self._random_scene_repeat_threshold,
+            ):
+                self._remember_random_scene(candidate)
+                return candidate
+
+            rejected_candidates.append(candidate)
+            if best_score is None or score < best_score:
+                best_candidate = candidate
+                best_score = score
+            logger.info("%s 随机场景过于相似，重试中: %.2f %s", self.log_prefix, score, candidate)
+
+        if best_candidate:
+            self._remember_random_scene(best_candidate)
+        return best_candidate
+
+    def _build_random_scene_prompt(
+        self,
+        *,
+        selfie: bool = False,
+        rejected_candidates: Optional[list[str]] = None,
+    ) -> str:
+        """构造随机场景提示。"""
+        selfie_extra = ""
+        if selfie:
+            selfie_extra = (
+                "\n\n额外要求（自拍模式）：\n"
+                "- 必须明确是自拍，输出中包含“自拍”或具体自拍方式\n"
+                "- 自拍内容同样要明确偏成人向\n"
+                "- 自拍场景和方式也要多样化"
+            )
+
+        prompt = (
+            "随机生成一个二次元 NSFW 场景，并用空格分隔的中文短标签描述它。\n\n"
+            "要求：\n"
+            "- 题材不限，强度不限，可以是任何成人向内容\n"
+            "- 结果必须具体、可视化、适合转成 Danbooru 风格标签\n"
+            "- 只输出 1 行，包含 6-10 个中文短标签\n"
+            "- 标签尽量简短，使用明确视觉概念，不要写成句子\n"
+            "- 标签尽量覆盖人数、人物构成、状态、互动、视角、场景\n"
+            "- 不要和最近结果过于相似，尽量主动切换题材和画面类型"
+            f"{selfie_extra}"
+        )
+
+        if self._recent_random_scenes:
+            prompt += "\n\n以下是最近已生成过的内容，禁止与它们重复或相似：\n"
+            prompt += "\n".join(self._recent_random_scenes)
+
+        if rejected_candidates:
+            prompt += "\n\n以下候选刚刚被判定为过于相似，禁止继续沿着这些方向小修小补：\n"
+            prompt += "\n".join(rejected_candidates)
+
+        return prompt
+
+    @classmethod
+    def _remember_random_scene(cls, result: str) -> None:
+        """记录最近的随机场景。"""
+        if not result:
+            return
+        cls._recent_random_scenes.append(result)
+        if len(cls._recent_random_scenes) > cls._max_recent_scenes:
+            cls._recent_random_scenes.pop(0)
+
+    def _build_current_time_context(self) -> str:
+        """构造当前时间上下文。"""
+        now = datetime.now()
+        hour = now.hour
+        if 5 <= hour < 8:
+            period = "清晨"
+        elif 8 <= hour < 11:
+            period = "上午"
+        elif 11 <= hour < 14:
+            period = "中午"
+        elif 14 <= hour < 17:
+            period = "下午"
+        elif 17 <= hour < 19:
+            period = "傍晚"
+        elif 19 <= hour < 23:
+            period = "夜晚"
+        else:
+            period = "深夜"
+        return (
+            "<current_time_context>\n"
+            f"当前本地时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（{period}）。\n"
+            "仅在用户未明确指定时，用于补全时间、光线和背景氛围。\n"
+            "</current_time_context>"
+        )
+
+    def _build_selfie_scene_context(
+        self,
+        request_text: str,
+        *,
+        last_selfie_prompt: str = "",
+        last_selfie_request: str = "",
+        last_selfie_scene: str = "",
+        last_selfie_anchor: Optional[dict[str, list[str]]] = None,
+    ) -> str:
+        """为 Action 的自拍/展示照连续发图构建 LLM 上下文。"""
+        current_request = str(request_text or "").strip()
+        previous_prompt = str(last_selfie_prompt or "").strip()
+        if not self._is_likely_selfie_request(current_request, previous_prompt):
+            return ""
+
+        lines = [
+            "<selfie_scene_context>",
+            "这轮请求很可能属于 bot 本人自拍/展示照 的连续发图。",
+            "若用户没有明确要求切换场景、换穿搭或改光线，默认延续上一轮的背景、穿搭、时间氛围与构图重点。",
+            "服装连续性要尽量真实：若用户没有明确要求换衣服、换颜色、换材质、换风格，默认延续上一轮服装款式、主色、材质、袜子和鞋子的视觉设定，不要突然从白衣变黑衣，或从针织变皮衣。",
+            "如果用户明确指定了本轮想看的重点（如黑丝、鞋子、腿部、全身穿搭、背景），优先保留该重点，并选择能看清它的构图。",
+        ]
+        if last_selfie_request:
+            lines.append(f"上一轮用户请求：{last_selfie_request.strip()}")
+        if previous_prompt:
+            lines.append(f"上一轮自拍提示词：{previous_prompt}")
+        lines.append("</selfie_scene_context>")
+        return "\n".join(lines)
+
+    def _is_likely_selfie_request(self, request_text: str, last_selfie_prompt: str = "") -> bool:
+        """判断当前请求是否属于自拍/肖像/展示照连续请求。
+
+        用于决定是否给 LLM 注入"自拍连续场景"上下文，并不影响 Action 是否触发。
+        """
+        text = str(request_text or "").strip()
+        if not text:
+            return False
+
+        # 强信号：含画图/自拍/肖像/想看 bot/追图等关键词，统一走 selfie_rules
+        if detect_explicit_image_request(text):
+            return True
+
+        # 隐式追图：仅在上一轮已是自拍/肖像时，识别少量未在显式关键词里的延续表达
+        if last_selfie_prompt and detect_selfie_from_output(last_selfie_prompt):
+            continuation_patterns = [
+                r"继续", r"还是.*", r"来点不一样", r"换成.+", r"改成.+",
+                r"换地方", r"同一个场景", r"同样背景",
+            ]
+            return any(re.search(pattern, text) for pattern in continuation_patterns)
+
+        return False
+
+    def _extract_selfie_anchor_data(self, prompt: str) -> dict[str, list[str]]:
+        """自拍连续性不再使用结构化锚点，统一交给 LLM 自行判断。"""
+        return {}
+
+    def _format_selfie_anchor_summary(self, anchor_data: dict[str, list[str]]) -> str:
+        """自拍连续性不再输出锚点摘要。"""
+        return ""
+
+    def _normalize_prompt_tags(self, prompt: str) -> list[str]:
+        """将提示词切分并清洗为可分析标签。"""
+        raw_tags = [segment.strip() for segment in prompt.replace("\n", ",").split(",") if segment.strip()]
+        normalized_tags: list[str] = []
+        for tag in raw_tags:
+            cleaned = re.sub(r"^-?\d+(?:\.\d+)?::", "", tag.strip())
+            cleaned = cleaned.replace("::", "")
+            cleaned = cleaned.strip("{}[]() ")
+            if cleaned:
+                normalized_tags.append(cleaned.lower())
+        return normalized_tags
+
+    def _cleanup_llm_prompt(self, prompt: str) -> str:
+        """清理 LLM 返回的提示词。"""
+        if not prompt:
+            return ""
+
+        parsed_prompt = parse_prompt_from_structured_output(prompt)
+        if parsed_prompt:
+            return parsed_prompt
+
+        cleaned = prompt.strip()
+        if cleaned.startswith("```") and cleaned.endswith("```"):
+            cleaned = cleaned[3:-3].strip()
+            if "\n" in cleaned:
+                first_line, rest = cleaned.split("\n", 1)
+                if first_line.strip().isalpha() and len(first_line.strip()) < 15:
+                    cleaned = rest.strip()
+
+        cleaned = re.sub(r"^\s*prompt\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("，", ", ")
+        cleaned = re.sub(r"\s*\n\s*", "\n", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        return cleaned.strip("` \n")
+
+    async def handle_nai_draw(self, description: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai`。"""
+        try:
+            if not await self.ensure_generation_permission():
+                return False, "没有权限", True
+
+            description = str(description or "").strip()
+            if not description:
+                await self.send_text("请输入你想画的内容，例如：/nai 画一张初音未来")
+                return False, "未提供描述", True
+
+            is_random_selfie = description in {"随机自拍", "random selfie"}
+            if description in {"随机", "random", "rand"} or is_random_selfie:
+                description = await self._generate_random_description(selfie=is_random_selfie) or ""
+                if not description:
+                    await self.send_text("随机场景生成失败，请稍后再试~")
+                    return False, "随机生成失败", True
+
+            generated_prompt = await self._generate_prompt_with_llm(
+                description,
+                allow_inherit=False,
+                include_custom_system_prompt=False,
+            )
+            if not generated_prompt:
+                await self.send_text("提示词生成失败，请稍后再试~")
+                return False, "提示词生成失败", True
+
+            is_selfie = detect_selfie_from_output(generated_prompt)
+            selfie_base_prompt = generated_prompt
+            if is_selfie:
+                generated_prompt = self._process_selfie_prompt(
+                    generated_prompt,
+                    description,
+                    include_selfie_prompt_add=True,
+                    log_changes=True,
+                )
+
+            if self.get_config("prompt_generator.enforce_tag_order", False):
+                generated_prompt = normalize_prompt_order(generated_prompt)
+
+            generated_prompt = self._sanitize_prompt_for_sfw_mode(generated_prompt)
+
+            if self._is_prompt_show_enabled():
+                show_prompt = generated_prompt
+                header = "📝 提示词:"
+                if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
+                    show_prompt = self._process_selfie_prompt(
+                        selfie_base_prompt,
+                        description,
+                        include_selfie_prompt_add=False,
+                        log_changes=False,
+                    )
+                    header = "📝 提示词(已隐藏自拍补充):"
+                show_prompt = self._sanitize_prompt_for_sfw_mode(show_prompt)
+                await self.send_text(f"{header}\n{show_prompt}", storage_message=False)
+
+            model_config = self._get_model_config(is_selfie=is_selfie)
+            if not model_config or not model_config.get("base_url"):
+                await self.send_text("NovelAI 配置错误，请检查配置文件")
+                return False, "配置错误", True
+
+            image_size = model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
+            enable_debug = bool(self.get_config("components.enable_debug_info", False))
+            if enable_debug:
+                await self.send_text("正在生成图片，请稍候...")
+
+            success, result = await self.api_client.generate_image(
+                prompt=generated_prompt,
+                model_config=model_config,
+                size=image_size,
+            )
+
+            if not success:
+                await self.send_text(f"生成图片失败：{result}")
+                return False, f"生成失败: {result}", True
+
+            send_result = await self._send_image_result(result, description)
+            if send_result[0] and enable_debug:
+                await self.send_text("图片生成完成！")
+            return send_result
+        except Exception as exc:
+            logger.error("%s /nai 命令执行异常: %r", self.log_prefix, exc, exc_info=True)
+            await self.send_text(f"执行失败：{str(exc)[:100]}")
+            return False, f"执行失败: {exc}", True
+
+    async def handle_nai0_draw(self, tags: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai0`。"""
+        try:
+            if not await self.ensure_generation_permission():
+                return False, "没有权限", True
+
+            tags = str(tags or "").strip()
+            if not tags:
+                await self.send_text("请输入英文标签，例如：/nai0 hatsune miku, smile")
+                return False, "未提供标签", True
+
+            model_config = self._get_model_config()
+            if not model_config or not model_config.get("base_url"):
+                await self.send_text("NovelAI 配置错误，请检查配置文件")
+                return False, "配置错误", True
+
+            image_size = model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
+            enable_debug = bool(self.get_config("components.enable_debug_info", False))
+            if enable_debug:
+                await self.send_text("正在生成图片，请稍候...")
+
+            success, result = await self.api_client.generate_image(
+                prompt=tags,
+                model_config=model_config,
+                size=image_size,
+            )
+
+            if not success:
+                await self.send_text(f"生成图片失败：{result}")
+                return False, f"生成失败: {result}", True
+
+            send_result = await self._send_image_result(result, tags)
+            if send_result[0] and enable_debug:
+                await self.send_text("图片生成完成！")
+            return send_result
+        except Exception as exc:
+            logger.error("%s /nai0 命令执行异常: %r", self.log_prefix, exc, exc_info=True)
+            await self.send_text(f"执行失败：{str(exc)[:100]}")
+            return False, f"执行失败: {exc}", True
+
+    async def handle_action(self) -> tuple[bool, str]:
+        """处理 `nai_web_draw` Action。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户"
+        if not await self.ensure_generation_permission():
+            return False, "没有权限"
+
+        description = str(self.action_data.get("description", "") or "").strip()
+        raw_description = description
+        size = str(self.action_data.get("size", "") or "").strip()
+
+        if not description and not raw_description:
+            description = self.reasoning.strip()
+            raw_description = description
+
+        trigger_assessment = self._assess_action_trigger(
+            raw_description=raw_description,
+            reasoning=self.reasoning,
+        )
+        if self._is_action_guard_enabled() and not trigger_assessment["should_generate"]:
+            logger.info(
+                "%s Action 出图已拦截: category=%s detail=%s text=%s",
+                self.log_prefix,
+                trigger_assessment["category"],
+                trigger_assessment["detail"],
+                (raw_description or self.reasoning)[:120],
+            )
+            return False, trigger_assessment["detail"]
+
+        generated_prompt = await self._generate_prompt_with_llm(
+            description,
+            allow_inherit=True,
+            include_custom_system_prompt=True,
+        )
+        if generated_prompt:
+            description = generated_prompt.strip()
+        elif not description:
+            await self.send_text("提示词生成器开小差了，请直接告诉我想画什么，或者稍后再试一次~")
+            return False, "图片描述为空"
+
+        is_selfie = detect_selfie_from_output(description)
+        selfie_base_prompt = description
+        if is_selfie:
+            description = self._process_selfie_prompt(
+                description,
+                raw_description,
+                include_selfie_prompt_add=True,
+                log_changes=True,
+            )
+            session_state.set_last_selfie_context(
+                self.stream_id,
+                description,
+                raw_description,
+            )
+
+        if self.get_config("prompt_generator.enforce_tag_order", False):
+            description = normalize_prompt_order(description)
+
+        description = self._sanitize_prompt_for_sfw_mode(description)
+
+        if self._is_prompt_show_enabled():
+            show_prompt = description
+            header = "📝 提示词:"
+            if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
+                show_prompt = self._process_selfie_prompt(
+                    selfie_base_prompt,
+                    raw_description,
+                    include_selfie_prompt_add=False,
+                    log_changes=False,
+                )
+                header = "📝 提示词(已隐藏自拍补充):"
+            show_prompt = self._sanitize_prompt_for_sfw_mode(show_prompt)
+            await self.send_text(f"{header}\n{show_prompt}", storage_message=False)
+
+        model_config = self._get_model_config(is_selfie=is_selfie)
+        if not model_config or not model_config.get("base_url"):
+            await self.send_text("抱歉，NAI low-level 网关地址未配置，无法提供服务。")
+            return False, "模型配置无效"
+
+        image_size = size or model_config.get("nai_size") or model_config.get("default_size", "")
+        enable_debug = bool(self.get_config("components.enable_debug_info", False))
+        if enable_debug:
+            await self.send_text("收到！正在使用 NAI low-level 网关生成图片，请稍候...")
+
+        try:
+            success, result = await self.api_client.generate_image(
+                prompt=description,
+                model_config=model_config,
+                size=image_size,
+            )
+        except Exception as exc:
+            logger.error("%s Action 生图失败: %r", self.log_prefix, exc, exc_info=True)
+            await self.send_text(f"图片生成服务遇到意外问题: {str(exc)[:100]}")
+            return False, str(exc)
+
+        if not success:
+            await self.send_text(f"哎呀，生成图片时遇到问题：{result}")
+            return False, str(result)
+
+        send_result = await self._send_image_result(result, raw_description or description)
+        if send_result[0] and enable_debug:
+            await self.send_text("图片生成完成！")
+        return send_result[0], send_result[1] or ""
+
+    def _is_action_guard_enabled(self) -> bool:
+        """检查是否启用自动出图保护。"""
+        return bool(self.get_config("action_guard.enabled", True))
+
+    def _assess_action_trigger(self, raw_description: str, reasoning: str = "") -> dict[str, Any]:
+        """评估当前 Action 是否真的适合出图，并应用频率保护。
+
+        设计原则：
+        - 信任 Planner 的语义判断：Planner 调了 Action 即"它认为该发图"，Guard 不再做白名单二次拦截
+        - Guard 只负责两件事：
+          ① 否定意图黑名单兜底（用户明确说"不要画"也调用了，按 Planner 误判处理）
+          ② 频率保护，按"用户原话强度"分级 explicit / proactive 两档
+        - 不再字面匹配 reasoning：不同 Planner 模型 reasoning 风格差异大，匹配率极低反而造成误拦
+        """
+        del reasoning  # 不再使用 reasoning 做字面匹配，保留参数以兼容调用方
+        user_text = str(raw_description or "").strip()
+
+        # 否定意图兜底：Planner 偶发误调用
+        if detect_negative_image_intent(user_text):
+            return {
+                "should_generate": False,
+                "explicit_request": False,
+                "category": "blocked",
+                "detail": "用户明确表示不需要图片",
+            }
+
+        # 用户原话强度分级：含强信号 → 显式请求；否则 → bot 主动发图
+        is_explicit = detect_explicit_image_request(user_text)
+        category = "explicit" if is_explicit else "proactive"
+
+        can_send, detail = self._check_action_image_interval(category)
+        return {
+            "should_generate": can_send,
+            "explicit_request": is_explicit,
+            "category": category,
+            "detail": detail,
+        }
+
+    def _check_action_image_interval(self, category: str) -> tuple[bool, str]:
+        """检查自动出图间隔，避免短时间连续刷图。
+
+        分档：
+        - explicit:  用户原话明确要求看图/画图/自拍/追图 → 短间隔（默认 45s）
+        - proactive: bot 主动判断需要配图（角色扮演里描述自身/场景）→ 长间隔（默认 600s）
+        """
+        last_sent_at = session_state.get_last_action_image_sent_at(self.stream_id)
+        if last_sent_at is None:
+            return True, "首次出图"
+
+        elapsed = max(0.0, time.time() - last_sent_at)
+        explicit_interval = max(
+            0,
+            int(self.get_config("action_guard.explicit_request_min_interval_seconds", 45) or 45),
+        )
+        proactive_interval = max(
+            0,
+            int(self.get_config("action_guard.proactive_min_interval_seconds", 600) or 600),
+        )
+
+        required_interval = explicit_interval if category == "explicit" else proactive_interval
+
+        if elapsed >= required_interval:
+            return True, "触发条件满足"
+
+        remaining_seconds = int(required_interval - elapsed + 0.999)
+        return False, f"距离上次出图过近，还需等待约 {remaining_seconds} 秒"
+
+    async def handle_admin_command(self, action: str, param: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai st|sp|set|art|size|help`。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+
+        if action == "help":
+            help_text = """📖 NovelAI 图片生成插件命令帮助
+
+【生图命令】
+/nai <描述> - 使用自然语言生成图片
+  示例：/nai 画一张初音未来
+/nai 随机 - 随机生成一张 NSFW 图片
+/nai 随机自拍 - 随机生成一张 NSFW 自拍图片
+/nai0 <英文标签> - 直接使用英文标签生成图片
+  示例：/nai0 1girl, hatsune miku, smile
+
+【模型管理】（仅管理员可用）
+/nai set - 查看当前模型和可用模型列表
+/nai set <代号> - 切换生图模型
+  可用模型：3=V3, f3=Furry V3, 4=V4, 4.5=V4.5 Full, 4.5p=V4.5 Preview
+
+【画师风格预设】
+/nai art - 查看当前画师串列表
+/nai art <编号> - 切换画师风格预设
+
+【图片尺寸】
+/nai size - 查看当前尺寸
+/nai size <尺寸> - 切换图片尺寸
+
+【自动撤回】
+/nai on - 开启图片自动撤回功能（仅管理员可用）
+/nai off - 关闭图片自动撤回功能（仅管理员可用）
+
+【手动撤回】
+/nai 撤回 - 撤回最近一张本插件发送的图片
+
+【提示词显示】
+/nai pt on - 开启提示词显示
+/nai pt off - 关闭提示词显示
+
+【NSFW过滤】
+/nai nsfw - 查看当前 NSFW 过滤状态
+/nai nsfw on - 开启 NSFW 过滤
+/nai nsfw off - 关闭 NSFW 过滤
+
+【管理员功能】
+/nai st - 开启管理员模式
+/nai sp - 关闭管理员模式
+/nai ban <用户ID> - 拉黑指定用户
+/nai unban <用户ID> - 取消拉黑指定用户
+/nai banlist - 查看黑名单"""
+            await self.send_text(help_text)
+            return True, "显示帮助信息", True
+
+        is_admin = session_state.is_admin_user(user_id, self.get_config)
+        if action in {"st", "sp", "set", "ban", "unban", "banlist"} and not is_admin:
+            if action == "set":
+                await self.send_text("❌ 只有管理员可以切换生图模型", storage_message=False)
+            elif action in {"ban", "unban", "banlist"}:
+                await self.send_text("❌ 只有管理员可以管理黑名单", storage_message=False)
+            else:
+                await self.send_text("❌ 只有管理员可以开启/关闭管理员模式", storage_message=False)
+            return False, "没有管理员权限", True
+
+        if action in {"art", "size"} and session_state.is_admin_mode_enabled(platform, chat_id, self.get_config):
+            if not is_admin:
+                await self.send_text("❌ 当前会话已开启管理员模式，仅管理员可以修改 NAI 配置", storage_message=False)
+                return False, "没有权限", True
+
+        if action == "st":
+            session_state.set_admin_mode(platform, chat_id, True)
+            await self.send_text(
+                f"✅ 已在{self._chat_type_text()}中开启 NAI 管理员模式\n"
+                "🔒 现在所有 NAI 命令仅管理员可使用"
+            )
+            return True, "管理员模式已开启", True
+
+        if action == "sp":
+            session_state.set_admin_mode(platform, chat_id, False)
+            await self.send_text(
+                f"✅ 已在{self._chat_type_text()}中关闭 NAI 管理员模式\n"
+                "🔓 现在所有人都可使用 NAI 命令"
+            )
+            return True, "管理员模式已关闭", True
+
+        model_mappings = {
+            "3": "nai-diffusion-3",
+            "f3": "nai-diffusion-3-furry",
+            "4": "nai-diffusion-4-full",
+            "4.5": "nai-diffusion-4-5-full",
+            "4.5p": "nai-diffusion-4-5-curated-anlas-0",
+            "4.5-preview": "nai-diffusion-4-5-curated-anlas-0",
+        }
+        size_mappings = {
+            "竖": "832x1216",
+            "竖图": "832x1216",
+            "横": "1216x832",
+            "横图": "1216x832",
+            "方": "1024x1024",
+            "方图": "1024x1024",
+            "h": "1216x832",
+            "v": "832x1216",
+            "s": "1024x1024",
+        }
+
+        if action == "banlist":
+            blacklist_entries = user_blacklist.list_entries()
+            if not blacklist_entries:
+                await self.send_text("当前黑名单为空", storage_message=False)
+                return True, "黑名单为空", True
+
+            lines = ["当前黑名单用户："]
+            for entry in blacklist_entries:
+                suffix_parts = []
+                if entry["created_at"]:
+                    suffix_parts.append(f"添加时间: {entry['created_at']}")
+                if entry["created_by"]:
+                    suffix_parts.append(f"操作人: {entry['created_by']}")
+
+                suffix = f"（{'，'.join(suffix_parts)}）" if suffix_parts else ""
+                lines.append(f"- {entry['user_id']}{suffix}")
+
+            await self.send_text("\n".join(lines), storage_message=False)
+            return True, "显示黑名单列表", True
+
+        if action in {"ban", "unban"}:
+            target_user_id = self._extract_target_user_id(param)
+            if not target_user_id:
+                await self.send_text(
+                    "❌ 请输入目标用户 ID，例如：/nai ban 123456789",
+                    storage_message=False,
+                )
+                return False, "缺少目标用户 ID", True
+
+            if target_user_id == user_id:
+                await self.send_text("❌ 不允许将自己加入黑名单", storage_message=False)
+                return False, "不允许拉黑自己", True
+
+            if action == "ban":
+                added = user_blacklist.add_user(target_user_id, operator_id=user_id)
+                if not added:
+                    await self.send_text(f"⚠️ 用户 {target_user_id} 已在黑名单中", storage_message=False)
+                    return False, "用户已在黑名单中", True
+
+                await self.send_text(
+                    f"✅ 已将用户 {target_user_id} 加入黑名单\n"
+                    "🔒 该用户现在无法使用本插件任何功能",
+                    storage_message=False,
+                )
+                return True, "已加入黑名单", True
+
+            removed = user_blacklist.remove_user(target_user_id)
+            if not removed:
+                await self.send_text(f"⚠️ 用户 {target_user_id} 不在黑名单中", storage_message=False)
+                return False, "用户不在黑名单中", True
+
+            await self.send_text(f"✅ 已将用户 {target_user_id} 移出黑名单", storage_message=False)
+            return True, "已移出黑名单", True
+
+        if action == "set":
+            if not param:
+                current_model = session_state.get_selected_model(platform, chat_id) or self.get_config(
+                    "model.default_model",
+                    "nai-diffusion-4-5-full",
+                )
+                await self.send_text(
+                    f"当前模型: {current_model}\n\n"
+                    "可用模型:\n"
+                    "3 - nai-diffusion-3\n"
+                    "f3 - nai-diffusion-3-furry\n"
+                    "4 - nai-diffusion-4-full\n"
+                    "4.5 - nai-diffusion-4-5-full\n"
+                    "4.5p - nai-diffusion-4-5-curated-anlas-0 (Preview)"
+                )
+                return True, "显示模型列表", True
+
+            if param not in model_mappings:
+                await self.send_text("❌ 无效的模型代号，可用值：3 / f3 / 4 / 4.5 / 4.5p")
+                return False, "无效的模型代号", True
+
+            model_name = model_mappings[param]
+            session_state.set_selected_model(platform, chat_id, model_name)
+            await self.send_text(f"✅ 已切换到模型: {model_name}")
+            return True, f"已切换到模型 {model_name}", True
+
+        if action == "art":
+            current_model = session_state.get_selected_model(platform, chat_id) or self.get_config(
+                "model.default_model",
+                "nai-diffusion-4-5-full",
+            )
+            if "nai-diffusion-3" in current_model:
+                config_section = "model_nai3"
+            elif "nai-diffusion-4-5" in current_model:
+                config_section = "model_nai4_5"
+            elif "nai-diffusion-4" in current_model:
+                config_section = "model_nai4"
+            else:
+                await self.send_text("❌ 当前模型不支持画师串切换")
+                return False, "模型不支持画师串", True
+
+            artist_presets_raw = self.get_config(f"{config_section}.artist_presets", [])
+            artist_presets = session_state._parse_artist_presets(artist_presets_raw)
+            if not artist_presets:
+                await self.send_text("❌ 当前模型未配置画师串预设")
+                return False, "未配置画师串", True
+
+            if not param:
+                current_index = session_state.get_effective_artist_index(platform, chat_id, current_model, self.get_config)
+                lines = [
+                    f"{'→ ' if index == current_index else '  '}{index}. {preset['name']}"
+                    for index, preset in enumerate(artist_presets, 1)
+                ]
+                await self.send_text("\n".join(lines))
+                return True, "显示画师串列表", True
+
+            try:
+                index = int(param)
+            except ValueError:
+                await self.send_text("❌ 画师串编号必须是数字")
+                return False, "无效的画师串编号", True
+
+            if index < 1 or index > len(artist_presets):
+                await self.send_text(f"❌ 无效的画师串编号，可用范围：1-{len(artist_presets)}")
+                return False, "无效的画师串编号", True
+
+            session_state.set_selected_artist_index(platform, chat_id, index)
+            await self.send_text(f"✅ 已切换到画师串 #{index}\n名称: {artist_presets[index - 1]['name']}")
+            return True, f"已切换到画师串 #{index}", True
+
+        if action == "size":
+            if not param:
+                current_size = session_state.get_selected_size(platform, chat_id) or self.get_config(
+                    "model.default_size",
+                    "832x1216",
+                )
+                await self.send_text(
+                    f"当前尺寸: {current_size}\n\n"
+                    "可用尺寸:\n"
+                    "竖/v - 832x1216\n"
+                    "横/h - 1216x832\n"
+                    "方/s - 1024x1024"
+                )
+                return True, "显示尺寸列表", True
+
+            if param not in size_mappings:
+                await self.send_text("❌ 无效的尺寸代号，可用值：竖/v、横/h、方/s")
+                return False, "无效的尺寸代号", True
+
+            session_state.set_selected_size(platform, chat_id, size_mappings[param])
+            await self.send_text(f"✅ 已切换到尺寸: {size_mappings[param]}")
+            return True, f"已切换到尺寸 {size_mappings[param]}", True
+
+        await self.send_text("使用 /nai help 查看帮助")
+        return False, "未知操作", True
+
+    async def handle_recall_switch(self, action: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai on|off`。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+
+        if not session_state.is_admin_user(user_id, self.get_config):
+            await self.send_text("❌ 只有管理员可以使用自动撤回控制命令", storage_message=False)
+            return False, "没有管理员权限", True
+
+        allowed_groups = self.get_config("auto_recall.allowed_groups", [])
+        if allowed_groups and f"{platform}:{chat_id}" not in allowed_groups:
+            await self.send_text("❌ 当前会话没有使用自动撤回功能的权限")
+            return False, "当前会话没有使用自动撤回功能的权限", True
+
+        if action == "on":
+            session_state.set_recall_enabled(platform, chat_id, True)
+            delay_seconds = self.get_config("auto_recall.delay_seconds", 5)
+            await self.send_text(
+                f"✅ 已在{self._chat_type_text()}中开启 NAI 图片自动撤回功能\n"
+                f"📝 图片将在发送后 {delay_seconds} 秒自动撤回"
+            )
+            return True, "自动撤回已开启", True
+
+        session_state.set_recall_enabled(platform, chat_id, False)
+        await self.send_text(f"✅ 已在{self._chat_type_text()}中关闭 NAI 图片自动撤回功能")
+        return True, "自动撤回已关闭", True
+
+    async def handle_nsfw_command(self, action: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai nsfw`。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+
+        if not session_state.is_admin_user(user_id, self.get_config):
+            await self.send_text("❌ 只有管理员可以使用 NSFW 过滤控制命令", storage_message=False)
+            return False, "没有管理员权限", True
+
+        if not action:
+            current_state = session_state.is_nsfw_filter_enabled(platform, chat_id, self.get_config)
+            state_text = "已开启" if current_state else "已关闭"
+            await self.send_text(
+                f"当前 NSFW 过滤状态: {state_text}\n\n"
+                "使用方法:\n"
+                "/nai nsfw on - 开启 NSFW 内容过滤\n"
+                "/nai nsfw off - 关闭 NSFW 内容过滤",
+                storage_message=False,
+            )
+            return True, "显示 NSFW 过滤状态", True
+
+        enabled = action == "on"
+        session_state.set_nsfw_filter_enabled(platform, chat_id, enabled)
+        state_text = "开启" if enabled else "关闭"
+        await self.send_text(f"✅ 已在{self._chat_type_text()}中{state_text} NSFW 内容过滤", storage_message=False)
+        return True, f"NSFW 过滤已{state_text}", True
+
+    async def handle_prompt_show_command(self, action: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai pt on|off`。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+
+        if session_state.is_admin_mode_enabled(platform, chat_id, self.get_config):
+            if not session_state.is_admin_user(user_id, self.get_config):
+                await self.send_text("❌ 当前会话已开启管理员模式，仅管理员可以修改提示词显示设置", storage_message=False)
+                return False, "没有权限", True
+
+        enabled = action == "on"
+        session_state.set_prompt_show_enabled(platform, chat_id, enabled)
+        await self.send_text("✅ 已开启提示词显示" if enabled else "✅ 已关闭提示词显示")
+        return True, "提示词显示状态已更新", True
+
+    @staticmethod
+    def _extract_target_user_id(raw_value: str) -> str:
+        """从命令参数中提取目标用户 ID。"""
+        text = str(raw_value or "").strip()
+        if not text:
+            return ""
+
+        for pattern in (
+            r"(?:qq|user_id|uid)=(\d+)",
+            r"<@!?(\d+)>",
+            r"@(\d+)",
+        ):
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+
+        return text

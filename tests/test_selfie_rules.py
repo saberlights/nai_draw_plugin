@@ -1,0 +1,89 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from plugins.nai_draw_plugin.core.rules.selfie_rules import (
+    detect_explicit_image_request,
+    detect_negative_image_intent,
+    merge_selfie_prompt,
+)
+
+
+def test_merge_selfie_prompt_appends_selfie_tags_after_main_prompt() -> None:
+    merged = merge_selfie_prompt(
+        "solo, 1girl, selfie, smile, bedroom",
+        "young woman, pink eyes",
+    )
+
+    assert merged == "solo, 1girl, selfie, smile, bedroom, young woman, pink eyes"
+
+
+def test_merge_selfie_prompt_removes_conflicting_hair_and_eye_tags_before_appending() -> None:
+    merged = merge_selfie_prompt(
+        "solo, 1girl, selfie, black hair, blue eyes, smile",
+        "light blue hair, pink eyes",
+    )
+
+    assert merged == "solo, 1girl, selfie, smile, light blue hair, pink eyes"
+
+
+# ============ detect_explicit_image_request ============
+
+def test_explicit_request_direct_draw_words_match() -> None:
+    """用户原话含画图/出图类强信号 → True"""
+    assert detect_explicit_image_request("来一张萝莉") is True
+    assert detect_explicit_image_request("给我整一只小狗") is True
+    assert detect_explicit_image_request("帮我画一张赛博朋克城市") is True
+    assert detect_explicit_image_request("发图") is True
+    assert detect_explicit_image_request("再来一张") is True
+
+
+def test_explicit_request_selfie_and_portrait_words_match() -> None:
+    """自拍/肖像类关键词 → True"""
+    assert detect_explicit_image_request("发张自拍") is True
+    assert detect_explicit_image_request("镜子里拍一张") is True
+    assert detect_explicit_image_request("想要肖像") is True
+    assert detect_explicit_image_request("看你的立绘") is True
+
+
+def test_explicit_request_see_bot_self_words_match() -> None:
+    """想看 bot 本人样子的请求 → True"""
+    assert detect_explicit_image_request("想看你妹妹") is True
+    assert detect_explicit_image_request("看看你今天穿了什么") is True
+    assert detect_explicit_image_request("你长什么样") is True
+    assert detect_explicit_image_request("看看黑丝") is True
+
+
+def test_explicit_request_continuation_words_match() -> None:
+    """连续追图类关键词 → True"""
+    assert detect_explicit_image_request("换个角度") is True
+    assert detect_explicit_image_request("这身衣服全身看看") is True
+    assert detect_explicit_image_request("同一套再来一张") is True
+
+
+def test_explicit_request_casual_chat_does_not_match() -> None:
+    """日常闲聊、知识问答、评价类不命中 → False（此时由 Planner 决定是否主动发图，进 proactive 档）"""
+    assert detect_explicit_image_request("今天天气真不错") is False
+    assert detect_explicit_image_request("Python 字典怎么用") is False
+    assert detect_explicit_image_request("你觉得这个电影怎么样") is False
+    assert detect_explicit_image_request("刚才那张图不错") is False
+    assert detect_explicit_image_request("") is False
+
+
+# ============ detect_negative_image_intent ============
+
+def test_negative_intent_blocks_explicit_refusals() -> None:
+    """用户明确拒绝出图 → True（即使 Planner 调了 Action 也应拦截）"""
+    assert detect_negative_image_intent("不要画") is True
+    assert detect_negative_image_intent("别给我画图") is True
+    assert detect_negative_image_intent("文字回复就行") is True
+    assert detect_negative_image_intent("不用配图") is True
+
+
+def test_negative_intent_does_not_block_normal_requests() -> None:
+    """正常请求/闲聊不应命中否定意图"""
+    assert detect_negative_image_intent("想看你") is False
+    assert detect_negative_image_intent("画一张萝莉") is False
+    assert detect_negative_image_intent("今天天气真好") is False
+    assert detect_negative_image_intent("") is False

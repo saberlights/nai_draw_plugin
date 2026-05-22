@@ -1,0 +1,42 @@
+# 配置文件
+config.toml
+config.toml.bak
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 生成的图片
+generated_images/
+
+# 生成的数据文件
+data/
+
+# 运行日志
+logs/
+
+# 临时文件
+*.tmp
+*.tmp.*
+
+# 外部资料（参考数据，不进仓库）
+*.xlsx
+
+# IDE / 工具
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude/
+.codex
+.agents/
+.pytest_cache/
+
+# 项目内部协作文档（不进公开仓库；保留 README.md）
+AGENTS.md
+CLAUDE.md
+docs/
