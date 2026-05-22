@@ -693,6 +693,25 @@ class NaiPicPlugin(MaiBotPlugin):
         },
     }
 
+    def get_default_config(self) -> dict[str, Any]:
+        """从 ``config_schema`` 推导默认配置，供 MaiBot Runner 首次启动时自动生成 config.toml。
+
+        MaiBotPlugin SDK 默认通过 ``get_config_model()`` 拼默认配置，但本插件仍走旧版
+        ``config_schema`` 字典风格，因此手动遍历一次，避免 Runner 因为 ``default_config``
+        为空而跳过 config.toml 初始化。
+        """
+        default_config: dict[str, Any] = {}
+        for section_name, fields in type(self).config_schema.items():
+            if not isinstance(fields, dict):
+                continue
+            section: dict[str, Any] = {}
+            for field_name, field in fields.items():
+                if hasattr(field, "default"):
+                    section[field_name] = field.default
+            if section:
+                default_config[section_name] = section
+        return default_config
+
     def __init__(self) -> None:
         """初始化插件实例。"""
         super().__init__()
