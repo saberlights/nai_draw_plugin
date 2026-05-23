@@ -19,6 +19,7 @@ sys.modules.setdefault("maibot_sdk", maibot_sdk_stub)
 maibot_sdk_types_stub = types.ModuleType("maibot_sdk.types")
 maibot_sdk_types_stub.ActivationType = type("ActivationType", (), {"ALWAYS": "ALWAYS"})
 maibot_sdk_types_stub.HookMode = type("HookMode", (), {"OBSERVE": "OBSERVE"})
+maibot_sdk_types_stub.HookOrder = type("HookOrder", (), {"EARLY": "EARLY", "NORMAL": "NORMAL", "LATE": "LATE"})
 sys.modules.setdefault("maibot_sdk.types", maibot_sdk_types_stub)
 
 src_config_package = types.ModuleType("src.config")

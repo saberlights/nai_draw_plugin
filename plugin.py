@@ -9,11 +9,12 @@ import tomllib
 import tomlkit
 
 from maibot_sdk import Action, Command, HookHandler, MaiBotPlugin
-from maibot_sdk.types import ActivationType, HookMode
+from maibot_sdk.types import ActivationType, HookMode, HookOrder
 
 from src.core.config_types import ConfigField
 
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
+from .core.retag import ImageCacheService, ReverseService, WD14Client
 from .core.rules.reply_auto_draw import (
     compose_description_from_reply,
     score_reply_for_auto_draw,
@@ -227,7 +228,7 @@ class NaiPicPlugin(MaiBotPlugin):
 
     # 插件基本信息
     plugin_name = "nai_draw_plugin"
-    plugin_version = "1.2.1"
+    plugin_version = "1.7.0"
     plugin_author = "saberlight"
     enable_plugin = True
     dependencies: List[str] = []
@@ -264,6 +265,7 @@ class NaiPicPlugin(MaiBotPlugin):
         "auto_recall",
         "admin",
         "tag_retriever",
+        "retag",
         "custom_prompt",
         "model_nai4_5",
         "model_nai4",
@@ -280,6 +282,11 @@ class NaiPicPlugin(MaiBotPlugin):
         "action_guard": "========== 自动出图触发保护 ==========",
         "random_scene": "========== 随机场景生成（/nai 随机） ==========\n未配置的项会回退到 [prompt_generator]",
         "components": "========== 功能开关 ==========",
+        "retag": (
+            "========== 图片反推（/nai 反推） ==========\n"
+            "PNG 元数据可命中 → 直接读 prompt；不可命中 → 用 WD14 在线 Space 兜底（需安装 gradio_client）。\n"
+            "只输出正向 prompt，不返回负面。"
+        ),
         "custom_prompt": (
             "========== 自定义系统提示词 ==========\n"
             "这段通常不需要频繁修改；保留在文件末尾，避免影响日常配置体验。"
@@ -299,6 +306,14 @@ class NaiPicPlugin(MaiBotPlugin):
     # 仅为 schema 内联 dict 字段做兜底，避免删后老代码崩）。
     config_section_descriptions: dict[str, str] = {}
 
+    # 不渲染到 config.toml 的字段（schema 仍保留以便高级用户手动覆盖；默认值在代码层走兜底）。
+    # 结构：{section_name: {field_name, ...}}
+    config_hidden_fields: dict[str, set[str]] = {
+        # WD14 Space 列表用户基本改不动（要清楚 type/api 协议）；默认 3 个 Space 内置在
+        # WD14Client.DEFAULT_SPACES，留空配置即用默认，碍眼又易写错故不渲染。
+        "retag": {"wd14_spaces"},
+    }
+
     # 配置Schema
     config_schema = {
         "plugin": {
@@ -310,7 +325,7 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.4.0",
+                default="1.5.0",
                 description="插件配置版本号"
             ),
             "enabled": ConfigField(
@@ -922,6 +937,84 @@ class NaiPicPlugin(MaiBotPlugin):
                 description="本地检索最低相似度阈值（低于此分数的不返回）"
             ),
         },
+        "retag": {
+            "enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用 /nai 反推 命令（PNG 元数据 → WD14 兜底，只输出正向 prompt）"
+            ),
+            "cache_ttl_seconds": ConfigField(
+                type=int,
+                default=3600,
+                description="入站图片缓存保留秒数；超过后即便回引也无法定位旧图"
+            ),
+            "image_cache_per_stream": ConfigField(
+                type=int,
+                default=20,
+                description="每个会话保留的最近图片消息数量上限"
+            ),
+            "wd14_enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="非原图（无元数据）时是否调用 WD14 在线 Space 兜底；需安装 gradio_client"
+            ),
+            "wd14_model": ConfigField(
+                type=str,
+                default="SmilingWolf/wd-eva02-large-tagger-v3",
+                description="WD14 模型名（仅 official 类 Space 生效）"
+            ),
+            "wd14_threshold": ConfigField(
+                type=float,
+                default=0.35,
+                description="通用标签置信度阈值（0~1）"
+            ),
+            "wd14_character_threshold": ConfigField(
+                type=float,
+                default=0.8,
+                description="角色标签置信度阈值（0~1）"
+            ),
+            "wd14_request_timeout": ConfigField(
+                type=float,
+                default=35.0,
+                description="单个 Space 请求超时（秒）；1~2MB 大图实测需 16~23s，留点余量"
+            ),
+            "wd14_max_retries": ConfigField(
+                type=int,
+                default=1,
+                description="单个 Space 失败时的重试次数"
+            ),
+            "wd14_retry_delay": ConfigField(
+                type=float,
+                default=0.5,
+                description="单个 Space 重试间隔（秒）"
+            ),
+            "wd14_proxy": ConfigField(
+                type=str,
+                default="",
+                description="访问 Hugging Face Space 时使用的代理 URL（形如 http://127.0.0.1:7890）；留空则继承环境变量"
+            ),
+            "wd14_spaces": ConfigField(
+                type=list,
+                default=[
+                    {
+                        "name": "animetimm/dbv4-full-witha-playground",
+                        "type": "danbooru_v4",
+                        "api": "/_fn_submit",
+                    },
+                    {
+                        "name": "pixai-labs/pixai-tagger-demo",
+                        "type": "pixai",
+                        "api": "/predict_image",
+                    },
+                    {
+                        "name": "DraconicDragon/PixAI-Tagger-v0.9-ONNX",
+                        "type": "pixai_onnx",
+                        "api": "/run_inference",
+                    },
+                ],
+                description="可并发轮询的 HF Space 列表；每条需 name/type/api 三字段"
+            ),
+        },
     }
 
     def get_default_config(self) -> dict[str, Any]:
@@ -930,13 +1023,20 @@ class NaiPicPlugin(MaiBotPlugin):
         MaiBotPlugin SDK 默认通过 ``get_config_model()`` 拼默认配置，但本插件仍走旧版
         ``config_schema`` 字典风格，因此手动遍历一次，避免 Runner 因为 ``default_config``
         为空而跳过 config.toml 初始化。
+
+        ``config_hidden_fields`` 中声明的字段不会写入默认配置，避免 Runner 把它们 dump 到
+        首次生成的 config.toml；运行时这些字段仍可被用户手动添加并被代码读取。
         """
+        hidden_map = getattr(self, "config_hidden_fields", None) or {}
         default_config: dict[str, Any] = {}
         for section_name, fields in type(self).config_schema.items():
             if not isinstance(fields, dict):
                 continue
+            hidden = hidden_map.get(section_name) or set()
             section: dict[str, Any] = {}
             for field_name, field in fields.items():
+                if field_name in hidden:
+                    continue
                 if hasattr(field, "default"):
                     section[field_name] = field.default
             if section:
@@ -951,10 +1051,14 @@ class NaiPicPlugin(MaiBotPlugin):
         # reply 自动跟图：同一 session 在同一 reply 链路里只触发一次，避免 retry 重复出图。
         # key=session_id, value=已触发的 reply 文本哈希集合
         self._auto_draw_fired_signatures: dict[str, set[str]] = {}
+        # 反推链路：图片缓存与编排服务都在 __init__ 阶段就准备好，避免 HookHandler 在配置加载前触发时 NoneError
+        self._image_cache_service: ImageCacheService = ImageCacheService()
+        self._reverse_service: ReverseService = ReverseService(wd14_client=None)
 
     async def on_load(self) -> None:
         """处理插件加载。"""
         self._refresh_runtime_singletons()
+        self._refresh_retag_runtime()
         # 主程序 _save_plugin_config 在整文件重写时不会把 ConfigField.description 渲染成注释。
         # 在 on_load 兜底回填一次，保留用户已写入的值，仅在文件里完全没有注释时触发，
         # 避免覆盖用户手写注释。
@@ -974,6 +1078,7 @@ class NaiPicPlugin(MaiBotPlugin):
         for invocation in list(self._active_invocations):
             invocation.close()
         reset_runtime_recall_tracking_state()
+        self._image_cache_service.clear()
         self._refresh_runtime_singletons(reset_only=True)
 
     async def on_config_update(
@@ -1002,6 +1107,7 @@ class NaiPicPlugin(MaiBotPlugin):
 
         if _scope == "self":
             self._refresh_runtime_singletons()
+            self._refresh_retag_runtime()
 
     def _refresh_runtime_singletons(self, *, reset_only: bool = False) -> None:
         """刷新插件级单例缓存，保证配置热更新后新调用使用最新参数。"""
@@ -1042,6 +1148,53 @@ class NaiPicPlugin(MaiBotPlugin):
             enabled=True,
             top_k=tag_retriever_config.get("top_k", 50),
             min_score=tag_retriever_config.get("min_score", 0.6),
+        )
+
+    def _refresh_retag_runtime(self) -> None:
+        """刷新反推链路的运行时单例（图缓存 TTL、WD14 客户端）。"""
+        plugin_config = self.get_plugin_config_data()
+        retag_config = plugin_config.get("retag") if isinstance(plugin_config, dict) else None
+        if not isinstance(retag_config, dict):
+            retag_config = {}
+
+        self._image_cache_service.update_config(
+            cache_ttl_seconds=float(retag_config.get("cache_ttl_seconds", 3600) or 3600),
+            per_stream_capacity=int(retag_config.get("image_cache_per_stream", 20) or 20),
+        )
+
+        wd14_enabled = bool(retag_config.get("wd14_enabled", True))
+        wd14_threshold = float(retag_config.get("wd14_threshold", 0.35) or 0.35)
+        wd14_character_threshold = float(retag_config.get("wd14_character_threshold", 0.8) or 0.8)
+
+        if wd14_enabled:
+            spaces_raw = retag_config.get("wd14_spaces")
+            spaces_config: list[dict[str, str]] = []
+            if isinstance(spaces_raw, list):
+                for item in spaces_raw:
+                    if isinstance(item, dict) and item.get("name") and item.get("type") and item.get("api"):
+                        spaces_config.append(
+                            {
+                                "name": str(item["name"]),
+                                "type": str(item["type"]),
+                                "api": str(item["api"]),
+                            }
+                        )
+            wd14_client = WD14Client(
+                model=str(retag_config.get("wd14_model", "SmilingWolf/wd-eva02-large-tagger-v3")),
+                timeout=float(retag_config.get("wd14_request_timeout", 20.0) or 20.0),
+                max_retries=int(retag_config.get("wd14_max_retries", 1) or 1),
+                retry_delay=float(retag_config.get("wd14_retry_delay", 0.5) or 0.5),
+                spaces_config=spaces_config or None,
+                proxy=str(retag_config.get("wd14_proxy", "") or "").strip() or None,
+            )
+        else:
+            wd14_client = None
+
+        self._reverse_service.update_wd14_client(wd14_client)
+        self._reverse_service.update_wd14_thresholds(
+            threshold=wd14_threshold,
+            character_threshold=wd14_character_threshold,
+            enabled=wd14_enabled,
         )
 
     def _track_task(self, task: asyncio.Task[Any]) -> None:
@@ -1177,6 +1330,41 @@ class NaiPicPlugin(MaiBotPlugin):
         # 走通用后台启动：同 session 已有生成任务则丢弃这次跟图（避免叠加）
         self._start_image_generation_in_background(normalized_session, _runner)
 
+    @HookHandler(
+        "chat.receive.before_process",
+        name="nai_draw_plugin_retag_receive_image_cache",
+        description="缓存入站图片消息，供 /nai 反推 解析引用回复",
+        order=HookOrder.EARLY,
+    )
+    async def handle_retag_receive_before_process(
+        self,
+        message: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """监听所有入站消息，把带图的存到 ImageCacheService。"""
+        del kwargs
+        if isinstance(message, dict):
+            self._image_cache_service.cache_inbound_message(message)
+        return {"action": "continue"}
+
+    @HookHandler(
+        "chat.command.before_execute",
+        name="nai_draw_plugin_retag_command_message_cache",
+        description="在 /nai 反推 执行前缓存当前命令消息（保留 reply 信息）",
+        order=HookOrder.EARLY,
+    )
+    async def handle_retag_command_before_execute(
+        self,
+        message: dict[str, Any] | None = None,
+        command_name: str = "",
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """仅在 /nai 反推 命令触发前生效，其它命令直接放行。"""
+        del kwargs
+        if command_name == "nai_retag_command" and isinstance(message, dict):
+            self._image_cache_service.remember_command_message(message)
+        return {"action": "continue"}
+
     def _is_image_generation_pending(self, stream_id: str) -> bool:
         """检查当前会话是否已有进行中的图片任务。"""
         return bool(stream_id and session_state.get_pending_image_generation_started_at(stream_id) is not None)
@@ -1218,6 +1406,56 @@ class NaiPicPlugin(MaiBotPlugin):
         if stream_id:
             await self.ctx.send.text("收到，正在生成图片，请稍候...", stream_id, storage_message=False)
         return True
+
+    async def _run_retag(self, *, stream_id: str, user_id: str) -> tuple[bool, str | None, bool]:
+        """执行 `/nai 反推`：取目标图 → 反推 → 把结果发回会话。"""
+        plugin_config = self.get_plugin_config_data()
+        retag_config = plugin_config.get("retag") if isinstance(plugin_config, dict) else None
+        if not isinstance(retag_config, dict) or not retag_config.get("enabled", True):
+            await self.ctx.send.text("❌ /nai 反推 已在配置中关闭", stream_id, storage_message=False)
+            return False, "反推未启用", True
+
+        image_base64 = self._image_cache_service.resolve_image_base64(
+            stream_id=stream_id,
+            user_id=user_id,
+        )
+        if not image_base64:
+            await self.ctx.send.text(
+                "❌ 未找到图片\n请引用回复一张图后发送 /nai 反推，或在同一条消息内发图加命令",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "未找到图片", True
+
+        try:
+            import base64 as _base64
+            payload = image_base64.split(",", 1)[1] if image_base64.startswith("data:") else image_base64
+            image_bytes = _base64.b64decode(payload)
+        except Exception as exc:
+            await self.ctx.send.text(f"❌ 图片解码失败: {exc}", stream_id, storage_message=False)
+            return False, "图片解码失败", True
+
+        await self.ctx.send.text("🔍 正在反推 tag，请稍候...", stream_id, storage_message=False)
+
+        result = await self._reverse_service.reverse(image_bytes)
+        if result.source == "failed" or not result.prompt:
+            await self.ctx.send.text(
+                "❌ 反推失败：" + (result.detail or "未知原因") + "\n（仅 PNG 元数据命中或 WD14 可用时才能拿到 tag）",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "反推失败", True
+
+        source_label = {
+            "metadata": "📦 PNG 元数据",
+            "wd14": "🔍 WD14 在线 Space",
+        }.get(result.source, result.source)
+
+        await self.ctx.send.text(
+            f"✅ 反推完成（{source_label}，{len(result.tags)} 个 tag）\n\n{result.prompt}\n\n💡 可直接用于 /nai0 <prompt>",
+            stream_id,
+        )
+        return True, "反推成功", True
 
     def _load_local_plugin_config(self) -> dict[str, Any]:
         """回退读取当前插件目录下的 `config.toml`。"""
@@ -1291,6 +1529,7 @@ class NaiPicPlugin(MaiBotPlugin):
         """
         schema = getattr(self, "config_schema", None) or {}
         section_descs = getattr(self, "config_section_descriptions", None) or {}
+        hidden_map = getattr(self, "config_hidden_fields", None) or {}
         if not isinstance(schema, dict) or not schema:
             return ""
 
@@ -1324,13 +1563,19 @@ class NaiPicPlugin(MaiBotPlugin):
             if not isinstance(fields, dict):
                 continue
             seen_sections.add(section_name)
+            hidden = hidden_map.get(section_name) or set()
+            visible_fields = {
+                fname: fdef for fname, fdef in fields.items() if fname not in hidden
+            }
+            if not visible_fields:
+                continue
             group_header_text = group_headers.get(section_name)
             if isinstance(group_header_text, str) and group_header_text.strip():
                 blocks.append(_format_comment_block(group_header_text))
             blocks.append(
                 _render_section_with_comments(
                     section_name=section_name,
-                    fields=fields,
+                    fields=visible_fields,
                     section_desc=section_descs.get(section_name),
                     existing_doc=existing_doc,
                 )
@@ -1486,9 +1731,27 @@ class NaiPicPlugin(MaiBotPlugin):
         return await invocation.manual_recall()
 
     @Command(
+        "nai_retag_command",
+        description="图片反推：/nai 反推（PNG 元数据 → WD14 兜底，只输出正向 prompt）",
+        pattern=r"^(?:.*?)(?:/nai\s+反推)(?:\s+.*)?$",
+    )
+    async def handle_nai_retag_command(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai 反推`。
+
+        反推链路全部走插件内单例，命令本身不接 Invocation。
+        """
+        del kwargs
+        return await self._run_retag(stream_id=stream_id, user_id=user_id)
+
+    @Command(
         "nai_draw",
         description="使用自然语言描述生成图片",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|撤回(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,

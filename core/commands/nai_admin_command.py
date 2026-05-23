@@ -203,6 +203,11 @@ class NaiAdminControlCommand(BaseCommand):
 /nai nsfw on - 开启NSFW过滤
 /nai nsfw off - 关闭NSFW过滤
 
+【图片反推】
+/nai 反推 - 回引图片或同消息发图，把图反推成 Danbooru tag
+  · PNG 原图（NAI/SD 元数据）→ 秒级精确还原 prompt
+  · 非原图 → 走 WD14 在线 Space 兜底（耗时 20~60s，只输出正向）
+
 【管理员功能】（仅管理员可用）
 /nai st - 开启管理员模式
 /nai sp - 关闭管理员模式

@@ -2370,6 +2370,11 @@ class NaiInvocation(ModelConfigMixin):
 /nai nsfw - 查看当前状态
 /nai nsfw on/off - 开关 NSFW 过滤
 
+【图片反推】
+/nai 反推 - 回引图片或同消息发图，把图反推成 Danbooru tag
+  · PNG 原图（NAI/SD 元数据）→ 秒级精确还原 prompt
+  · 非原图 → 走 WD14 在线 Space 兜底（耗时 20~60s，只输出正向）
+
 【管理员功能】
 /nai st - 开启管理员模式
 /nai sp - 关闭管理员模式
