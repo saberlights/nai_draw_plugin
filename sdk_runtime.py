@@ -1647,13 +1647,6 @@ class NaiInvocation(ModelConfigMixin):
             prompt += "\n\n以下候选刚刚被判定为过于相似，禁止继续沿着这些方向小修小补：\n"
             prompt += "\n".join(rejected_candidates)
 
-        # 与主提示词生成保持一致：仅在 NSFW 模式（未开启过滤）下把 custom_prompt.system_prompt 拼到最前
-        nsfw_enabled = session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config)
-        if not nsfw_enabled:
-            custom_system_prompt = str(self.get_config("custom_prompt.system_prompt", "") or "").strip()
-            if custom_system_prompt:
-                prompt = f"{custom_system_prompt}\n\n{prompt}"
-
         return prompt
 
     @classmethod
