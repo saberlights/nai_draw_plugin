@@ -1528,10 +1528,13 @@ class NaiInvocation(ModelConfigMixin):
             previous_request = previous_request or ""
 
         prompt_template = str(generator_config.get("prompt_template") or default_template)
+        # 仅在 NSFW 模板（即未开启 NSFW 过滤）路径下注入 custom_prompt.system_prompt；
+        # SFW 模板要保持安全输出，不能被破限词颠覆
+        effective_include_custom_system_prompt = include_custom_system_prompt and not nsfw_enabled
         prompt = self._render_generator_prompt(
             prompt_template,
             request_text,
-            include_custom_system_prompt=include_custom_system_prompt,
+            include_custom_system_prompt=effective_include_custom_system_prompt,
             previous_prompt=previous_prompt if allow_inherit else "",
             previous_request=previous_request if allow_inherit else "",
             last_selfie_prompt=last_selfie_prompt if allow_inherit else "",
@@ -1643,6 +1646,13 @@ class NaiInvocation(ModelConfigMixin):
         if rejected_candidates:
             prompt += "\n\n以下候选刚刚被判定为过于相似，禁止继续沿着这些方向小修小补：\n"
             prompt += "\n".join(rejected_candidates)
+
+        # 与主提示词生成保持一致：仅在 NSFW 模式（未开启过滤）下把 custom_prompt.system_prompt 拼到最前
+        nsfw_enabled = session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config)
+        if not nsfw_enabled:
+            custom_system_prompt = str(self.get_config("custom_prompt.system_prompt", "") or "").strip()
+            if custom_system_prompt:
+                prompt = f"{custom_system_prompt}\n\n{prompt}"
 
         return prompt
 
@@ -1796,7 +1806,8 @@ class NaiInvocation(ModelConfigMixin):
             generated_prompt = await self._generate_prompt_with_llm(
                 description,
                 allow_inherit=False,
-                include_custom_system_prompt=False,
+                # NSFW 模板路径会自动注入 custom_prompt.system_prompt；SFW 模板由内部门控跳过
+                include_custom_system_prompt=True,
             )
             if not generated_prompt:
                 await self.send_text("提示词生成失败，请稍后再试~")
