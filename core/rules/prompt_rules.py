@@ -205,9 +205,44 @@ char2:[人物2 tag],
 
 ### 互动 tag（多人核心机制）
 当多人发生物理互动，使用前缀区分主被动：
-- `source#动作`：动作发出者（主动式/现在分词，如 `source#hugging`、`source#groping`）
-- `target#动作`：动作接受者（被动式/过去分词，如 `target#hugged`、`target#groped`）
-- `mutual#动作`：双方共同动作（如 `mutual#hug`、`mutual#kiss`）
+- `source#动作`：动作发出者（**现在分词 / -ing 形式**，如 `source#hugging`、`source#groping`、`source#kissing`、`source#fingering`）
+- `target#动作`：动作接受者（**过去分词 / -ed 形式**，如 `target#hugged`、`target#groped`、`target#kissed`、`target#fingered`）
+- `mutual#动作`：双方**真正共同参与且强度对等**的动作（如 `mutual#hug`、`mutual#kiss`、`mutual#dance`）
+
+**铁律 1 · 前缀后必须是动词分词，禁止名词短语**
+任何 `source#/target#/mutual#` 前缀之后只能跟动词分词形式。如果你脑中只有名词短语，就**不要加 # 前缀**，作为状态描述直接写在 char 段里。
+
+| ❌ 错误（名词短语 + # 前缀） | ✅ 正确写法 |
+|---|---|
+| `target#hand under skirt` | 改为状态描述 `hand under skirt`（不带前缀）；或 `target#touched under skirt` |
+| `source#hand under skirt` | `source#touching under skirt` / `source#groping under skirt` |
+| `target#breast` | `target#groped` / `target#fondled` |
+| `source#another's breast` | `source#groping` |
+| `mutual#tongue` | `mutual#tongue kiss` / 状态描述 `tongue out` |
+
+**铁律 2 · source 与 target 的动词形式必须配对，且方向不能反**
+对接受方写主动语态（`target#grabbing`）等于把"被害人"写成了"加害人"，画面会反。
+
+| ❌ 错误（target 配主动语态） | ✅ 正确 |
+|---|---|
+| `target#grabbing another's breast` | `target#groped` |
+| `target#kissing` | `target#kissed` |
+| `target#fingering` | `target#fingered` |
+| `source#groped`（source 配被动） | `source#groping` |
+
+**铁律 3 · 单向 / 强迫场景禁用 mutual**
+当一方主动一方被动（如强吻、抚摸、调戏），即便动作是亲吻这类"看起来双方都在"的事，也必须用 `source#kissing` + `target#kissed`，而**不是** `mutual#kiss`。`mutual#` 只留给两人都明显享受/主动的对等动作。
+
+判定方法：char1 表情含 `scowl / uncomfortable / crying / struggling / forced` 等被动信号，或 char2 含 `pulling hair / forcing / pinning` 等主动信号 → 必用 source/target，不许 mutual。
+
+**铁律 4 · # 前缀内部禁止逗号、撇号 `'`、下划线**
+逗号会破坏 tag 结构；撇号 / 下划线已知会让 NAI 4 多角色解析不稳。
+
+| ❌ | ✅ |
+|---|---|
+| `source#grabbing another's breast` | `source#groping` |
+| `target#hand_under_skirt` | `target#touched under skirt` |
+| `source#groping, fingering` | 拆成两条：`source#groping, source#fingering` |
 
 ### JSON 模式额外规则
 - `format: "multi"` 时，人数 tag 只能在 `global`，`people[i]` 不得重复
@@ -287,59 +322,31 @@ _EXAMPLES_BASE = """
 ### 例 1：已知角色（不补外貌）
 输入：画初音未来
 输出：solo, 1girl, {hatsune miku (vocaloid)}, standing, looking at viewer, gentle smile, soft lighting, year 2025
+（不要再补 long hair / twintails / blue hair / blue eyes，模型已知）
 
-❌ 错误：solo, 1girl, hatsune miku, long hair, twintails, blue hair, blue eyes, ...
-（不要补 long hair/twintails/blue hair/blue eyes，模型已知初音外貌）
-
-### 例 2：已知角色 + 用户明确要求外貌
-输入：画蕾姆，必须是蓝色头发，一定要微笑
-输出：solo, 1girl, {rem (re zero)}, {{{blue hair}}}, {{{smile}}}, looking at viewer, soft lighting, year 2025
-
-### 例 3：原创人物（要补外貌）
+### 例 2：原创人物（要补外貌）
 输入：画一个女孩在雨中哭泣
-输出：solo, 1girl, long black hair, brown eyes, school uniform, crying, tears, wet hair, wet clothes, looking down, rain, cloudy sky, backlighting, year 2025
+输出：solo, 1girl, long black hair, brown eyes, school uniform, crying, tears, wet clothes, rain, cloudy sky, backlighting, year 2025
 
-### 例 4：动态场景（视角前置 + 动作加权）
+### 例 3：动态场景（视角前置 + 动作加权）
 输入：画 saber 挥剑
-输出：solo, 1girl, from below, dynamic angle, {saber (fate)}, excalibur, 1.2::sword swing::, dynamic pose, motion blur, dramatic lighting, sparks, year 2025
+输出：solo, 1girl, from below, dynamic angle, {saber (fate)}, excalibur, 1.2::sword swing::, motion blur, dramatic lighting, year 2025
 
-### 例 5：多人互动（结构化）
+### 例 4：多人对等互动（用 mutual#）
 输入：画蕾姆和拉姆两姐妹拥抱
-输出：
+输出:
 2girls, sisters, indoor, soft lighting, year 2025,
 char1:girl, in foreground, {rem (re zero)}, gentle smile, mutual#hug, looking at another,
 char2:girl, beside girl, {ram (re zero)}, gentle smile, mutual#hug, looking at another,
 
-### 例 6：自拍（不补外貌，重点在镜头/动作）
+### 例 5：自拍（不补外貌，重点在镜头/动作）
 输入：自拍
 输出：solo, 1girl, selfie, close-up, female pov, looking at viewer, smile, peace sign, natural light, indoor, year 2025
 
-### 例 7：连续性（延续上一轮）
+### 例 6：连续性（延续上一轮）
 上一轮：solo, 1girl, school uniform, black thighhighs, classroom, afternoon
 输入：换个姿势
 输出：solo, 1girl, school uniform, black thighhighs, classroom, afternoon, sitting on desk, looking at viewer, year 2025
-（保留制服/黑丝/教室/下午光线，仅改姿势）
-
-### 例 8：风景场景（无人物）
-输入：画日落时的海边
-输出：scenery, ocean, sunset, golden hour, waves, clouds, horizon, dramatic lighting, year 2025
-
-### 例 9：男女互动焦点在女性
-输入：画一个女孩被男生追着跑（焦点在女孩）
-输出：solo focus, 1girl, 1boy, long hair, school uniform, running, looking back, smile, outdoor, sunlight, year 2025
-
-### 例 10：第一人称视角
-输入：画从女孩视角看到男生
-输出：female pov, 1girl, 1boy, looking at viewer, indoor, soft lighting, year 2025
-
-### 例 11：服装具体化（避免泛义词）
-输入：画一个穿制服的女孩
-✅ 输出：solo, 1girl, long brown hair, blue eyes, navy blue sailor uniform, white sailor collar, red ribbon, pleated skirt, looking at viewer, classroom, year 2025
-❌ 错误：solo, 1girl, school uniform, casual wear, ...（uniform/casual wear 太宽泛）
-
-### 例 12：稳定性（同样输入，输出应稳定）
-- 同一个 "画初音未来" 输入，无论调用多少次，核心 tag 集合应相同（`solo, 1girl, {hatsune miku (vocaloid)}, year 2025`），仅画面细节（动作、背景、镜头）可有合理差异
-- 不要为了"求新"而频繁换角色服装、外貌、场景
 </examples>
 """.strip()
 
@@ -381,32 +388,28 @@ _NSFW_EXTRA_EXAMPLES = """
 <nsfw_examples>
 ## NSFW 场景示例
 
-### 例 N1：单人 NSFW（基础）
+### 例 N1：单人 NSFW
 输入：画一个女孩躺在床上自慰
-输出：nsfw, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, indoor, dim lighting, year 2025
+输出：nsfw, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, dim lighting, year 2025
 
-### 例 N2：多人 NSFW（结构化 + 互动 + 细节）
-输入：男生从背后压住女生在门口，女生半推半就
-输出：
-indoor, doorway, dim lighting, sweat, steamy room, lewd sounds, nsfw, year 2025,
-char1:girl, in foreground, messy hair, half-closed eyes, heart-shaped pupils, drooling, heavy blush, wet camisole, see-through white top, midriff, no bra, tight black leggings pulled down, thong pull, sweat, wet skin, target#groped, target#fondled, target#fingered, trembling, opening door, doorknob in hand, looking at viewer, bent over, leaning forward, back arched, spread legs, one hand on doorframe for support,
-char2:boy, partially visible, behind girl, source#groping, source#fondling, source#fingering, grabbing breast, pulling hair, whispering in ear, biting neck,
+### 例 N2：多人 NSFW（source/target 主被动配对）
+输入：男生从背后压住女生
+输出:
+indoor, dim lighting, sweat, lewd sounds, nsfw, year 2025,
+char1:girl, in foreground, messy hair, half-closed eyes, drooling, blush, naked, target#groped, target#fingered, bent over, back arched,
+char2:boy, behind girl, source#groping, source#fingering, pulling hair, biting neck,
 
-### 例 N3：状态/精神控制
-输入：画一个被催眠的女孩
-输出：nsfw, solo, 1girl, empty eyes, hypnosis, heart-shaped pupils, drooling, parted lips, blush, spiral background, year 2025
+### 例 N3：百合强迫（互动 tag 规范模板）
+输入：画两个女孩，一个被另一个强吻并摸胸摸裙底，被强吻的不情愿
+输出:
+2girls, nsfw, yuri, indoor, lewd sounds, dim lighting, year 2025,
+char1:girl, in foreground, {hatsune miku (vocaloid)}, scowl, uncomfortable, blush, target#kissed, target#groped, hand under skirt, struggling,
+char2:girl, beside girl, {luo tianyi (vocaloid)}, closed eyes, blush, source#kissing, source#groping, source#touching under skirt, pulling hair,
 
-### 例 N4：调教进程（中后期状态）
-输入：画一个被调教完全堕落的女孩
-输出：nsfw, solo, 1girl, ahegao, rolling eyes, heart-shaped pupils, tongue out, drooling, heavy blush, sweat, body writing, collar, leash, restraints, bound, naked, cum on body, dim lighting, year 2025
-
-### 例 N5：群交（≥3 人）
-输入：画一个女孩被两个男生夹住
-输出：
-indoor, dim lighting, nsfw, year 2025,
-char1:girl, in foreground, messy hair, half-closed eyes, parted lips, drooling, blush, naked, sweat, target#groped, target#penetrated, target#fingered, spread legs, looking at viewer,
-char2:boy, behind girl, source#penetrating, source#groping, holding girl,
-char3:boy, in front of girl, source#held, presenting penis, hand on girl's head,
+判定要点：
+- 被动方全部 `target#` + 过去分词；主动方全部 `source#` + 现在分词
+- "hand under skirt" 名词短语 → 不带前缀写为状态；动词分词 `source#touching under skirt` 可加前缀
+- 单向强迫禁用 `mutual#`，必须用 source/target
 </nsfw_examples>
 """.strip()
 
