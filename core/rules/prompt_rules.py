@@ -59,34 +59,42 @@ _HARD_RULES = """
 
 ### 3. 标签顺序（按类别聚合，不要散落）
 
-**人物场景**（从前到后）：
-NSFW 标记 → 人数 → 视角/构图 → 角色名 → 核心外观 → 服装 → 核心动作 → 动作细节 → 表情姿态 → 环境氛围 → 光影效果 → 年代标签
+**人物场景**（从前到后，NAI 4.5 越靠前权重越强）：
+NSFW 标记 → 人数（1girl/2girls/solo）→ **镜头框图（framing，三档互斥选一）** → **视角朝向（viewpoint，可选）** → 角色名 → 核心外观 → 服装 → 核心动作 → 动作细节 → 表情姿态 → 环境氛围 → 光影效果
 
 **风景/物品场景**：
 主体 → 时间天气 → 环境细节 → 氛围光影
 
+**Framing 三档互斥（必看）**：
+- 特写：`close-up` / `portrait`（头肩特写）
+- 半身：`upper body`（胸部以上）/ `cowboy shot`（腰部以上）
+- 全身：`full body`（头到脚）
+
+三档**只能选一个**。**禁止矛盾组合**如 `full body portrait`（portrait 默认头肩，与全身相反）、`upper body full body`、`close-up cowboy shot` 等——NAI 官方文档把这几个列为同类对立 framing tag，叠加会让构图回退到中间档（半身偏特写），用户要的"全身"出不来。
+
+**视角朝向（viewpoint，独立维度）**：
+`from above` / `from below` / `from side` / `from behind` / `pov` / `female pov`
+- 与 framing 是不同维度，可叠加 framing 使用
+- 同类只选一个，不要 `from above, from below` 共存
+- 默认无朝向 tag 时 NAI 输出正面（front view），通常不需要显式写
+
 注意：
-- 视角 tag 必须在角色名之前（否则可能不生效）
-- 光影、年代标签必须放最后，禁止散落到中间
+- Framing 和视角 tag 必须在角色名之前（否则被角色名 tag 覆盖不生效）
+- 光影标签必须放最后，禁止散落到中间
 - 一个动作只用一个最准确的词，禁止堆叠近义词
 
-### 4. 年代标签（默认必加）
-
-- 现代二次元人物插画 → `global` 必须包含 `year 2024` 或 `year 2025`
-- 例外：用户明确指定年代、要求复古风格、题材明显不适合年份时可不加
-
-### 5. 已知角色 / 自拍 / 肖像场景的外貌强约束
+### 4. 已知角色 / 自拍 / 肖像场景的外貌强约束
 
 满足以下任一条件，且用户**未明确指定**外貌时，**禁止输出发色/发型/瞳色 tag**：
 - 输出中含已知角色 tag（形如 `name (series)`）
-- 用户请求触发自拍或肖像（`<<SELFIE_HINT>>` 出现，输出含 `selfie` / `mirror selfie` / `group selfie` / `portrait photo` / `candid photo` / `upper body portrait` / `full body portrait`）
+- 用户请求触发自拍或肖像（`<<SELFIE_HINT>>` 出现，输出含 `selfie` / `mirror selfie` / `group selfie` / `portrait photo` / `candid photo` / `upper body` / `full body`）
 
 被禁止的具体 tag 类型：
 hair / haired / long hair / short hair / medium hair / eyes / eyed / bangs / twintails / ponytail / braid / bun / bob cut / hime cut 等。
 
 允许且鼓励的补充：动作、背景、镜头、光影、表情、姿态。
 
-### 6. 连续性与服装稳定性
+### 5. 连续性与服装稳定性
 
 - 若有 `<<SELFIE_SCENE_CONTEXT>>` 上下文，且用户没有明确换场景/换穿搭/改光线，必须延续上一轮的背景、服装、光线、时间氛围
 - 上一轮的明确元素（黑丝/白丝/制服/鞋子/特定背景/衣服颜色/材质）默认保留，除非用户明确要求删除或替换
@@ -95,7 +103,7 @@ hair / haired / long hair / short hair / medium hair / eyes / eyed / bangs / twi
 - 没有可继承上下文也不要写空，按场景合理补出具体款式
 - 用户要求看腿/袜子/鞋子/全身穿搭时，`global` 必须含能看清这些重点的构图 tag
 
-### 7. 一致性
+### 6. 一致性
 
 - 同一输入应保持输出 tag 集合和顺序基本稳定
 - 不要为了变化而变化，除非用户明确要求"换一种/不一样/再来一张不同的"
@@ -274,11 +282,18 @@ _QUALITY_PRINCIPLES = """
 - 场景适配优先采纳共现推荐里的服饰 tag；SFW 模式即使共现给出泳装/内衣/透视装，也按 sfw_safety 改写为安全版本
 - 适度：默认 1-2 个关键服装词，服装是本轮重点时再加细节
 
-### 镜头与场景对应
-- 全身动作 → 全身镜头 / `full body`
-- 表情特写 → 近景 / `close-up`
-- 动态场景 → 动感角度 / `dynamic angle` / `from below`
-- 自拍 → `selfie`、`female pov` 或 `pov`、`looking at viewer`
+### 镜头与场景对应（framing 三档互斥，不要堆叠）
+
+按场景选一个 framing tag，禁止叠加（详见 hard_rules 第 3 条）：
+- 全身动作/看穿搭/腿部 → `full body`
+- 半身社交距离 → `cowboy shot`（腰以上）/ `upper body`（胸以上）
+- 表情/局部特写 → `close-up` / `portrait`
+
+视角朝向独立选择（不与 framing 冲突）：
+- 动态场景 → `from below` + `dynamic angle`
+- 自拍取景角度 → `selfie`（天然带半身取景，无需再加 `cowboy shot`）+ `female pov` 或 `pov` + `looking at viewer`
+- 全身自拍 → `selfie, full body, looking at viewer`（显式加 full body 才会出全身）
+- 镜面自拍 → `mirror selfie` + `looking at viewer`
 
 ### 画面增强（按需补充，不强加）
 - 光影 / 氛围粒子 / 头发动态：优先采用共现推荐里的相关 tag（如 `moonlight`、`light particles`、`hair flowing`），未覆盖时按场景自行补
@@ -321,32 +336,32 @@ _EXAMPLES_BASE = """
 
 ### 例 1：已知角色（不补外貌）
 输入：画初音未来
-输出：solo, 1girl, {hatsune miku (vocaloid)}, standing, looking at viewer, gentle smile, soft lighting, year 2025
+输出：solo, 1girl, {hatsune miku (vocaloid)}, standing, looking at viewer, gentle smile, soft lighting
 （不要再补 long hair / twintails / blue hair / blue eyes，模型已知）
 
 ### 例 2：原创人物（要补外貌）
 输入：画一个女孩在雨中哭泣
-输出：solo, 1girl, long black hair, brown eyes, school uniform, crying, tears, wet clothes, rain, cloudy sky, backlighting, year 2025
+输出：solo, 1girl, long black hair, brown eyes, school uniform, crying, tears, wet clothes, rain, cloudy sky, backlighting
 
 ### 例 3：动态场景（视角前置 + 动作加权）
 输入：画 saber 挥剑
-输出：solo, 1girl, from below, dynamic angle, {saber (fate)}, excalibur, 1.2::sword swing::, motion blur, dramatic lighting, year 2025
+输出：solo, 1girl, from below, dynamic angle, {saber (fate)}, excalibur, 1.2::sword swing::, motion blur, dramatic lighting
 
 ### 例 4：多人对等互动（用 mutual#）
 输入：画蕾姆和拉姆两姐妹拥抱
 输出:
-2girls, sisters, indoor, soft lighting, year 2025,
+2girls, sisters, indoor, soft lighting,
 char1:girl, in foreground, {rem (re zero)}, gentle smile, mutual#hug, looking at another,
 char2:girl, beside girl, {ram (re zero)}, gentle smile, mutual#hug, looking at another,
 
 ### 例 5：自拍（不补外貌，重点在镜头/动作）
 输入：自拍
-输出：solo, 1girl, selfie, close-up, female pov, looking at viewer, smile, peace sign, natural light, indoor, year 2025
+输出：solo, 1girl, selfie, close-up, female pov, looking at viewer, smile, peace sign, natural light, indoor
 
 ### 例 6：连续性（延续上一轮）
 上一轮：solo, 1girl, school uniform, black thighhighs, classroom, afternoon
 输入：换个姿势
-输出：solo, 1girl, school uniform, black thighhighs, classroom, afternoon, sitting on desk, looking at viewer, year 2025
+输出：solo, 1girl, school uniform, black thighhighs, classroom, afternoon, sitting on desk, looking at viewer
 </examples>
 """.strip()
 
@@ -390,19 +405,19 @@ _NSFW_EXTRA_EXAMPLES = """
 
 ### 例 N1：单人 NSFW
 输入：画一个女孩躺在床上自慰
-输出：nsfw, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, dim lighting, year 2025
+输出：nsfw, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, dim lighting
 
 ### 例 N2：多人 NSFW（source/target 主被动配对）
 输入：男生从背后压住女生
 输出:
-indoor, dim lighting, sweat, lewd sounds, nsfw, year 2025,
+indoor, dim lighting, sweat, lewd sounds, nsfw,
 char1:girl, in foreground, messy hair, half-closed eyes, drooling, blush, naked, target#groped, target#fingered, bent over, back arched,
 char2:boy, behind girl, source#groping, source#fingering, pulling hair, biting neck,
 
 ### 例 N3：百合强迫（互动 tag 规范模板）
 输入：画两个女孩，一个被另一个强吻并摸胸摸裙底，被强吻的不情愿
 输出:
-2girls, nsfw, yuri, indoor, lewd sounds, dim lighting, year 2025,
+2girls, nsfw, yuri, indoor, lewd sounds, dim lighting,
 char1:girl, in foreground, {hatsune miku (vocaloid)}, scowl, uncomfortable, blush, target#kissed, target#groped, hand under skirt, struggling,
 char2:girl, beside girl, {luo tianyi (vocaloid)}, closed eyes, blush, source#kissing, source#groping, source#touching under skirt, pulling hair,
 

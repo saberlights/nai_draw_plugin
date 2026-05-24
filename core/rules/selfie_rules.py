@@ -87,7 +87,7 @@ SELFIE_HINT_FOR_LLM = """
 
 | 意图 | 触发线索 | 输出特征 |
 |------|----------|----------|
-| **肖像/生活照（portrait）** | 用户输入含：肖像 / 头像照 / portrait / 生活照 / 立绘 / 证件照 / candid | 必含 `portrait photo` 或 `candid photo` 或 `upper body portrait` 或 `full body portrait`；**绝对禁止** `selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` |
+| **肖像/生活照（portrait）** | 用户输入含：肖像 / 头像照 / portrait / 生活照 / 立绘 / 证件照 / candid | 必含 `portrait photo` 或 `candid photo` 作为肖像意图标记；framing tag（`upper body` / `full body`）独立选择并紧邻其前。**绝对禁止**写矛盾合体 `full body portrait` / `upper body portrait`（NAI 把 portrait 与 full body/upper body 视为同类对立 framing tag，叠加会让构图回退到中间档）；**绝对禁止** `selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` |
 | **自拍（selfie）** | 用户输入含：自拍 / selfie / 镜子 / 前置 / 合照 / 拍给我看 / 看你的 / 给我看 / 你穿X / 你的X / 看看X（X 是穿搭/部位） | 必含 `selfie` 或 `mirror selfie` 或 `group selfie`，并按下方"自拍类型"选择对应必须标签 |
 | **普通画图（normal）** | 用户明确要"画一个 X"，与 bot 本人无关 | 按场景生成普通 tag，不加 selfie/portrait 类标签；可补 `solo, 1girl/1boy` |
 
@@ -96,8 +96,9 @@ SELFIE_HINT_FOR_LLM = """
 ## 肖像路径输出规则
 
 肖像意图时：
-- 必含一个肖像类标签：`portrait photo` / `candid photo` / `upper body portrait` / `full body portrait`
-- 根据场景选构图：看脸/气质 → `upper body portrait`；看穿搭 → `full body portrait`；自然抓拍感 → `candid photo`
+- 必含一个肖像意图标记标签：`portrait photo` / `candid photo`
+- Framing tag（紧邻意图标记前，独立选择）：看脸/气质 → `upper body, portrait photo`；看穿搭/全身 → `full body, portrait photo`；自然抓拍感 → `candid photo`（candid 默认半身取景，必要时再叠加 `full body`）
+- **禁止矛盾合体**：不要写 `full body portrait` / `upper body portrait`，必须拆成两个独立 tag（如 `full body, portrait photo`）。NAI 官方文档把 `portrait` / `upper body` / `full body` 列为同类对立 framing tag，合体写会让构图回退到中间档
 - 可加：`looking at viewer`（直视镜头）、自然光线、合理背景、姿态/动作
 - **禁止**：`selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` / `selfie stick`
 
@@ -127,13 +128,13 @@ SELFIE_HINT_FOR_LLM = """
 ## 服装与连续性（与主模板 _HARD_RULES.6 保持一致）
 - 没有上下文 → 按场景合理补具体款式 + 颜色，不要写 `casual wear` 这类宽泛词
 - 有连续性上下文且用户没说要换装 → 延续上一轮的服装款式、主色、材质
-- 看腿/袜子/鞋/全身穿搭 → 必须用能看清重点的全身构图（自拍走类型 2/4，肖像走 `full body portrait`）
+- 看腿/袜子/鞋/全身穿搭 → 必须用能看清重点的全身构图（自拍走类型 2/4，肖像走 `full body, portrait photo`）
 
 ## 类型连续性（避免跳变）
 当用户说"再来一张/换个姿势/继续/还是这个/这身/这套"等连续请求时，**默认延续上一轮的图片类型**，仅修改用户明确指定的部分：
 
 - 上一轮是**自拍**（输出含 `selfie` / `mirror selfie` / `group selfie`）→ 本轮默认仍是自拍，并且沿用同一种自拍类型（上轮镜子自拍 → 本轮仍镜子自拍；上轮俯拍 → 本轮仍俯拍）
-- 上一轮是**肖像**（输出含 `portrait photo` / `candid photo` / `upper body portrait` / `full body portrait`）→ 本轮默认仍是肖像，并且沿用同一种肖像构图
+- 上一轮是**肖像**（输出含 `portrait photo` / `candid photo`，或旧格式 `upper body portrait` / `full body portrait`）→ 本轮默认仍是肖像，并且沿用同一种肖像构图（看脸 → `upper body, portrait photo`；看穿搭 → `full body, portrait photo`）
 - 上一轮是**普通画图**（无自拍/肖像标签）→ 本轮默认仍是普通画图，不强加 selfie/portrait 类标签
 
 **只有以下情况才允许切换类型**：
@@ -251,7 +252,8 @@ def get_portrait_enforcement_hint() -> str:
     return (
         "<portrait_enforcement>\n"
         "【本轮强制约束】用户请求肖像/portrait 类图片，输出必须满足：\n"
-        "- 必含一个肖像类标签：portrait photo / candid photo / upper body portrait / full body portrait\n"
+        "- 必含一个肖像意图标记：portrait photo / candid photo\n"
+        "- Framing tag（upper body / full body）独立选择并紧邻其前；禁止矛盾合体 `full body portrait` / `upper body portrait`，必须拆成两个独立 tag\n"
         "- 绝对禁止输出：selfie / mirror selfie / group selfie / holding phone / pov / female pov / selfie stick\n"
         "- 不要使用第一人称视角，使用第三人称镜头\n"
         "</portrait_enforcement>"
