@@ -21,6 +21,12 @@ _MAX_SIZE_SQUARE: Tuple[int, int] = (1024, 1024)
 # 网关临时故障的可重试状态码（§15）
 _RETRYABLE_STATUS_CODES: frozenset = frozenset({429, 500, 502, 503, 504})
 
+# 多角色（NewAPI §7）能力检测：仅 nai-diffusion-4 系列稳定支持 `characters[]` / `use_coords`
+_MULTI_CHARACTER_MODEL_KEYWORDS: Tuple[str, ...] = ("nai-diffusion-4",)
+
+# 多角色 position 字面量 [A-E][1-5]，与 prompt_output_parser 保持一致
+_POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
+
 # 响应正文里 markdown 形式的图片 data URI
 _CHAT_IMAGE_DATA_URI_PATTERN = re.compile(
     r"!\[[^\]]*]\((data:image/(?P<format>[a-zA-Z0-9.+-]+);base64,(?P<data>[A-Za-z0-9+/=]+))\)"
@@ -176,8 +182,15 @@ class NaiWebClient:
         prompt: str,
         model_config: Dict[str, Any],
         size: Optional[str],
+        characters: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """组装 messages[0].content 内层 JSON（NewAPI 文档 §5）。"""
+        """组装 messages[0].content 内层 JSON（NewAPI 文档 §5 / §7）。
+
+        Args:
+            characters: 已规范化的多角色列表。每项含 ``prompt`` / ``negative_prompt`` / ``position``。
+                位置非空时启用 ``use_coords=true``，否则交由后端自动布局。仅当模型支持时注入；
+                由 :meth:`_filter_characters_for_model` 在入口处嗅探，本函数信任入参已通过过滤。
+        """
         custom_prompt_add = str(model_config.get("custom_prompt_add") or "").strip()
         artist_prompt = str(
             model_config.get("nai_artist_prompt") or model_config.get("artist_prompt") or ""
@@ -210,6 +223,13 @@ class NaiWebClient:
         if seed_int >= 0:
             inner["seed"] = seed_int
 
+        # 多角色字段（文档 §7）。characters 已经过模型嗅探与规范化，这里直接写入。
+        normalized_characters = cls._normalize_characters_for_inner(characters)
+        if normalized_characters:
+            inner["characters"] = normalized_characters
+            inner["use_coords"] = all(bool(item.get("position")) for item in normalized_characters)
+            inner["use_order"] = True
+
         # 质量增强参数（文档 §5 表外，透传由 NewAPI 决定是否吃下）
         if bool(model_config.get("quality_toggle", True)):
             inner["qualityToggle"] = True
@@ -234,6 +254,84 @@ class NaiWebClient:
                     inner[key] = value
 
         return inner
+
+    @staticmethod
+    def _normalize_characters_for_inner(
+        characters: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, str]]:
+        """把上层传入的角色列表归一为 inner JSON 直接可用的形态。
+
+        - 丢弃 prompt 为空的项
+        - position 不匹配 ``[A-E][1-5]`` 时落为 ``""``（由调用方决定 ``use_coords``）
+        - 当任一项缺 position 时统一不发送 position 字段，避免文档约束冲突
+        """
+        if not characters:
+            return []
+
+        cleaned: List[Dict[str, str]] = []
+        for item in characters:
+            if not isinstance(item, dict):
+                continue
+            char_prompt = str(item.get("prompt") or "").strip()
+            if not char_prompt:
+                continue
+
+            char_negative = str(item.get("negative_prompt") or "").strip()
+            raw_position = str(item.get("position") or "").strip().upper()
+            position = raw_position if _POSITION_GRID_RE.match(raw_position) else ""
+
+            cleaned.append(
+                {
+                    "prompt": char_prompt,
+                    "negative_prompt": char_negative,
+                    "position": position,
+                }
+            )
+
+        if len(cleaned) < 2:
+            return []
+
+        # 部分角色缺 position 时，把所有 position 一并清空，让后端自动布局
+        if any(not item["position"] for item in cleaned):
+            for item in cleaned:
+                item["position"] = ""
+
+        # 输出体里 position 为空的项需要剔除 position 键，文档对该字段只接受字符串
+        result: List[Dict[str, str]] = []
+        for item in cleaned:
+            entry: Dict[str, str] = {"prompt": item["prompt"]}
+            if item["negative_prompt"]:
+                entry["negative_prompt"] = item["negative_prompt"]
+            if item["position"]:
+                entry["position"] = item["position"]
+            result.append(entry)
+        return result
+
+    @classmethod
+    def _filter_characters_for_model(
+        cls,
+        model_name: str,
+        characters: Optional[List[Dict[str, Any]]],
+        log_prefix: str = "",
+    ) -> Optional[List[Dict[str, Any]]]:
+        """按模型嗅探决定是否启用多角色字段。
+
+        非 ``nai-diffusion-4*`` 系列降级为单字符串路径，并打一条 warning 让用户知道
+        发生了静默降级。
+
+        Returns:
+            支持时返回原列表（可能为 None / 空）；不支持时返回 None。
+        """
+        if not characters:
+            return None
+        lowered = str(model_name or "").lower()
+        if any(keyword in lowered for keyword in _MULTI_CHARACTER_MODEL_KEYWORDS):
+            return characters
+        logger.warning(
+            f"{log_prefix} (NewAPI) 模型 {model_name!r} 不在多角色支持列表内，"
+            f"已自动降级为单 prompt 路径，characters({len(characters)} 项) 已忽略"
+        )
+        return None
 
     @staticmethod
     def _validate_inner_payload(model_name: str, inner: Dict[str, Any]) -> Optional[str]:
@@ -274,6 +372,28 @@ class NaiWebClient:
 
         if int(inner.get("n_samples", 1)) != 1:
             return f"NewAPI 当前只允许 n_samples=1，配置中收到 {inner.get('n_samples')}"
+
+        characters_value = inner.get("characters")
+        if characters_value is not None:
+            if not isinstance(characters_value, list) or not characters_value:
+                return f"characters 必须是非空数组，当前收到 {characters_value!r}"
+            for index, item in enumerate(characters_value):
+                if not isinstance(item, dict):
+                    return f"characters[{index}] 必须是对象，当前收到 {item!r}"
+                char_prompt = str(item.get("prompt") or "").strip()
+                if not char_prompt:
+                    return f"characters[{index}].prompt 为空"
+                position = item.get("position")
+                if position is not None:
+                    if not isinstance(position, str) or not _POSITION_GRID_RE.match(position):
+                        return (
+                            f"characters[{index}].position 必须是 [A-E][1-5] 字符串，"
+                            f"当前收到 {position!r}"
+                        )
+
+            use_coords_value = inner.get("use_coords")
+            if use_coords_value is not None and not isinstance(use_coords_value, bool):
+                return f"use_coords 必须是布尔值，当前收到 {use_coords_value!r}"
 
         return None
 
@@ -317,10 +437,15 @@ class NaiWebClient:
         model_config: Dict[str, Any],
         size: Optional[str] = None,
         input_image_base64: Optional[str] = None,
+        characters: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[bool, str]:
         """调用 NewAPI 兼容网关生成图片。
 
         成功时返回 (True, base64_string)；失败时返回 (False, 错误描述)。
+
+        Args:
+            characters: 可选的多角色 payload，每项含 ``prompt`` / ``negative_prompt`` / ``position``。
+                仅当模型支持（nai-diffusion-4 系列）时生效；其它模型会自动降级为单字符串路径。
         """
         if input_image_base64:
             logger.warning(f"{self.log_prefix} (NewAPI) 当前网关不支持图生图")
@@ -344,7 +469,12 @@ class NaiWebClient:
             url = f"{base_url}{endpoint}"
 
             model_name = self._resolve_model_name(model_config)
-            inner_params = self._build_inner_draw_params(prompt, model_config, size)
+            effective_characters = self._filter_characters_for_model(
+                model_name, characters, log_prefix=self.log_prefix
+            )
+            inner_params = self._build_inner_draw_params(
+                prompt, model_config, size, characters=effective_characters
+            )
             reject_reason = self._validate_inner_payload(model_name, inner_params)
             if reject_reason:
                 logger.error(f"{self.log_prefix} (NewAPI) 请求被前置校验拒绝: {reject_reason}")
@@ -357,12 +487,14 @@ class NaiWebClient:
             request_timeout = self._resolve_request_timeout(model_config)
 
             size_value = inner_params.get("size")
+            character_count = len(inner_params.get("characters") or [])
             logger.info(
                 f"{self.log_prefix} (NewAPI) 请求URL: {url}, model={model_name}, "
                 f"size={size_value}, steps={inner_params['steps']}, "
                 f"scale={inner_params['scale']}, sampler={inner_params['sampler']}, "
-                f"seed={inner_params.get('seed')}, max_tokens={max_tokens}, proxy={proxy_mode}, "
-                f"timeout={request_timeout:.1f}s"
+                f"seed={inner_params.get('seed')}, characters={character_count}, "
+                f"use_coords={inner_params.get('use_coords')}, max_tokens={max_tokens}, "
+                f"proxy={proxy_mode}, timeout={request_timeout:.1f}s"
             )
             logger.debug(
                 f"{self.log_prefix} (NewAPI) inner_params keys: "

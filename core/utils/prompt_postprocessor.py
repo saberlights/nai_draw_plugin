@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import re
-from typing import List
+from typing import Any, Dict, List, Tuple
 
 
 _COUNT_RE = re.compile(r"^(?:solo|\d+girls|\d+boys|\d+people|1girl|1boy)$", re.IGNORECASE)
@@ -406,3 +406,68 @@ def normalize_prompt_order(prompt: str) -> str:
             out_lines.append(joined)
 
     return _join_prompt_segments(out_lines, prompt)
+
+
+# ==================== 结构化多角色后处理 ====================
+# 这些 wrapper 复用上面的字符串实现，专门服务于 NewAPI `characters[]` 通道。
+# 每个角色的 prompt / negative_prompt 都是无 `char1:` 前缀的单行字符串，
+# 复用单字符串路径既不需要重写规则，也保证字符串路径与结构化路径行为完全一致。
+
+
+def _apply_string_filter_to_characters(
+    global_text: str,
+    characters: List[Dict[str, Any]],
+    filter_fn,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """把字符串级过滤函数同步作用于 global + 每个 character 的 prompt/negative_prompt。
+
+    过滤后某个 character 的 prompt 被清空时，该 character 整体被丢弃；
+    调用方负责判断丢弃后角色数是否还满足结构化通道的最低要求（≥ 2）。
+    """
+    new_global = filter_fn(global_text) if global_text else global_text
+
+    new_characters: List[Dict[str, Any]] = []
+    for raw_item in characters or []:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+
+        char_prompt = str(item.get("prompt") or "")
+        if char_prompt:
+            item["prompt"] = filter_fn(char_prompt).strip()
+        if not item.get("prompt"):
+            continue
+
+        char_negative = str(item.get("negative_prompt") or "")
+        if char_negative:
+            item["negative_prompt"] = filter_fn(char_negative).strip()
+
+        new_characters.append(item)
+
+    return new_global, new_characters
+
+
+def sanitize_sfw_characters(
+    global_text: str,
+    characters: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """SFW 模式下的多角色 payload 清洗：与 sanitize_sfw_prompt 行为一致。"""
+    return _apply_string_filter_to_characters(global_text, characters, sanitize_sfw_prompt)
+
+
+def normalize_characters_order(
+    global_text: str,
+    characters: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """按 normalize_prompt_order 规则对 global 与每个 character 的 tag 顺序做轻量整理。"""
+    return _apply_string_filter_to_characters(global_text, characters, normalize_prompt_order)
+
+
+def remove_selfie_appearance_from_characters(
+    global_text: str,
+    characters: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """自拍模式下从 global 与每个 character 的 prompt 中剥离随机外貌 tag。"""
+    return _apply_string_filter_to_characters(
+        global_text, characters, remove_selfie_appearance_tags
+    )

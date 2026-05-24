@@ -16,6 +16,7 @@ _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 
 parse_prompt_from_structured_output = _mod.parse_prompt_from_structured_output
 parse_structured_prompt_payload = _mod.parse_structured_prompt_payload
+extract_multi_character_payload = _mod.extract_multi_character_payload
 
 
 class PromptOutputParserTest(unittest.TestCase):
@@ -80,6 +81,68 @@ class PromptOutputParserTest(unittest.TestCase):
         self.assertIsNotNone(payload)
         self.assertEqual(payload["intent"], "selfie")
         self.assertEqual(payload["continuity"], "adjust")
+
+    def test_extract_multi_character_payload_with_positions(self):
+        text = (
+            '{"version":3,"format":"multi","intent":"normal","continuity":"new",'
+            '"global":["2girls","indoor","year 2025"],'
+            '"people":[["girl","blue hair","blue dress"],["girl","white hair","white kimono"]],'
+            '"positions":["B2","D4"]}'
+        )
+        payload = extract_multi_character_payload(text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["global_text"], "2girls, indoor, year 2025")
+        self.assertEqual(len(payload["characters"]), 2)
+        self.assertEqual(payload["characters"][0]["prompt"], "girl, blue hair, blue dress")
+        self.assertEqual(payload["characters"][0]["position"], "B2")
+        self.assertEqual(payload["characters"][1]["position"], "D4")
+        self.assertTrue(payload["has_coords"])
+
+    def test_extract_multi_character_payload_without_positions(self):
+        text = (
+            '{"version":3,"format":"multi",'
+            '"global":["2girls","park"],'
+            '"people":[["girl","laughing"],["girl","running"]]}'
+        )
+        payload = extract_multi_character_payload(text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["characters"]), 2)
+        self.assertEqual(payload["characters"][0]["position"], "")
+        self.assertFalse(payload["has_coords"])
+
+    def test_extract_multi_character_payload_drops_invalid_position(self):
+        text = (
+            '{"version":3,"format":"multi",'
+            '"global":["2girls","indoor"],'
+            '"people":[["girl","a"],["girl","b"]],'
+            '"positions":["X9","D3"]}'
+        )
+        payload = extract_multi_character_payload(text)
+        self.assertIsNotNone(payload)
+        # X9 不匹配 [A-E][1-5]，被规整为 ""，导致 has_coords=False
+        self.assertEqual(payload["characters"][0]["position"], "")
+        self.assertEqual(payload["characters"][1]["position"], "D3")
+        self.assertFalse(payload["has_coords"])
+
+    def test_extract_multi_character_payload_returns_none_for_single(self):
+        text = (
+            '{"version":3,"format":"single",'
+            '"global":["solo","1girl"],'
+            '"people":[["girl","smile"]]}'
+        )
+        self.assertIsNone(extract_multi_character_payload(text))
+
+    def test_extract_multi_character_payload_returns_none_when_under_two(self):
+        text = (
+            '{"version":3,"format":"multi",'
+            '"global":["1girl"],'
+            '"people":[["girl","smile"]]}'
+        )
+        self.assertIsNone(extract_multi_character_payload(text))
+
+    def test_extract_multi_character_payload_returns_none_for_v1(self):
+        text = '{"version":1,"format":"multi","prompt":"x"}'
+        self.assertIsNone(extract_multi_character_payload(text))
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ LLM 输出解析工具
 - 结构化 JSON 输出：{"format":"single|multi","prompt":"..."}
 - JSON 被 ```json 代码块包裹
 - JSON 前后夹杂少量无关文本（尽量提取包含 "prompt" 的 JSON 对象）
+- v3 多人 JSON 抽取结构化 characters payload（含 position 网格）
 
 解析失败时返回 None，调用方应回退到原有的纯文本清洗逻辑。
 """
@@ -15,7 +16,12 @@ LLM 输出解析工具
 from __future__ import annotations
 
 import json
-from typing import Optional, Dict, Any
+import re
+from typing import Optional, Dict, Any, List
+
+
+# 5×5 网格坐标 [A-E][1-5]（NewAPI 多角色 position 字面量）
+_POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
 
 
 def _strip_code_fence(text: str) -> str:
@@ -153,3 +159,78 @@ def parse_prompt_from_structured_output(text: str) -> Optional[str]:
         return normalized
 
     return None
+
+
+def extract_multi_character_payload(text: str) -> Optional[Dict[str, Any]]:
+    """从 v3 multi JSON 抽出结构化角色 payload，供 NewAPI `characters[]` 通道使用。
+
+    Returns:
+        成功时返回 ``{"global_text": str,
+                       "characters": [{"prompt": str, "negative_prompt": str, "position": str}, ...],
+                       "has_coords": bool}``；
+        不是 v2/v3 多人输出、人数 < 2 或字段缺失时返回 ``None``，调用方应回退到字符串通道。
+
+    Notes:
+        - 仅当 ``format == "multi"`` 且 ``people`` 至少包含 2 个非空角色时才会返回结构化结果
+        - ``positions`` 数组长度允许 ≤ ``people``，越界处按 ``""`` 处理
+        - ``position`` 字面量不匹配 ``[A-E][1-5]`` 时被规整为 ``""``（不抛错，仅丢弃该坐标）
+        - ``has_coords`` 为 ``True`` 当且仅当所有角色都有合法坐标，否则交由后端自动布局
+    """
+    obj = parse_structured_prompt_payload(text)
+    if not obj:
+        return None
+
+    version = obj.get("version")
+    if not (version == 2 or version == 3 or (isinstance(version, int) and version >= 2)):
+        return None
+
+    if str(obj.get("format", "") or "").strip().lower() != "multi":
+        return None
+
+    raw_people = obj.get("people", []) or []
+    if not isinstance(raw_people, list):
+        return None
+
+    valid_people: List[List[str]] = []
+    for person_tags in raw_people:
+        if not isinstance(person_tags, list):
+            continue
+        person_line = [t.strip() for t in person_tags if isinstance(t, str) and t.strip()]
+        if person_line:
+            valid_people.append(person_line)
+
+    if len(valid_people) < 2:
+        return None
+
+    global_text = _join_tags(obj.get("global"))
+    if not global_text:
+        return None
+
+    raw_positions = obj.get("positions", []) or []
+    if not isinstance(raw_positions, list):
+        raw_positions = []
+
+    characters: List[Dict[str, str]] = []
+    normalized_positions: List[str] = []
+    for index, tags in enumerate(valid_people):
+        position = ""
+        if index < len(raw_positions):
+            candidate = str(raw_positions[index] or "").strip().upper()
+            if _POSITION_GRID_RE.match(candidate):
+                position = candidate
+        normalized_positions.append(position)
+        characters.append(
+            {
+                "prompt": _join_tags(tags),
+                "negative_prompt": "",
+                "position": position,
+            }
+        )
+
+    has_coords = bool(normalized_positions) and all(p for p in normalized_positions)
+
+    return {
+        "global_text": global_text,
+        "characters": characters,
+        "has_coords": has_coords,
+    }

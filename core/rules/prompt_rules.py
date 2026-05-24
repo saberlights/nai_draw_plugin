@@ -214,6 +214,16 @@ char2:[人物2 tag],
 - `people[i]` 应以人物自身身份词开头
 - 每个 tag 元素是单个 tag 或单个权重表达，**元素内部不得含逗号**
 - 不要自己拼接换行，不要输出 `|` 字符
+
+### 多人坐标（positions，可选）
+后端支持把每个角色钉到 5×5 网格上（字母列 A→E 左到右，数字行 1→5 上到下，中心 = `C3`）。
+
+仅在用户**明确指定空间关系**时才输出 `positions` 数组（与 `people` 同序、同长）：
+- 用户说"左边/右边/上下/对角/前后景"等含明确方位的描述
+- 横图常用左右：`["B3","D3"]`；竖图常用上下：`["C2","C4"]`；对角错位：`["B2","D4"]`
+- 用户未指定方位时，**整个 `positions` 字段省略或输出空数组** `[]`，让后端自动布局
+- 不要凭空猜测位置，宁可空也不要乱填
+- 元素只能是 `[A-E][1-5]` 字符串字面量，禁止其他格式
 </multi_person_rules>
 """.strip()
 
@@ -488,7 +498,7 @@ _JSON_OUTPUT_INSTRUCTION = """
 你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序解析。
 
 输出格式（version=3）：
-{"version":3,"format":"single|multi","intent":"normal|selfie","continuity":"new|keep|adjust|switch","global":[...],"people":[[...],[...]]}
+{"version":3,"format":"single|multi","intent":"normal|selfie","continuity":"new|keep|adjust|switch","global":[...],"people":[[...],[...]],"positions":[...]}
 
 字段说明：
 - version: 固定 3
@@ -497,8 +507,9 @@ _JSON_OUTPUT_INSTRUCTION = """
 - continuity: "new" / "keep" / "adjust" / "switch"
 - global: 场景整体 tag 列表
 - people: 每人物的 tag 列表（按人物顺序）；single 时输出 [] 或省略
+- positions: 多人坐标数组（可选），与 people 同序同长，元素为 `[A-E][1-5]` 字符串；用户未指定方位时省略或输出 []，禁止凭空猜测
 
-JSON 元素结构规则：
+JSON 元素结构规则:
 - 【铁律】global / people 数组每个元素只能是最终的英文 Danbooru tag 或权重表达，严禁放分析过程、推理步骤、规则复述、markdown 标题（如 `**意图判定**`、`## 肖像路径`）、字段标签（如 `**最终 tag**：`）、表格分隔行（如 `|---|---|`）、系统提示原文等任何非 tag 内容
 - 每个元素是一个单独的 tag 或单个权重表达，禁止内部含逗号
 - 权重表达内部也只能是单 tag 或单不可拆短语，禁止 `1.3::tagA, tagB::`

@@ -100,3 +100,111 @@ def test_build_inner_draw_params_keeps_explicit_seed() -> None:
 
     assert inner["size"] == [1024, 1024]
     assert inner["seed"] == 123456789
+
+
+def test_build_inner_draw_params_injects_characters_with_position() -> None:
+    """全部 character 都给了合法 position 时启用 use_coords=true。"""
+    characters = [
+        {"prompt": "girl, blue hair, blue dress", "negative_prompt": "white hair", "position": "B3"},
+        {"prompt": "girl, white hair, white kimono", "negative_prompt": "blue hair", "position": "D3"},
+    ]
+    inner = NaiWebClient._build_inner_draw_params(
+        "2girls, indoor",
+        {"default_model": "nai-diffusion-4-5-full", "nai_size": "横图"},
+        None,
+        characters=characters,
+    )
+
+    assert inner["characters"] == [
+        {"prompt": "girl, blue hair, blue dress", "negative_prompt": "white hair", "position": "B3"},
+        {"prompt": "girl, white hair, white kimono", "negative_prompt": "blue hair", "position": "D3"},
+    ]
+    assert inner["use_coords"] is True
+    assert inner["use_order"] is True
+
+
+def test_build_inner_draw_params_clears_position_when_partial() -> None:
+    """只要一个角色缺 position，整组 position 全部丢弃且 use_coords=false。"""
+    characters = [
+        {"prompt": "girl, smile", "position": "B3"},
+        {"prompt": "girl, laugh", "position": ""},
+    ]
+    inner = NaiWebClient._build_inner_draw_params(
+        "2girls",
+        {"default_model": "nai-diffusion-4-5-full"},
+        None,
+        characters=characters,
+    )
+
+    for item in inner["characters"]:
+        assert "position" not in item
+    assert inner["use_coords"] is False
+    assert inner["use_order"] is True
+
+
+def test_build_inner_draw_params_omits_characters_when_only_one() -> None:
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-4-5-full"},
+        None,
+        characters=[{"prompt": "girl, smile"}],
+    )
+
+    assert "characters" not in inner
+    assert "use_coords" not in inner
+
+
+def test_filter_characters_for_model_keeps_v4_series() -> None:
+    characters = [{"prompt": "a"}, {"prompt": "b"}]
+    assert (
+        NaiWebClient._filter_characters_for_model("nai-diffusion-4-5-full", characters)
+        is characters
+    )
+    assert (
+        NaiWebClient._filter_characters_for_model("nai-diffusion-4-full", characters)
+        is characters
+    )
+
+
+def test_filter_characters_for_model_drops_legacy_models() -> None:
+    characters = [{"prompt": "a"}, {"prompt": "b"}]
+    assert NaiWebClient._filter_characters_for_model("nai-diffusion-3", characters) is None
+    assert NaiWebClient._filter_characters_for_model("nai-diffusion-3-furry", characters) is None
+
+
+def test_validate_inner_payload_rejects_bad_position() -> None:
+    inner = {
+        "prompt": "global",
+        "negative_prompt": "",
+        "size": [832, 1216],
+        "steps": 20,
+        "scale": 5.0,
+        "sampler": "k_euler_ancestral",
+        "n_samples": 1,
+        "image_format": "png",
+        "characters": [
+            {"prompt": "a", "position": "Z9"},
+            {"prompt": "b", "position": "D3"},
+        ],
+        "use_coords": True,
+    }
+    reason = NaiWebClient._validate_inner_payload("nai-diffusion-4-5-full", inner)
+    assert reason is not None
+    assert "position" in reason
+
+
+def test_validate_inner_payload_rejects_empty_character_prompt() -> None:
+    inner = {
+        "prompt": "global",
+        "negative_prompt": "",
+        "size": [832, 1216],
+        "steps": 20,
+        "scale": 5.0,
+        "sampler": "k_euler_ancestral",
+        "n_samples": 1,
+        "image_format": "png",
+        "characters": [{"prompt": ""}, {"prompt": "b"}],
+    }
+    reason = NaiWebClient._validate_inner_payload("nai-diffusion-4-5-full", inner)
+    assert reason is not None
+    assert "prompt" in reason
