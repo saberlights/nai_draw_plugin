@@ -117,19 +117,26 @@ class NaiWebClient:
     # ========== Prompt / Size 组装 ==========
 
     @staticmethod
-    def _merge_artist_into_prompt(prompt: str, artist_prompt: str) -> str:
-        """把画师串拼到正向提示词前面，与 NovelAI 推荐顺序保持一致。"""
-        normalized_prompt = str(prompt or "").strip()
+    def _merge_artist_into_prompt(prompt: str, artist_prompt: str, custom_prompt_add: str = "") -> str:
+        """按 质量词 → 画师串 → 用户词 顺序拼接，与 NovelAI 推荐顺序保持一致。
+
+        - 质量词（custom_prompt_add）置首，建立整体画质基调
+        - 画师串紧随其后，定义风格
+        - 用户词最后，承载本次具体描述
+        - 去重：用户词若已以画师串开头，跳过画师以免重复
+        """
+        normalized_user = str(prompt or "").strip()
         normalized_artist = str(artist_prompt or "").strip().strip(",")
-        if not normalized_artist:
-            return normalized_prompt
-        if not normalized_prompt:
-            return normalized_artist
-        lowered_prompt = normalized_prompt.lower()
-        lowered_artist = normalized_artist.lower()
-        if lowered_prompt == lowered_artist or lowered_prompt.startswith(f"{lowered_artist},"):
-            return normalized_prompt
-        return f"{normalized_artist}, {normalized_prompt}"
+        normalized_quality = str(custom_prompt_add or "").strip().strip(",")
+
+        if normalized_artist and normalized_user:
+            lowered_user = normalized_user.lower()
+            lowered_artist = normalized_artist.lower()
+            if lowered_user == lowered_artist or lowered_user.startswith(f"{lowered_artist},"):
+                normalized_artist = ""
+
+        parts = [p for p in (normalized_quality, normalized_artist, normalized_user) if p]
+        return ", ".join(parts)
 
     @staticmethod
     def _resolve_size(size_value: Any) -> Tuple[int, int]:
@@ -197,9 +204,7 @@ class NaiWebClient:
         ).strip()
         negative_prompt = str(model_config.get("negative_prompt_add") or "").strip()
 
-        full_prompt = cls._merge_artist_into_prompt(prompt, artist_prompt)
-        if custom_prompt_add:
-            full_prompt = f"{full_prompt}, {custom_prompt_add}" if full_prompt else custom_prompt_add
+        full_prompt = cls._merge_artist_into_prompt(prompt, artist_prompt, custom_prompt_add)
 
         size_value = model_config.get("nai_size") or size or model_config.get("default_size") or "竖图"
         width, height = cls._resolve_size(size_value)
