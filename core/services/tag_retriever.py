@@ -258,7 +258,7 @@ class TagRetriever:
         return results
 
     def format_candidates(self, results: List[Dict]) -> str:
-        """将检索结果格式化为可注入模板的文本"""
+        """将检索结果格式化为可注入模板的文本（使用规则统一在 prompt 模板中描述）"""
         if not results:
             return ""
 
@@ -266,15 +266,9 @@ class TagRetriever:
 
         return (
             "<tag_candidates>\n"
-            "以下是根据用户描述从 Danbooru 标签数据库中检索到的候选标签（按相关度排序）：\n"
+            "## 语义匹配（与用户描述直接相关，优先选用）\n"
             + "\n".join(lines)
-            + "\n使用规则：\n"
-            "- 这些是经过数据库验证的标准 Danbooru tag，比自行翻译更准确，优先从中选用\n"
-            "- 不强制全部使用，从中挑选能互相搭配、组合起来贴合用户描述的标签即可\n"
-            "- 也可以基于候选标签进行发散，补充用户没有明确提到但能丰富画面的相关标签\n"
-            "- 当同一概念有泛义词和具体词时（如 uniform vs school_uniform），优先选具体的\n"
-            "- 与用户描述无关的候选直接忽略\n"
-            "</tag_candidates>"
+            + "\n</tag_candidates>"
         )
 
 

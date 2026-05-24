@@ -164,6 +164,13 @@ _TAG_CANDIDATES_USAGE = """
 - 适合用来补充场景一致性元素：搭配服饰、配套配件、相关动作、画面细节
 - 不要把不相关的共现 tag 强塞进画面
 
+### category 字段（每个候选后方的 `[Character]`/`[Copyright]`/`[Artist]`/`[General]` 等）
+- `[Character]`：角色 tag。**直接当已知角色处理**，遵循 hard_rules 第 1 条形式 A（不补发色/瞳色等外貌），必要时用 `{tag}` 加权锁定特征
+- `[Copyright]`：作品/系列 tag。已嵌入 `name (series)` 写法时不再单独追加
+- `[Artist]`：画师 tag。**禁止使用**（由系统配置统一管理）
+- `[General]`：通用 tag（动作、服装、场景、氛围等），按场景自由组合
+- 候选未提供 category（如本地检索）时，按 tag 字面含义自行判断
+
 使用原则：
 - 候选只是建议，不强制全部使用，挑选能贴合本次描述的即可
 - 候选未覆盖的内容用你自身的 Danbooru 知识补充
@@ -219,7 +226,7 @@ _QUALITY_PRINCIPLES = """
 - 用户已指定 → 严格使用用户描述
 - 已知角色 + 普通场景 + 未指定 → 该角色经典服装
 - 未指定 + 无上下文 → 按场景合理补充，至少到"款式 + 颜色"，避免反复套用同一组合
-- 场景适配：海边=夏装/防晒外套（SFW）或泳装（NSFW）、办公室=正装、居家=家居服
+- 场景适配优先采纳共现推荐里的服饰 tag；SFW 模式即使共现给出泳装/内衣/透视装，也按 sfw_safety 改写为安全版本
 - 适度：默认 1-2 个关键服装词，服装是本轮重点时再加细节
 
 ### 镜头与场景对应
@@ -229,10 +236,8 @@ _QUALITY_PRINCIPLES = """
 - 自拍 → `selfie`、`female pov` 或 `pov`、`looking at viewer`
 
 ### 画面增强（按需补充，不强加）
-- 光影：根据场景/时间补合适光线（夜晚 → `moonlight`、室内 → `indoor lighting`、戏剧 → `dramatic lighting`）
+- 光影 / 氛围粒子 / 头发动态：优先采用共现推荐里的相关 tag（如 `moonlight`、`light particles`、`hair flowing`），未覆盖时按场景自行补
 - 眼睛：人物场景可强化眼睛细节
-- 头发动态：动态/风/动作场景考虑飘动感
-- 氛围粒子：合适场景加 `light particles`、`petals`、`snowflakes` 等
 - 手部：易出错，非必要时通过姿势自然隐藏
 
 ### 冲突消解

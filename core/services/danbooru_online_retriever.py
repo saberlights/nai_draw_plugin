@@ -153,8 +153,8 @@ class DanbooruOnlineRetriever:
         if not search_items and not related_items:
             return ""
 
+        # 仅输出候选数据，使用规则统一在 prompt 模板 _TAG_CANDIDATES_USAGE 中描述
         lines = ["<tag_candidates>"]
-        lines.append("以下是从 Danbooru 标签数据库中检索到的候选标签：\n")
 
         # 语义匹配部分
         if search_items:
@@ -179,14 +179,6 @@ class DanbooruOnlineRetriever:
                 cn_part = f"{cn} → " if cn else ""
                 lines.append(f"- {cn_part}{tag} [{category}] (共现度 {cooc:.2f})")
 
-        # 使用规则
-        lines.append("")
-        lines.append("使用规则：")
-        lines.append("- 语义匹配标签是数据库验证的标准 Danbooru tag，与描述匹配的应优先采用")
-        lines.append("- 共现推荐是真实画作中的常见搭配，可用于丰富画面细节和一致性")
-        lines.append("- 不强制全部使用，挑选能互相搭配、贴合用户描述的标签即可")
-        lines.append("- 候选未覆盖的内容，用你自身的 Danbooru 知识补充")
-        lines.append("- 与用户描述无关的候选直接忽略")
         lines.append("</tag_candidates>")
 
         return "\n".join(lines)
