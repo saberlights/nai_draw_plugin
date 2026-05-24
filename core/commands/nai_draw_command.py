@@ -154,7 +154,7 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
             return False, "配置错误", True
 
         # 获取图片尺寸
-        image_size = model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
+        image_size = model_config.get("nai_size") or model_config.get("default_size", "")
 
         # 显示处理信息
         enable_debug = self.get_config("components.enable_debug_info", False)

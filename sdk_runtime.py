@@ -1835,7 +1835,7 @@ class NaiInvocation(ModelConfigMixin):
                 await self.send_text("NovelAI 配置错误，请检查配置文件")
                 return False, "配置错误", True
 
-            image_size = model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
+            image_size = model_config.get("nai_size") or model_config.get("default_size", "")
             enable_debug = bool(self.get_config("components.enable_debug_info", False))
             if enable_debug:
                 await self.send_text("正在生成图片，请稍候...")
@@ -1879,7 +1879,7 @@ class NaiInvocation(ModelConfigMixin):
                 await self.send_text("NovelAI 配置错误，请检查配置文件")
                 return False, "配置错误", True
 
-            image_size = model_config.get("nai_size") or model_config.get("default_size", "1024x1280")
+            image_size = model_config.get("nai_size") or model_config.get("default_size", "")
             enable_debug = bool(self.get_config("components.enable_debug_info", False))
             if enable_debug:
                 await self.send_text("正在生成图片，请稍候...")
