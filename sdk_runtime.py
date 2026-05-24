@@ -58,7 +58,7 @@ from .core.rules.selfie_rules import (
 )
 from .core.services.prompt_memory import render_previous_prompt_block
 from .core.services.session_state import session_state
-from .core.services.tag_retriever import get_tag_retriever
+from .core.services.tag_candidate_resolver import resolve_tag_candidates
 from .core.services.user_blacklist import user_blacklist
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.prompt_output_parser import parse_prompt_from_structured_output
@@ -1394,85 +1394,12 @@ class NaiInvocation(ModelConfigMixin):
 
     async def _retrieve_tag_candidates(self, request_text: str) -> str:
         """执行 Danbooru tag 检索增强。"""
-        try:
-            retriever_config = self.get_config("tag_retriever", {}) or {}
-            if not isinstance(retriever_config, dict) or not retriever_config.get("enabled", False):
-                return ""
-
-            mode = str(retriever_config.get("mode", "local") or "local").strip().lower()
-            logger.info(f"{self.log_prefix} Tag 检索已启用，模式={mode}，query='{request_text[:30]}'")
-
-            if mode == "online":
-                return await self._retrieve_online_tag_candidates(request_text, retriever_config)
-            return await self._retrieve_local_tag_candidates(request_text, retriever_config)
-        except Exception as exc:
-            logger.warning(f"{self.log_prefix} Tag 检索失败，已跳过: {exc}")
-            return ""
-
-    async def _retrieve_online_tag_candidates(
-        self,
-        request_text: str,
-        retriever_config: dict[str, Any],
-    ) -> str:
-        """执行在线 Danbooru 检索，失败时回退到本地检索。"""
-        try:
-            from .core.services.danbooru_online_retriever import get_online_retriever
-        except Exception as exc:
-            logger.warning(f"{self.log_prefix} Tag 在线检索初始化失败，回退到本地检索: {exc}")
-            return await self._retrieve_local_tag_candidates(request_text, retriever_config)
-
-        retriever = get_online_retriever(
-            enabled=True,
-            base_url=retriever_config.get("api_url", "https://sakizuki-danboorusearch.hf.space/api"),
-            timeout=retriever_config.get("timeout", 90.0),
-            search_limit=retriever_config.get("search_limit", 30),
-            search_top_k=retriever_config.get("search_top_k", 5),
-            related_limit=retriever_config.get("related_limit", 20),
-            related_seed_count=retriever_config.get("related_seed_count", 8),
-            show_nsfw=retriever_config.get("show_nsfw", True),
-            popularity_weight=retriever_config.get("popularity_weight", 0.15),
+        retriever_config = self.get_config("tag_retriever", {}) or {}
+        return await resolve_tag_candidates(
+            retriever_config,
+            request_text,
+            log_prefix=self.log_prefix,
         )
-        if not retriever:
-            return ""
-
-        results = await retriever.retrieve(query=request_text)
-        search_count = len(results.get("search", []))
-        related_count = len(results.get("related", []))
-        if search_count == 0 and related_count == 0:
-            logger.info(f"{self.log_prefix} Tag 在线检索无结果，回退到本地检索")
-            return await self._retrieve_local_tag_candidates(request_text, retriever_config)
-
-        logger.info(
-            f"{self.log_prefix} Tag 在线检索命中："
-            f"query='{request_text[:30]}' search={search_count} related={related_count}"
-        )
-        return retriever.format_candidates(results)
-
-    async def _retrieve_local_tag_candidates(
-        self,
-        request_text: str,
-        retriever_config: dict[str, Any],
-    ) -> str:
-        """执行本地 Danbooru 检索。"""
-        retriever = get_tag_retriever(
-            enabled=True,
-            top_k=retriever_config.get("top_k", 20),
-            min_score=retriever_config.get("min_score", 0.3),
-        )
-        if not retriever:
-            return ""
-
-        results = await retriever.retrieve(
-            query=request_text,
-            top_k=retriever_config.get("top_k", 20),
-            min_score=retriever_config.get("min_score", 0.3),
-        )
-        if not results:
-            return ""
-
-        tag_list = ", ".join(f"{item['cn']}→{item['tag']}({item['score']})" for item in results)
-        logger.info(f"{self.log_prefix} Tag 本地检索命中：{tag_list}")
-        return retriever.format_candidates(results)
 
     async def _generate_prompt_with_llm(
         self,

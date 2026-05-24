@@ -81,7 +81,7 @@ tag_retriever_module = types.ModuleType("plugins.nai_draw_plugin.core.services.t
 tag_retriever_module.get_tag_retriever = lambda **_kwargs: None
 sys.modules.setdefault("plugins.nai_draw_plugin.core.services.tag_retriever", tag_retriever_module)
 
-from plugins.nai_draw_plugin.core.services import danbooru_online_retriever as online_retriever_module
+from plugins.nai_draw_plugin.core.services import tag_candidate_resolver as resolver_module
 from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation
 from plugins.nai_draw_plugin import sdk_runtime as sdk_runtime_module
 
@@ -175,8 +175,8 @@ def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatc
     def fake_get_tag_retriever(**kwargs: object) -> _FakeLocalRetriever:
         return local_retriever
 
-    monkeypatch.setattr(online_retriever_module, "get_online_retriever", fake_get_online_retriever)
-    monkeypatch.setattr(sdk_runtime_module, "get_tag_retriever", fake_get_tag_retriever)
+    monkeypatch.setattr(resolver_module, "get_online_retriever", fake_get_online_retriever)
+    monkeypatch.setattr(resolver_module, "get_tag_retriever", fake_get_tag_retriever)
 
     result = asyncio.run(invocation._retrieve_tag_candidates("画一张初音未来"))
 
@@ -217,8 +217,8 @@ def test_retrieve_tag_candidates_falls_back_to_local_when_online_returns_empty(
     def fake_get_tag_retriever(**kwargs: object) -> _FakeLocalRetriever:
         return local_retriever
 
-    monkeypatch.setattr(online_retriever_module, "get_online_retriever", fake_get_online_retriever)
-    monkeypatch.setattr(sdk_runtime_module, "get_tag_retriever", fake_get_tag_retriever)
+    monkeypatch.setattr(resolver_module, "get_online_retriever", fake_get_online_retriever)
+    monkeypatch.setattr(resolver_module, "get_tag_retriever", fake_get_tag_retriever)
 
     result = asyncio.run(invocation._retrieve_tag_candidates("画一张猫耳少女"))
 

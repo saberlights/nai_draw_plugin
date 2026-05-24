@@ -21,7 +21,7 @@ from ..rules.selfie_rules import (
     merge_selfie_prompt,
 )
 from ..services.session_state import session_state
-from ..services.tag_retriever import get_tag_retriever
+from ..services.tag_candidate_resolver import resolve_tag_candidates
 from ..utils.prompt_output_parser import parse_prompt_from_structured_output
 from ..utils.prompt_postprocessor import (
     normalize_prompt_order,
@@ -303,30 +303,13 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
         return prompt
 
     async def _retrieve_tag_candidates(self, request_text: str) -> str:
-        """检索候选 danbooru tag"""
-        try:
-            retriever_config = self.get_config("tag_retriever", None) or {}
-            if not retriever_config.get("enabled", False):
-                return ""
-            retriever = get_tag_retriever(
-                enabled=True,
-                top_k=retriever_config.get("top_k", 20),
-                min_score=retriever_config.get("min_score", 0.3),
-            )
-            if not retriever:
-                return ""
-            results = await retriever.retrieve(
-                query=request_text,
-                top_k=retriever_config.get("top_k", 20),
-                min_score=retriever_config.get("min_score", 0.3),
-            )
-            if results:
-                tag_list = ", ".join(f"{r['cn']}→{r['tag']}({r['score']})" for r in results)
-                logger.info(f"{self.log_prefix} Tag 检索增强：找到 {len(results)} 个候选 tag: {tag_list}")
-                return retriever.format_candidates(results)
-        except Exception as e:
-            logger.warning(f"{self.log_prefix} Tag 检索失败，跳过: {e}")
-        return ""
+        """检索候选 danbooru tag（支持本地/在线两种模式，与 Action 路径共用调度逻辑）"""
+        retriever_config = self.get_config("tag_retriever", None) or {}
+        return await resolve_tag_candidates(
+            retriever_config,
+            request_text,
+            log_prefix=self.log_prefix,
+        )
 
     async def _generate_random_description(self, selfie: bool = False) -> Optional[str]:
         """LLM 生成随机场景关键词"""
