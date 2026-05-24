@@ -139,12 +139,15 @@ sys.modules["core.services.tag_retriever"] = tag_retriever_module
 
 prompt_output_parser_module = types.ModuleType("core.utils.prompt_output_parser")
 prompt_output_parser_module.parse_prompt_from_structured_output = lambda *_args, **_kwargs: None
+prompt_output_parser_module.extract_multi_character_payload = lambda *_args, **_kwargs: None
 sys.modules["core.utils.prompt_output_parser"] = prompt_output_parser_module
 
 prompt_postprocessor_module = types.ModuleType("core.utils.prompt_postprocessor")
 prompt_postprocessor_module.normalize_prompt_order = lambda prompt: prompt
+prompt_postprocessor_module.normalize_characters_order = lambda global_text, characters: (global_text, characters)
 prompt_postprocessor_module.remove_selfie_appearance_tags = lambda prompt: prompt
 prompt_postprocessor_module.sanitize_sfw_prompt = lambda prompt: prompt
+prompt_postprocessor_module.sanitize_sfw_characters = lambda global_text, characters: (global_text, characters)
 prompt_postprocessor_module.user_mentions_appearance = lambda *_args, **_kwargs: False
 sys.modules["core.utils.prompt_postprocessor"] = prompt_postprocessor_module
 

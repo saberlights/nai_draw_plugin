@@ -10,7 +10,7 @@ import json
 import tomllib
 from collections.abc import Callable
 from uuid import uuid4
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import asyncio
 import re
@@ -61,10 +61,15 @@ from .core.services.session_state import session_state
 from .core.services.tag_candidate_resolver import resolve_tag_candidates
 from .core.services.user_blacklist import user_blacklist
 from .core.utils.display_message_helper import build_action_image_display_message
-from .core.utils.prompt_output_parser import parse_prompt_from_structured_output
+from .core.utils.prompt_output_parser import (
+    extract_multi_character_payload,
+    parse_prompt_from_structured_output,
+)
 from .core.utils.prompt_postprocessor import (
+    normalize_characters_order,
     normalize_prompt_order,
     remove_selfie_appearance_tags,
+    sanitize_sfw_characters,
     sanitize_sfw_prompt,
     user_mentions_appearance,
 )
@@ -633,6 +638,54 @@ class NaiInvocation(ModelConfigMixin):
         if not session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
             return prompt
         return sanitize_sfw_prompt(prompt)
+
+    def _sanitize_structured_for_sfw_mode(
+        self,
+        structured: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """SFW 过滤多角色 payload；过滤后人数不足 2 时返回 None 触发字符串降级。"""
+        if not structured:
+            return None
+        if not session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
+            return structured
+        new_global, new_chars = sanitize_sfw_characters(
+            structured.get("global_text", ""),
+            structured.get("characters") or [],
+        )
+        if len(new_chars) < 2:
+            logger.info(
+                f"{self.log_prefix} SFW 过滤后多角色 payload 剩余 {len(new_chars)} 项，"
+                "降级回单字符串路径"
+            )
+            return None
+        return {**structured, "global_text": new_global, "characters": new_chars}
+
+    def _normalize_structured_order(
+        self,
+        structured: Optional[dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        """按 normalize_prompt_order 规则整理多角色 payload。"""
+        if not structured:
+            return None
+        new_global, new_chars = normalize_characters_order(
+            structured.get("global_text", ""),
+            structured.get("characters") or [],
+        )
+        return {**structured, "global_text": new_global, "characters": new_chars}
+
+    @staticmethod
+    def _select_send_payload(
+        prompt: str,
+        structured: Optional[dict[str, Any]],
+    ) -> tuple[str, Optional[List[Dict[str, Any]]]]:
+        """根据是否存在合法结构化 payload，返回送往 generate_image 的 (prompt, characters)。
+
+        结构化路径下 ``prompt`` 用 ``global_text`` 单段；字符串路径下沿用拍平后的字符串，
+        ``characters`` 为 ``None``。
+        """
+        if structured and len(structured.get("characters") or []) >= 2:
+            return structured.get("global_text", "") or prompt, list(structured["characters"])
+        return prompt, None
 
     async def _find_recent_messages(self, limit: int = 120, hours: float = 24.0) -> list[Any]:
         """读取当前会话最近消息。
@@ -1409,8 +1462,13 @@ class NaiInvocation(ModelConfigMixin):
         include_custom_system_prompt: bool = True,
         reply_context_text: str = "",
         reasoning_context_text: str = "",
-    ) -> str | None:
+    ) -> Optional[tuple[str, Optional[dict[str, Any]]]]:
         """将自然语言描述转换为提示词。
+
+        Returns:
+            ``(text, structured)`` 二元组；``text`` 为拍平后的字符串（含 ``char1:/char2:`` 前缀，
+            用于显示与字符串路径），``structured`` 在 v3 multi JSON 且 ≥2 人时为
+            ``{"global_text", "characters", "has_coords"}``，否则为 ``None``。整体失败返回 ``None``。
 
         ``reply_context_text`` 仅在 reply 后置自动跟图链路传入，作为 bot 即将说出的回复
         原文喂给 LLM；``reasoning_context_text`` 仅在 Planner Action 链路传入，作为本轮
@@ -1489,9 +1547,13 @@ class NaiInvocation(ModelConfigMixin):
         if not cleaned_prompt:
             return None
 
+        # 同时尝试抽出 v3 multi 结构化 payload，供 NewAPI characters[] 通道使用
+        structured_payload = extract_multi_character_payload(response)
+
         if allow_inherit and self.stream_id:
             session_state.set_last_nai_context(self.stream_id, cleaned_prompt, request_text)
-        return cleaned_prompt
+
+        return cleaned_prompt, structured_payload
 
     async def _generate_random_description(self, *, selfie: bool = False) -> str | None:
         """生成随机场景描述。"""
@@ -1723,15 +1785,16 @@ class NaiInvocation(ModelConfigMixin):
                     await self.send_text("随机场景生成失败，请稍后再试~")
                     return False, "随机生成失败", True
 
-            generated_prompt = await self._generate_prompt_with_llm(
+            llm_result = await self._generate_prompt_with_llm(
                 description,
                 allow_inherit=False,
                 # NSFW 模板路径会自动注入 custom_prompt.system_prompt；SFW 模板由内部门控跳过
                 include_custom_system_prompt=True,
             )
-            if not generated_prompt:
+            if not llm_result:
                 await self.send_text("提示词生成失败，请稍后再试~")
                 return False, "提示词生成失败", True
+            generated_prompt, structured_payload = llm_result
 
             is_selfie = detect_selfie_from_output(generated_prompt)
             selfie_base_prompt = generated_prompt
@@ -1742,11 +1805,15 @@ class NaiInvocation(ModelConfigMixin):
                     include_selfie_prompt_add=True,
                     log_changes=True,
                 )
+                # 自拍场景目前一律按单字符串路径处理（_process_selfie_prompt 只作用于字符串）
+                structured_payload = None
 
             if self.get_config("prompt_generator.enforce_tag_order", False):
                 generated_prompt = normalize_prompt_order(generated_prompt)
+                structured_payload = self._normalize_structured_order(structured_payload)
 
             generated_prompt = self._sanitize_prompt_for_sfw_mode(generated_prompt)
+            structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
 
             if self._is_prompt_show_enabled():
                 show_prompt = generated_prompt
@@ -1772,10 +1839,14 @@ class NaiInvocation(ModelConfigMixin):
             if enable_debug:
                 await self.send_text("正在生成图片，请稍候...")
 
+            request_prompt, request_characters = self._select_send_payload(
+                generated_prompt, structured_payload
+            )
             success, result = await self.api_client.generate_image(
-                prompt=generated_prompt,
+                prompt=request_prompt,
                 model_config=model_config,
                 size=image_size,
+                characters=request_characters,
             )
 
             if not success:
@@ -1906,8 +1977,10 @@ class NaiInvocation(ModelConfigMixin):
             include_custom_system_prompt=True,
             reasoning_context_text=self.reasoning,
         )
+        structured_payload: Optional[Dict[str, Any]] = None
         if generated_prompt:
-            description = generated_prompt.strip()
+            description = generated_prompt[0].strip()
+            structured_payload = generated_prompt[1]
         elif not description:
             await self.send_text("提示词生成器开小差了，请直接告诉我想画什么，或者稍后再试一次~")
             return False, "图片描述为空"
@@ -1926,11 +1999,14 @@ class NaiInvocation(ModelConfigMixin):
                 description,
                 raw_description,
             )
+            structured_payload = None
 
         if self.get_config("prompt_generator.enforce_tag_order", False):
             description = normalize_prompt_order(description)
+            structured_payload = self._normalize_structured_order(structured_payload)
 
         description = self._sanitize_prompt_for_sfw_mode(description)
+        structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
 
         if self._is_prompt_show_enabled():
             show_prompt = description
@@ -1956,11 +2032,15 @@ class NaiInvocation(ModelConfigMixin):
         if enable_debug:
             await self.send_text("收到！正在使用 NAI low-level 网关生成图片，请稍候...")
 
+        request_prompt, request_characters = self._select_send_payload(
+            description, structured_payload
+        )
         try:
             success, result = await self.api_client.generate_image(
-                prompt=description,
+                prompt=request_prompt,
                 model_config=model_config,
                 size=image_size,
+                characters=request_characters,
             )
         except Exception as exc:
             logger.error("%s Action 生图失败: %r", self.log_prefix, exc, exc_info=True)
@@ -2029,8 +2109,10 @@ class NaiInvocation(ModelConfigMixin):
             include_custom_system_prompt=True,
             reply_context_text=reply_context_text,
         )
+        structured_payload: Optional[Dict[str, Any]] = None
         if generated_prompt:
-            description = generated_prompt.strip()
+            description = generated_prompt[0].strip()
+            structured_payload = generated_prompt[1]
         elif not description:
             return False, "图片描述为空"
 
@@ -2047,11 +2129,14 @@ class NaiInvocation(ModelConfigMixin):
                 description,
                 raw_description,
             )
+            structured_payload = None
 
         if self.get_config("prompt_generator.enforce_tag_order", False):
             description = normalize_prompt_order(description)
+            structured_payload = self._normalize_structured_order(structured_payload)
 
         description = self._sanitize_prompt_for_sfw_mode(description)
+        structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
 
         model_config = self._get_model_config(is_selfie=is_selfie)
         if not model_config or not model_config.get("base_url"):
@@ -2059,11 +2144,15 @@ class NaiInvocation(ModelConfigMixin):
 
         image_size = model_config.get("nai_size") or model_config.get("default_size", "")
 
+        request_prompt, request_characters = self._select_send_payload(
+            description, structured_payload
+        )
         try:
             success, result = await self.api_client.generate_image(
-                prompt=description,
+                prompt=request_prompt,
                 model_config=model_config,
                 size=image_size,
+                characters=request_characters,
             )
         except Exception as exc:
             logger.error("%s reply 自动跟图生成失败: %r", self.log_prefix, exc, exc_info=True)

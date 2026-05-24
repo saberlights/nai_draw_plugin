@@ -5,7 +5,7 @@
 import re
 import time
 from datetime import datetime
-from typing import Tuple, Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.plugin_system.base.base_command import BaseCommand
 from src.common.logger import get_logger
@@ -22,10 +22,15 @@ from ..rules.selfie_rules import (
 )
 from ..services.session_state import session_state
 from ..services.tag_candidate_resolver import resolve_tag_candidates
-from ..utils.prompt_output_parser import parse_prompt_from_structured_output
+from ..utils.prompt_output_parser import (
+    extract_multi_character_payload,
+    parse_prompt_from_structured_output,
+)
 from ..utils.prompt_postprocessor import (
+    normalize_characters_order,
     normalize_prompt_order,
     remove_selfie_appearance_tags,
+    sanitize_sfw_characters,
     sanitize_sfw_prompt,
     user_mentions_appearance,
 )
@@ -82,13 +87,14 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
             logger.info(f"{self.log_prefix} [LLM生图] 随机场景: {description}")
 
         # 使用 LLM 生成提示词（自拍意图由 LLM 自行判断）
-        generated_prompt = await self._generate_prompt_with_llm(description)
+        llm_result = await self._generate_prompt_with_llm(description)
 
-        if not generated_prompt:
+        if not llm_result:
             logger.warning(f"{self.log_prefix} [LLM生图] 提示词生成失败")
             await self.send_text("提示词生成失败，请稍后再试~")
             return False, "提示词生成失败", True
 
+        generated_prompt, structured_payload = llm_result
         logger.debug(f"{self.log_prefix} [LLM生图] 原始提示词: {generated_prompt}")
 
         # 从 LLM 输出检测是否为自拍
@@ -103,15 +109,19 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
                 include_selfie_prompt_add=True,
                 log_changes=True,
             )
+            # 自拍场景按单字符串路径处理（_process_selfie_prompt 只作用于字符串）
+            structured_payload = None
 
         # 轻量排序（可配置关闭）
         if self.get_config("prompt_generator.enforce_tag_order", False):
             generated_prompt = normalize_prompt_order(generated_prompt)
+            structured_payload = self._normalize_structured_order(structured_payload)
 
         try:
             platform, chat_id, _ = self._get_chat_identity()
             if platform and chat_id and session_state.is_nsfw_filter_enabled(platform, chat_id, self.get_config):
                 generated_prompt = sanitize_sfw_prompt(generated_prompt)
+                structured_payload = self._sanitize_structured_for_sfw(structured_payload)
         except Exception:
             pass
 
@@ -153,10 +163,14 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
 
         try:
             # 调用 API 生成图片（异步，不阻塞事件循环）
+            request_prompt, request_characters = self._select_send_payload(
+                generated_prompt, structured_payload
+            )
             success, result = await self.api_client.generate_image(
-                prompt=generated_prompt,
+                prompt=request_prompt,
                 model_config=model_config,
-                size=image_size
+                size=image_size,
+                characters=request_characters,
             )
         except Exception as e:
             logger.error(f"{self.log_prefix} [LLM生图] 图片生成失败: {e!r}", exc_info=True)
@@ -220,9 +234,15 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
 
     async def _generate_prompt_with_llm(
         self,
-        request_text: str
-    ) -> Optional[str]:
-        """使用 LLM 生成英文提示词（自拍意图由 LLM 自行判断）"""
+        request_text: str,
+    ) -> Optional[Tuple[str, Optional[Dict[str, Any]]]]:
+        """使用 LLM 生成英文提示词（自拍意图由 LLM 自行判断）。
+
+        Returns:
+            ``(text, structured)`` 二元组；``text`` 为拍平后的字符串，``structured`` 在 v3 multi
+            JSON 且 ≥2 人时为 ``{"global_text", "characters", "has_coords"}``，否则为 ``None``；
+            整体失败返回 ``None``。
+        """
         generator_config = self._get_prompt_generator_config()
 
         # 检查是否启用 NSFW 过滤，选择对应模板
@@ -282,7 +302,54 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
             return None
 
         cleaned = self._cleanup_llm_prompt(response)
-        return cleaned if cleaned else None
+        if not cleaned:
+            return None
+
+        # 从原始 LLM 响应中抽出 v3 multi 结构化 payload，供 NewAPI characters[] 通道使用
+        structured_payload = extract_multi_character_payload(response)
+        return cleaned, structured_payload
+
+    def _normalize_structured_order(
+        self,
+        structured: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """按 normalize_prompt_order 规则整理多角色 payload。"""
+        if not structured:
+            return None
+        new_global, new_chars = normalize_characters_order(
+            structured.get("global_text", ""),
+            structured.get("characters") or [],
+        )
+        return {**structured, "global_text": new_global, "characters": new_chars}
+
+    def _sanitize_structured_for_sfw(
+        self,
+        structured: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """SFW 过滤多角色 payload，过滤后人数不足 2 时返回 None 触发字符串降级。"""
+        if not structured:
+            return None
+        new_global, new_chars = sanitize_sfw_characters(
+            structured.get("global_text", ""),
+            structured.get("characters") or [],
+        )
+        if len(new_chars) < 2:
+            logger.info(
+                f"{self.log_prefix} SFW 过滤后多角色 payload 剩余 {len(new_chars)} 项，"
+                "降级回单字符串路径"
+            )
+            return None
+        return {**structured, "global_text": new_global, "characters": new_chars}
+
+    @staticmethod
+    def _select_send_payload(
+        prompt: str,
+        structured: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        """根据是否存在合法结构化 payload，决定送往 generate_image 的 (prompt, characters)。"""
+        if structured and len(structured.get("characters") or []) >= 2:
+            return structured.get("global_text", "") or prompt, list(structured["characters"])
+        return prompt, None
 
     def _render_generator_prompt(
         self,
