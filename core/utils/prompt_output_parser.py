@@ -23,6 +23,9 @@ from typing import Optional, Dict, Any, List
 # 5×5 网格坐标 [A-E][1-5]（NewAPI 多角色 position 字面量）
 _POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
 
+# 拍平多人字符串的 charN: 前缀（兼容大小写、中英文冒号、可选空格）
+_CHAR_PREFIX_RE = re.compile(r"^char\s*\d+\s*[:：]\s*", re.IGNORECASE)
+
 
 def _strip_code_fence(text: str) -> str:
     """去掉可能的 ```lang ... ``` 包裹（只做轻量处理）。"""
@@ -234,3 +237,77 @@ def extract_multi_character_payload(text: str) -> Optional[Dict[str, Any]]:
         "characters": characters,
         "has_coords": has_coords,
     }
+
+
+def _split_multi_person_segments(text: str) -> List[str]:
+    """把拍平的多人字符串切成 [global, char1, char2, ...] 段。
+
+    支持两种拍平形态：
+    - 多行：``"global,\\nchar1:p1,\\nchar2:p2,"``（_render_from_v2 / LLM 当前主流输出）
+    - 单行 ``|`` 分隔：``"global | char1 prompt | char2 prompt"``（旧版本兼容）
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return []
+
+    if "\n" in stripped:
+        return [seg.strip() for seg in stripped.split("\n") if seg.strip()]
+    if "|" in stripped:
+        return [seg.strip() for seg in stripped.split("|") if seg.strip()]
+    return [stripped]
+
+
+def extract_multi_character_payload_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """从拍平后的多人字符串反解出结构化角色 payload。
+
+    用于 LLM 走文本路径（非 JSON）或 v3 JSON 模板被用户覆盖的场景，确保只要 LLM
+    输出了 ``char1:/char2:`` 多段格式，就能进入 NewAPI 的 ``characters[]`` 通道。
+
+    Returns:
+        与 :func:`extract_multi_character_payload` 同结构；解析为单人或失败时返回 ``None``。
+        反解路径不会带 position，因此 ``has_coords`` 永远为 ``False``。
+    """
+    segments = _split_multi_person_segments(text)
+    if len(segments) < 3:
+        # 至少 1 段 global + 2 段角色才认为是多人
+        return None
+
+    global_text = segments[0].strip().rstrip(",").strip()
+    if not global_text:
+        return None
+
+    characters: List[Dict[str, str]] = []
+    for raw_segment in segments[1:]:
+        cleaned = raw_segment.strip().lstrip("|").strip().rstrip(",").strip()
+        cleaned = _CHAR_PREFIX_RE.sub("", cleaned).strip()
+        if not cleaned:
+            continue
+        characters.append({"prompt": cleaned, "negative_prompt": "", "position": ""})
+
+    if len(characters) < 2:
+        return None
+
+    return {
+        "global_text": global_text,
+        "characters": characters,
+        "has_coords": False,
+    }
+
+
+def resolve_multi_character_payload(
+    raw_llm_response: str,
+    rendered_text: str,
+) -> Optional[Dict[str, Any]]:
+    """统一入口：优先用 v3 JSON 抽取，失败时回退到从拍平文本反解。
+
+    Args:
+        raw_llm_response: LLM 的原始返回（可能是 JSON、JSON+噪声、纯文本任意一种）
+        rendered_text: 经 ``_cleanup_llm_prompt`` 拍平后的最终字符串（含 ``char1:/char2:``）
+
+    Returns:
+        结构化 payload；若 LLM 输出为单人或都解析失败，返回 ``None``。
+    """
+    from_json = extract_multi_character_payload(raw_llm_response)
+    if from_json is not None:
+        return from_json
+    return extract_multi_character_payload_from_text(rendered_text)

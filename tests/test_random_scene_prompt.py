@@ -140,6 +140,7 @@ sys.modules["core.services.tag_retriever"] = tag_retriever_module
 prompt_output_parser_module = types.ModuleType("core.utils.prompt_output_parser")
 prompt_output_parser_module.parse_prompt_from_structured_output = lambda *_args, **_kwargs: None
 prompt_output_parser_module.extract_multi_character_payload = lambda *_args, **_kwargs: None
+prompt_output_parser_module.resolve_multi_character_payload = lambda *_args, **_kwargs: None
 sys.modules["core.utils.prompt_output_parser"] = prompt_output_parser_module
 
 prompt_postprocessor_module = types.ModuleType("core.utils.prompt_postprocessor")

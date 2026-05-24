@@ -17,6 +17,8 @@ _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
 parse_prompt_from_structured_output = _mod.parse_prompt_from_structured_output
 parse_structured_prompt_payload = _mod.parse_structured_prompt_payload
 extract_multi_character_payload = _mod.extract_multi_character_payload
+extract_multi_character_payload_from_text = _mod.extract_multi_character_payload_from_text
+resolve_multi_character_payload = _mod.resolve_multi_character_payload
 
 
 class PromptOutputParserTest(unittest.TestCase):
@@ -143,6 +145,70 @@ class PromptOutputParserTest(unittest.TestCase):
     def test_extract_multi_character_payload_returns_none_for_v1(self):
         text = '{"version":1,"format":"multi","prompt":"x"}'
         self.assertIsNone(extract_multi_character_payload(text))
+
+    def test_extract_from_text_multiline_charN_prefix(self):
+        text = (
+            "2girls, nsfw, indoor, year 2026,\n"
+            "char1:girl, in foreground, {hatsune miku (vocaloid)}, blush,\n"
+            "char2:girl, beside girl, {luo tianyi (vocaloid)}, closed eyes,"
+        )
+        payload = extract_multi_character_payload_from_text(text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["global_text"], "2girls, nsfw, indoor, year 2026")
+        self.assertEqual(len(payload["characters"]), 2)
+        self.assertEqual(
+            payload["characters"][0]["prompt"],
+            "girl, in foreground, {hatsune miku (vocaloid)}, blush",
+        )
+        self.assertEqual(payload["characters"][0]["position"], "")
+        self.assertFalse(payload["has_coords"])
+
+    def test_extract_from_text_pipe_format(self):
+        text = "2girls, street | girl a, smile | girl b, smile"
+        payload = extract_multi_character_payload_from_text(text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["global_text"], "2girls, street")
+        self.assertEqual(len(payload["characters"]), 2)
+        self.assertEqual(payload["characters"][0]["prompt"], "girl a, smile")
+
+    def test_extract_from_text_returns_none_for_single_line(self):
+        self.assertIsNone(extract_multi_character_payload_from_text("solo, 1girl, smile"))
+
+    def test_extract_from_text_tolerates_chinese_colon(self):
+        text = (
+            "2girls, park,\n"
+            "char1:girl, smile,\n"
+            "char2:girl, laugh,"  # 半角冒号
+        )
+        payload = extract_multi_character_payload_from_text(text)
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["characters"]), 2)
+        self.assertEqual(payload["characters"][1]["prompt"], "girl, laugh")
+
+    def test_resolve_prefers_json_when_available(self):
+        json_text = (
+            '{"version":3,"format":"multi",'
+            '"global":["2girls","park"],'
+            '"people":[["girl","smile"],["girl","laugh"]],'
+            '"positions":["B3","D3"]}'
+        )
+        rendered = "2girls, park,\nchar1:girl, smile,\nchar2:girl, laugh,"
+        payload = resolve_multi_character_payload(json_text, rendered)
+        self.assertIsNotNone(payload)
+        # JSON 路径才有 position
+        self.assertEqual(payload["characters"][0]["position"], "B3")
+        self.assertTrue(payload["has_coords"])
+
+    def test_resolve_falls_back_to_text_when_json_missing(self):
+        rendered = "2girls, park,\nchar1:girl, smile,\nchar2:girl, laugh,"
+        payload = resolve_multi_character_payload("not a json", rendered)
+        self.assertIsNotNone(payload)
+        self.assertEqual(len(payload["characters"]), 2)
+        self.assertFalse(payload["has_coords"])
+
+    def test_resolve_returns_none_for_single_person(self):
+        rendered = "solo, 1girl, smile"
+        self.assertIsNone(resolve_multi_character_payload("not a json", rendered))
 
 
 if __name__ == "__main__":

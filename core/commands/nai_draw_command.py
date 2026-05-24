@@ -23,8 +23,8 @@ from ..rules.selfie_rules import (
 from ..services.session_state import session_state
 from ..services.tag_candidate_resolver import resolve_tag_candidates
 from ..utils.prompt_output_parser import (
-    extract_multi_character_payload,
     parse_prompt_from_structured_output,
+    resolve_multi_character_payload,
 )
 from ..utils.prompt_postprocessor import (
     normalize_characters_order,
@@ -305,8 +305,8 @@ class NaiDrawCommand(ModelConfigMixin, AutoRecallMixin, BaseCommand):
         if not cleaned:
             return None
 
-        # 从原始 LLM 响应中抽出 v3 multi 结构化 payload，供 NewAPI characters[] 通道使用
-        structured_payload = extract_multi_character_payload(response)
+        # 从原始 LLM 响应中抽出 v3 multi 结构化 payload；JSON 失败时反解拍平 char1:/char2: 文本
+        structured_payload = resolve_multi_character_payload(response, cleaned)
         return cleaned, structured_payload
 
     def _normalize_structured_order(

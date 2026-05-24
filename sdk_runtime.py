@@ -62,8 +62,8 @@ from .core.services.tag_candidate_resolver import resolve_tag_candidates
 from .core.services.user_blacklist import user_blacklist
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.prompt_output_parser import (
-    extract_multi_character_payload,
     parse_prompt_from_structured_output,
+    resolve_multi_character_payload,
 )
 from .core.utils.prompt_postprocessor import (
     normalize_characters_order,
@@ -1548,7 +1548,8 @@ class NaiInvocation(ModelConfigMixin):
             return None
 
         # 同时尝试抽出 v3 multi 结构化 payload，供 NewAPI characters[] 通道使用
-        structured_payload = extract_multi_character_payload(response)
+        # 先走 JSON 抽取，失败时从拍平的 char1:/char2: 文本反解，保证只要 LLM 判定多人就进结构化通道
+        structured_payload = resolve_multi_character_payload(response, cleaned_prompt)
 
         if allow_inherit and self.stream_id:
             session_state.set_last_nai_context(self.stream_id, cleaned_prompt, request_text)
