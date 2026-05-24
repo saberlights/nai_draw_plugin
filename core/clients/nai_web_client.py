@@ -1,9 +1,8 @@
 import asyncio
 import base64
 import json
-import random
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -129,6 +128,12 @@ class NaiWebClient:
     @staticmethod
     def _resolve_size(size_value: Any) -> Tuple[int, int]:
         """把人类可读的尺寸描述（竖图/横图/方图/portrait/...）归一化成 (w, h)。"""
+        if isinstance(size_value, (list, tuple)) and len(size_value) == 2:
+            try:
+                return int(size_value[0]), int(size_value[1])
+            except (TypeError, ValueError):
+                return _MAX_SIZE_PORTRAIT
+
         text = str(size_value or "").strip()
         if not text:
             return _MAX_SIZE_PORTRAIT
@@ -159,15 +164,9 @@ class NaiWebClient:
         return _MAX_SIZE_PORTRAIT
 
     @staticmethod
-    def _size_alias_for(width: int, height: int) -> Optional[str]:
-        """落到三档标准尺寸时返回 portrait/landscape/square，否则返回 None。"""
-        if (width, height) == _MAX_SIZE_PORTRAIT:
-            return "portrait"
-        if (width, height) == _MAX_SIZE_LANDSCAPE:
-            return "landscape"
-        if (width, height) == _MAX_SIZE_SQUARE:
-            return "square"
-        return None
+    def _resolve_model_name(model_config: Dict[str, Any]) -> str:
+        model_name = str(model_config.get("default_model") or "").strip()
+        return model_name or "nai-diffusion-4-5-full"
 
     # ========== 请求构造 ==========
 
@@ -191,30 +190,25 @@ class NaiWebClient:
 
         size_value = model_config.get("nai_size") or size or model_config.get("default_size") or "竖图"
         width, height = cls._resolve_size(size_value)
-        size_payload: Union[str, List[int]]
-        alias = cls._size_alias_for(width, height)
-        size_payload = alias if alias is not None else [width, height]
+        size_payload: List[int] = [width, height]
 
         seed_value = model_config.get("seed")
         try:
             seed_int = int(seed_value) if seed_value not in (None, "") else -1
         except (TypeError, ValueError):
             seed_int = -1
-        if seed_int < 0:
-            seed_int = random.randint(0, 999_999_999)
-
         inner: Dict[str, Any] = {
-            "model": str(model_config.get("default_model") or "nai-diffusion-4-5-full"),
             "prompt": full_prompt,
             "negative_prompt": negative_prompt,
             "size": size_payload,
             "steps": int(model_config.get("num_inference_steps", 23)),
             "scale": float(model_config.get("guidance_scale", 5.0)),
             "sampler": str(model_config.get("sampler") or "k_euler_ancestral"),
-            "seed": seed_int,
             "n_samples": 1,
             "image_format": str(model_config.get("image_format", "png")),
         }
+        if seed_int >= 0:
+            inner["seed"] = seed_int
 
         # 质量增强参数（文档 §5 表外，透传由 NewAPI 决定是否吃下）
         if bool(model_config.get("quality_toggle", True)):
@@ -242,7 +236,7 @@ class NaiWebClient:
         return inner
 
     @staticmethod
-    def _validate_inner_payload(inner: Dict[str, Any]) -> Optional[str]:
+    def _validate_inner_payload(model_name: str, inner: Dict[str, Any]) -> Optional[str]:
         """对内层参数做最关键的硬约束（参考 NewAPI 文档 §5 / §15）。
 
         返回非空字符串表示拒绝原因；返回 None 表示通过。
@@ -252,23 +246,46 @@ class NaiWebClient:
         if not prompt:
             return "prompt 为空，无法发起绘图请求"
 
-        model_name = str(inner.get("model") or "").lower()
-        if "inpainting" in model_name:
-            return f"NewAPI 当前不支持 inpainting 模型：{inner.get('model')}"
+        normalized_model_name = str(model_name or "").strip()
+        if "inpainting" in normalized_model_name.lower():
+            return f"NewAPI 当前不支持 inpainting 模型：{normalized_model_name}"
+
+        size_value = inner.get("size")
+        if not (
+            isinstance(size_value, list)
+            and len(size_value) == 2
+            and all(isinstance(value, int) for value in size_value)
+        ):
+            return f"size 必须是 [width, height] 整数数组，当前收到 {size_value!r}"
+        width, height = size_value
+        if width <= 0 or height <= 0:
+            return f"size 宽高必须大于 0，当前收到 {size_value!r}"
+        if width % 64 != 0 or height % 64 != 0:
+            return f"size 宽高必须是 64 的倍数，当前收到 {size_value!r}"
+        if width == height:
+            if width > _MAX_SIZE_SQUARE[0]:
+                return f"方图最大尺寸为 {_MAX_SIZE_SQUARE}，当前收到 {size_value!r}"
+        elif height > width:
+            if width > _MAX_SIZE_PORTRAIT[0] or height > _MAX_SIZE_PORTRAIT[1]:
+                return f"竖图最大尺寸为 {_MAX_SIZE_PORTRAIT}，当前收到 {size_value!r}"
+        else:
+            if width > _MAX_SIZE_LANDSCAPE[0] or height > _MAX_SIZE_LANDSCAPE[1]:
+                return f"横图最大尺寸为 {_MAX_SIZE_LANDSCAPE}，当前收到 {size_value!r}"
 
         if int(inner.get("n_samples", 1)) != 1:
             return f"NewAPI 当前只允许 n_samples=1，配置中收到 {inner.get('n_samples')}"
 
         return None
 
+    @staticmethod
     def _build_request_body(
-        self,
+        model_name: str,
         inner: Dict[str, Any],
         max_tokens: int,
     ) -> Dict[str, Any]:
         """构造 OpenAI 兼容外层 body。"""
         return {
-            "model": inner["model"],
+            "model": model_name,
             "messages": [
                 {
                     "role": "user",
@@ -326,24 +343,25 @@ class NaiWebClient:
                 endpoint = "/v1/chat/completions"
             url = f"{base_url}{endpoint}"
 
+            model_name = self._resolve_model_name(model_config)
             inner_params = self._build_inner_draw_params(prompt, model_config, size)
-            reject_reason = self._validate_inner_payload(inner_params)
+            reject_reason = self._validate_inner_payload(model_name, inner_params)
             if reject_reason:
                 logger.error(f"{self.log_prefix} (NewAPI) 请求被前置校验拒绝: {reject_reason}")
                 return False, reject_reason
 
             max_tokens = self._resolve_max_tokens(model_config)
-            body = self._build_request_body(inner_params, max_tokens)
+            body = self._build_request_body(model_name, inner_params, max_tokens)
             headers = self._build_request_headers(model_config.get("api_key") or "")
             proxy_mode = self._resolve_proxy_mode(model_config)
             request_timeout = self._resolve_request_timeout(model_config)
 
             size_value = inner_params.get("size")
             logger.info(
-                f"{self.log_prefix} (NewAPI) 请求URL: {url}, model={inner_params['model']}, "
+                f"{self.log_prefix} (NewAPI) 请求URL: {url}, model={model_name}, "
                 f"size={size_value}, steps={inner_params['steps']}, "
                 f"scale={inner_params['scale']}, sampler={inner_params['sampler']}, "
-                f"seed={inner_params['seed']}, max_tokens={max_tokens}, proxy={proxy_mode}, "
+                f"seed={inner_params.get('seed')}, max_tokens={max_tokens}, proxy={proxy_mode}, "
                 f"timeout={request_timeout:.1f}s"
             )
             logger.debug(

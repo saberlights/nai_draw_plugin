@@ -140,9 +140,22 @@ def test_rendered_config_has_per_field_comments() -> None:
         ("# 入站图片缓存保留秒数", "cache_ttl_seconds"),
         ("# 单个 Space 请求超时", "wd14_request_timeout"),
         ("# 访问 Hugging Face Space", "wd14_proxy"),
+        ("# 图片尺寸：可填 竖图 / 横图 / 方图（v/h/s）或 832x1216 / 1216x832 / 1024x1024；请求会自动转换成 NewAPI 要求的 [宽,高] 整数数组", "nai_size"),
+        ("# 随机种子；填 -1 表示请求里省略 seed，由 NewAPI 随机", "seed"),
     ]
     for comment_prefix, field_name in must_have:
         assert comment_prefix in text, f"缺少 {field_name} 的注释行"
+
+
+def test_repository_config_toml_is_valid_and_uses_supported_draw_defaults() -> None:
+    import tomllib
+
+    config_path = Path(__file__).resolve().parents[1] / "config.toml"
+    data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+    assert data["model_nai4_5"]["seed"] == -1
+    assert data["model_nai4_5"]["default_size"] == "832x1216"
+    assert data["model_nai4"]["default_size"] == "832x1216"
 
 
 def test_rendered_config_does_not_contain_wd14_spaces_block() -> None:

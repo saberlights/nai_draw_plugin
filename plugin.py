@@ -551,7 +551,7 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "default_size": ConfigField(
                 type=str,
-                default="1024x1280",
+                default="832x1216",
                 description="作用同 model_nai4_5.default_size"
             ),
             "custom_prompt_add": ConfigField(
@@ -602,7 +602,7 @@ class NaiPicPlugin(MaiBotPlugin):
             "nai_size": ConfigField(
                 type=str,
                 default="竖图",
-                description="图片尺寸：竖图 / 横图 / 方图（v/h/s），或直接写 832x1216 / 1024x1024 这种"
+                description="图片尺寸：可填 竖图 / 横图 / 方图（v/h/s）或 832x1216 / 1216x832 / 1024x1024；请求会自动转换成 NewAPI 要求的 [宽,高] 整数数组"
             ),
             "sampler": ConfigField(
                 type=str,
@@ -622,17 +622,17 @@ class NaiPicPlugin(MaiBotPlugin):
             "seed": ConfigField(
                 type=int,
                 default=-1,
-                description="随机种子；小于 0 表示每次随机"
+                description="随机种子；填 -1 表示请求里省略 seed，由 NewAPI 随机"
             ),
             "quality_toggle": ConfigField(
                 type=bool,
                 default=True,
-                description="更高质量路径；可能更慢、也更容易影响点数"
+                description="更高质量路径；透传为 inner.qualityToggle，可能更慢、也更容易影响点数"
             ),
             "auto_smea": ConfigField(
                 type=bool,
                 default=False,
-                description="底层 SMEA 类增强"
+                description="底层 SMEA 类增强；透传为 inner.autoSmea"
             ),
             "variety_boost": ConfigField(
                 type=bool,
@@ -642,12 +642,12 @@ class NaiPicPlugin(MaiBotPlugin):
             "image_format": ConfigField(
                 type=str,
                 default="png",
-                description="返回图片格式；当前仓库只确认 png"
+                description="返回图片格式：png / webp"
             ),
             "default_size": ConfigField(
                 type=str,
-                default="1024x1280",
-                description="当 nai_size 解析失败时的兜底尺寸"
+                default="832x1216",
+                description="当 nai_size 为空或无法解析时的兜底尺寸；建议保持 832x1216 / 1216x832 / 1024x1024"
             ),
             "custom_prompt_add": ConfigField(
                 type=str,
