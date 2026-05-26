@@ -2372,7 +2372,7 @@ class NaiInvocation(ModelConfigMixin):
 
 【模型 / 尺寸 / 画师】（所有人可用，会话级，重启回退默认）
 /nai set [代号] - 查看/切换模型
-  代号：3=V3, f3=Furry V3, 4=V4, 4.5=V4.5 Full, 4.5p=V4.5 Preview
+  代号：3=V3, f3=Furry V3, 4c=V4 Curated, 4=V4 Full, 4.5c=V4.5 Curated, 4.5=V4.5 Full
 /nai size [代号] - 查看/切换尺寸
   代号：竖/v、横/h、方/s
 /nai art [编号] - 查看/切换画师风格预设
@@ -2442,10 +2442,10 @@ class NaiInvocation(ModelConfigMixin):
         model_mappings = {
             "3": "nai-diffusion-3",
             "f3": "nai-diffusion-3-furry",
+            "4c": "nai-diffusion-4-curated",
             "4": "nai-diffusion-4-full",
+            "4.5c": "nai-diffusion-4-5-curated",
             "4.5": "nai-diffusion-4-5-full",
-            "4.5p": "nai-diffusion-4-5-curated-anlas-0",
-            "4.5-preview": "nai-diffusion-4-5-curated-anlas-0",
         }
         size_mappings = {
             "竖": "832x1216",
@@ -2524,14 +2524,15 @@ class NaiInvocation(ModelConfigMixin):
                     "可用模型:\n"
                     "3 - nai-diffusion-3\n"
                     "f3 - nai-diffusion-3-furry\n"
+                    "4c - nai-diffusion-4-curated\n"
                     "4 - nai-diffusion-4-full\n"
-                    "4.5 - nai-diffusion-4-5-full\n"
-                    "4.5p - nai-diffusion-4-5-curated-anlas-0 (Preview)"
+                    "4.5c - nai-diffusion-4-5-curated\n"
+                    "4.5 - nai-diffusion-4-5-full"
                 )
                 return True, "显示模型列表", True
 
             if param not in model_mappings:
-                await self.send_text("❌ 无效的模型代号，可用值：3 / f3 / 4 / 4.5 / 4.5p")
+                await self.send_text("❌ 无效的模型代号，可用值：3 / f3 / 4c / 4 / 4.5c / 4.5")
                 return False, "无效的模型代号", True
 
             model_name = model_mappings[param]

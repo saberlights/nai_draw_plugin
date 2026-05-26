@@ -51,7 +51,7 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai 随机` / `/nai 随机自拍` | 随机 NSFW 场景 / 自拍 |
 | `/nai0 <标签>` | 直接英文标签生图（跳过 LLM） |
 | `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
-| `/nai set [3/f3/4/4.5]` | 查看/切换模型 |
+| `/nai set [3/f3/4c/4/4.5c/4.5]` | 查看/切换模型 |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
 | `/nai nsfw [on/off]` | 切换 NSFW 过滤（会话级） |
 | `/nai pt on/off` | 切换提示词显示 |
