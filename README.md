@@ -10,11 +10,31 @@
 
 仅文生图，不支持图生图。
 
+## 使用前提
+
+1. **MaiBot 主程序**：`host_application` 要求 `>=0.10.0`，SDK 要求 `2.x`（见 `_manifest.json`）。
+2. **NewAPI 网关账号**：自行准备一个支持 NovelAI 模型转发的 NewAPI 兼容服务（OpenAI 协议、`POST /v1/chat/completions`），拿到 `base_url` + `api_key`。每次绘图按 token 计费（1 Anlas ≈ 10000 tokens）。
+3. **一个智商还可以的 LLM 翻译/规划模型**：`/nai` 自然语言生图依赖 LLM 把中文描述转成 Danbooru tag。**强烈建议接 GPT-4o / Claude 3.5 Sonnet / DeepSeek-V3 这一档以上**——低端模型（如 7B 级开源小模型）容易丢主体、瞎编 tag、不遵守 NAI 权重语法，出图质量会断崖式下跌。模型在 `[prompt_generator]` / `[prompt_generator.custom_model]` 里配置，留空则走 MaiBot 全局 task model。
+4. **代理（仅当使用 `/nai 反推`）**：WD14 在线兜底走 HuggingFace Space，**国内必须开梯子**。在 `[retag].wd14_proxy` 显式填代理（如 `http://127.0.0.1:7890`），或继承 `HTTPS_PROXY` 环境变量。不开代理基本必超时。若只想用 PNG 元数据反推（无需联网），把 `wd14_enabled = false` 关掉兜底即可。
+
+## 依赖
+
+MaiBot 主程序通常已自带 `httpx` / `requests` / `aiohttp` / `numpy` / `tomlkit`，无需额外装。**仅 `/nai 反推` 的 WD14 兜底需要单独装 `gradio_client`**（软依赖，缺失时 PNG 元数据反推仍可用，非原图直接报错）：
+
+```bash
+uv add gradio_client      # 推荐
+# 或
+pip install gradio_client
+```
+
+`[tag_retriever]` 的 `local` 模式（离线 embedding 检索）还需要在 `model_config.toml` 配一个 embedding 模型（如 `bge-m3`），首次会全量 embed 5481 个 tag；online 模式（默认）开箱即用，无额外依赖。
+
 ## 安装
 
 1. 复制插件目录到 `plugins/`
-2. 编辑 `config.toml`（首次启动自动生成）
-3. 重启 MaiBot
+2. 按需安装上文「依赖」中的可选包
+3. 启动一次 MaiBot 让其生成 `config.toml`，再编辑填入 `base_url` / `api_key` / LLM 模型
+4. 重启 MaiBot
 
 ## 快速开始
 
