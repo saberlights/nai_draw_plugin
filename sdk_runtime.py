@@ -49,6 +49,7 @@ from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.mixins.model_config_mixin import ModelConfigMixin
 from .core.rules.prompt_rules import PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_TEMPLATE
 from .core.rules.selfie_rules import (
+    detect_bot_self_image_intent,
     detect_explicit_image_request,
     detect_negative_image_intent,
     detect_negative_image_intent_strength,
@@ -1797,7 +1798,12 @@ class NaiInvocation(ModelConfigMixin):
                 return False, "提示词生成失败", True
             generated_prompt, structured_payload = llm_result
 
-            is_selfie = detect_selfie_from_output(generated_prompt)
+            # 治根：只在用户原话明确想看 bot 本人时走 selfie 后处理。
+            # 旧实现 detect_selfie_from_output 会把 LLM 用作 framing 的 `portrait photo`
+            # / `full body portrait` 误判成 "bot 本人图片"，导致 `/nai 中野二乃，
+            # 展示身材` 这类点名二次元角色的请求被注入 bot 默认外貌，把角色洗成 bot 自己。
+            # 随机自拍场景下 description 已被替换为随机场景文本，靠 is_random_selfie 保留意图。
+            is_selfie = is_random_selfie or detect_bot_self_image_intent(description)
             selfie_base_prompt = generated_prompt
             if is_selfie:
                 generated_prompt = self._process_selfie_prompt(

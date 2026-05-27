@@ -79,6 +79,26 @@ PORTRAIT_TRIGGER_KEYWORDS = [
 ]
 
 
+# 「想看 bot 本人」表达：不是显式自拍/肖像词，但语义指向 bot 自己的身体/外形/穿搭。
+# 用来覆盖 SELFIE/PORTRAIT 关键词漏掉的隐式 self-image 请求。
+_BOT_SELF_REFERENCE_KEYWORDS = [
+    "看看你", "看你", "想看你", "发你", "发张你的",
+    "你长什么样", "你的照片", "你的样子", "你今天穿了什么", "你今天的样子",
+    "你穿什么", "你的脸", "你的全身",
+    "看看黑丝", "看看白丝", "你的腿", "你的脚", "你的鞋",
+    "拍给我看",
+]
+
+
+# selfie 后处理（注入 bot 默认外貌、删冲突发色/瞳色 tag）的触发关键词集。
+# 由 SELFIE_TRIGGER + PORTRAIT_TRIGGER + 隐式想看 bot 本人 三类合并而成。
+BOT_SELF_IMAGE_INTENT_KEYWORDS = (
+    SELFIE_TRIGGER_KEYWORDS
+    + PORTRAIT_TRIGGER_KEYWORDS
+    + _BOT_SELF_REFERENCE_KEYWORDS
+)
+
+
 # ==================== LLM 提示模板 ====================
 
 SELFIE_HINT_FOR_LLM = """
@@ -192,6 +212,29 @@ def detect_portrait_intent(description: str) -> bool:
         if keyword.lower() in description_lower:
             return True
     return False
+
+
+def detect_bot_self_image_intent(text: str) -> bool:
+    """判断输入文本是否明确指向 bot 本人图片（自拍/肖像/想看 bot 自己）。
+
+    覆盖 selfie/portrait 触发词 + 隐式"想看 bot 本人"表达（"看看你"/"你的腿"等）。
+
+    用于 ``/nai`` 命令路径决定是否走 ``_process_selfie_prompt`` 后处理（注入 bot
+    默认外貌、删冲突发色/瞳色 tag）。与 ``detect_selfie_from_output`` 的区别：后者
+    从 LLM 输出标签反推，会把作为 framing 的 ``portrait photo``/``full body
+    portrait`` 误判成"bot 本人图片"，结果把用户点名的二次元角色（如 ``中野二乃``）
+    洗成 bot 自己。
+
+    Args:
+        text: 用户原话或等价的中文意图描述。
+
+    Returns:
+        bool: 是否需要走 bot 自拍/肖像后处理。
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(keyword.lower() in lowered for keyword in BOT_SELF_IMAGE_INTENT_KEYWORDS)
 
 
 # LLM 输出中表示自拍的标签

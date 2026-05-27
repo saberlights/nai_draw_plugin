@@ -4,6 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from plugins.nai_draw_plugin.core.rules.selfie_rules import (
+    detect_bot_self_image_intent,
     detect_explicit_image_request,
     detect_negative_image_intent,
     merge_selfie_prompt,
@@ -87,3 +88,44 @@ def test_negative_intent_does_not_block_normal_requests() -> None:
     assert detect_negative_image_intent("画一张萝莉") is False
     assert detect_negative_image_intent("今天天气真好") is False
     assert detect_negative_image_intent("") is False
+
+
+# ============ detect_bot_self_image_intent ============
+
+def test_bot_self_image_intent_explicit_selfie_or_portrait_match() -> None:
+    """用户原话含自拍/肖像/立绘等显式关键词 → True"""
+    assert detect_bot_self_image_intent("自拍") is True
+    assert detect_bot_self_image_intent("发张自拍") is True
+    assert detect_bot_self_image_intent("镜子里来一张") is True
+    assert detect_bot_self_image_intent("肖像照") is True
+    assert detect_bot_self_image_intent("来张立绘") is True
+    assert detect_bot_self_image_intent("生活照") is True
+
+
+def test_bot_self_image_intent_implicit_see_bot_match() -> None:
+    """隐式"想看 bot 本人"表达 → True"""
+    assert detect_bot_self_image_intent("看看你今天穿了什么") is True
+    assert detect_bot_self_image_intent("你长什么样") is True
+    assert detect_bot_self_image_intent("看看黑丝") is True
+    assert detect_bot_self_image_intent("你的腿") is True
+    assert detect_bot_self_image_intent("拍给我看") is True
+
+
+def test_bot_self_image_intent_named_character_does_not_match() -> None:
+    """回归测试：用户指定二次元角色的请求不应触发 bot 自拍后处理。
+
+    /nai 中野二乃，展示身材 等点名二创角色的请求，必须返回 False，
+    否则 _process_selfie_prompt 会把 bot 默认外貌叠加进去，把角色洗成 bot 自己。
+    """
+    assert detect_bot_self_image_intent("中野二乃，展示身材") is False
+    assert detect_bot_self_image_intent("画一张初音未来") is False
+    assert detect_bot_self_image_intent("蕾姆，女仆装") is False
+    assert detect_bot_self_image_intent("芙兰朵露，红裙") is False
+
+
+def test_bot_self_image_intent_neutral_descriptions_do_not_match() -> None:
+    """场景/物品/原创人物描述不应命中。"""
+    assert detect_bot_self_image_intent("一只猫躺在窗台") is False
+    assert detect_bot_self_image_intent("赛博朋克城市夜景") is False
+    assert detect_bot_self_image_intent("一个女孩在雨中") is False
+    assert detect_bot_self_image_intent("") is False
