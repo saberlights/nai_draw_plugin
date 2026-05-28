@@ -41,8 +41,6 @@ def test_build_inner_draw_params_uses_integer_array_size_and_omits_random_seed()
             "seed": -1,
             "quality_toggle": True,
             "auto_smea": True,
-            "sm": True,
-            "sm_dyn": False,
             "variety_boost": True,
             "image_format": "webp",
         },
@@ -53,11 +51,61 @@ def test_build_inner_draw_params_uses_integer_array_size_and_omits_random_seed()
     assert "seed" not in inner
     assert inner["qualityToggle"] is True
     assert inner["autoSmea"] is True
-    assert inner["sm"] is True
-    assert inner["sm_dyn"] is False
+    # 文档 §5 表外的 sm/sm_dyn 字段已不再透传，避免触发网关 400
+    assert "sm" not in inner
+    assert "sm_dyn" not in inner
     assert inner["variety_boost"] is True
     assert inner["image_format"] == "webp"
     assert "model" not in inner
+
+
+def test_build_inner_draw_params_normalizes_image_format_whitelist() -> None:
+    """非 png/webp 的 image_format 会被回退到 png，避免触发 NewAPI 400。"""
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-4-5-full", "image_format": "jpeg"},
+        None,
+    )
+    assert inner["image_format"] == "png"
+
+
+def test_build_inner_draw_params_emits_cfg_rescale_and_noise_schedule() -> None:
+    """cfg_rescale / noise_schedule 在合法范围内时写入 inner JSON。"""
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {
+            "default_model": "nai-diffusion-4-5-full",
+            "cfg_rescale": 0.5,
+            "noise_schedule": "karras",
+        },
+        None,
+    )
+    assert inner["cfg_rescale"] == 0.5
+    assert inner["noise_schedule"] == "karras"
+
+
+def test_build_inner_draw_params_skips_blank_cfg_rescale_and_invalid_noise_schedule() -> None:
+    """cfg_rescale=0 与非法 noise_schedule 应被丢弃，不污染 inner JSON。"""
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {
+            "default_model": "nai-diffusion-4-5-full",
+            "cfg_rescale": 0.0,
+            "noise_schedule": "invalid_value",
+        },
+        None,
+    )
+    assert "cfg_rescale" not in inner
+    assert "noise_schedule" not in inner
+
+
+def test_build_inner_draw_params_clamps_cfg_rescale_above_one() -> None:
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-4-5-full", "cfg_rescale": 2.5},
+        None,
+    )
+    assert inner["cfg_rescale"] == 1.0
 
 
 def test_build_request_body_keeps_model_only_in_outer_body() -> None:
@@ -208,3 +256,70 @@ def test_validate_inner_payload_rejects_empty_character_prompt() -> None:
     reason = NaiWebClient._validate_inner_payload("nai-diffusion-4-5-full", inner)
     assert reason is not None
     assert "prompt" in reason
+
+
+def _make_valid_inner(**overrides: object) -> dict:
+    inner = {
+        "prompt": "1girl",
+        "negative_prompt": "",
+        "size": [832, 1216],
+        "steps": 23,
+        "scale": 5.0,
+        "sampler": "k_euler_ancestral",
+        "n_samples": 1,
+        "image_format": "png",
+    }
+    inner.update(overrides)
+    return inner
+
+
+def test_validate_inner_payload_rejects_steps_over_max() -> None:
+    """文档 §5：steps 最大 28，超过直接 400。"""
+    reason = NaiWebClient._validate_inner_payload(
+        "nai-diffusion-4-5-full", _make_valid_inner(steps=29)
+    )
+    assert reason is not None
+    assert "steps" in reason
+
+
+def test_validate_inner_payload_rejects_zero_or_negative_steps() -> None:
+    reason = NaiWebClient._validate_inner_payload(
+        "nai-diffusion-4-5-full", _make_valid_inner(steps=0)
+    )
+    assert reason is not None
+    assert "steps" in reason
+
+
+def test_validate_inner_payload_rejects_unknown_image_format() -> None:
+    """文档 §11：image_format 仅允许 png/webp。"""
+    reason = NaiWebClient._validate_inner_payload(
+        "nai-diffusion-4-5-full", _make_valid_inner(image_format="jpeg")
+    )
+    assert reason is not None
+    assert "image_format" in reason
+
+
+def test_validate_inner_payload_rejects_invalid_noise_schedule() -> None:
+    reason = NaiWebClient._validate_inner_payload(
+        "nai-diffusion-4-5-full",
+        _make_valid_inner(noise_schedule="not_a_schedule"),
+    )
+    assert reason is not None
+    assert "noise_schedule" in reason
+
+
+def test_validate_inner_payload_rejects_cfg_rescale_out_of_range() -> None:
+    reason = NaiWebClient._validate_inner_payload(
+        "nai-diffusion-4-5-full", _make_valid_inner(cfg_rescale=1.5)
+    )
+    assert reason is not None
+    assert "cfg_rescale" in reason
+
+
+def test_validate_inner_payload_accepts_steps_at_max_and_valid_noise_schedule() -> None:
+    """steps=28（边界）+ 合法 noise_schedule 应当通过。"""
+    reason = NaiWebClient._validate_inner_payload(
+        "nai-diffusion-4-5-full",
+        _make_valid_inner(steps=28, noise_schedule="karras", cfg_rescale=0.7),
+    )
+    assert reason is None

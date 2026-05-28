@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.7.0",
+  "version": "1.8.0",
   "name": "NAI NewAPI 网关图片生成插件（nai_draw_plugin）",
   "description": "与 nai_pic_plugin 共享同一套业务逻辑（命令、提示词生成、撤回、管理员、检索），底层请求走 NewAPI 兼容 OpenAI 协议（POST /v1/chat/completions）。",
   "author": {

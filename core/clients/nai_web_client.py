@@ -18,6 +18,18 @@ _MAX_SIZE_PORTRAIT: Tuple[int, int] = (832, 1216)
 _MAX_SIZE_LANDSCAPE: Tuple[int, int] = (1216, 832)
 _MAX_SIZE_SQUARE: Tuple[int, int] = (1024, 1024)
 
+# 文档 §5 steps 硬上限：超出会被网关直接 400
+_MAX_STEPS: int = 28
+
+# 文档 §11 image_format 白名单：其他值会被网关直接 400
+_ALLOWED_IMAGE_FORMATS: frozenset = frozenset({"png", "webp"})
+
+# 文档 §9 noise_schedule 枚举
+_ALLOWED_NOISE_SCHEDULES: frozenset = frozenset({"karras", "exponential", "polyexponential"})
+
+# NewAPI 绘图请求只能走 OpenAI 兼容的 chat/completions 端点（文档 §3）
+_NAI_CHAT_ENDPOINT: str = "/v1/chat/completions"
+
 # 网关临时故障的可重试状态码（§15）
 _RETRYABLE_STATUS_CODES: frozenset = frozenset({429, 500, 502, 503, 504})
 
@@ -223,7 +235,7 @@ class NaiWebClient:
             "scale": float(model_config.get("guidance_scale", 5.0)),
             "sampler": str(model_config.get("sampler") or "k_euler_ancestral"),
             "n_samples": 1,
-            "image_format": str(model_config.get("image_format", "png")),
+            "image_format": cls._resolve_image_format(model_config.get("image_format")),
         }
         if seed_int >= 0:
             inner["seed"] = seed_int
@@ -235,23 +247,28 @@ class NaiWebClient:
             inner["use_coords"] = all(bool(item.get("position")) for item in normalized_characters)
             inner["use_order"] = True
 
-        # 质量增强参数（文档 §5 表外，透传由 NewAPI 决定是否吃下）
+        # 质量增强参数（NovelAI 原生开关，透传给上游解释；NewAPI 网关在 §5 表外，
+        # 但已知会向下游 NovelAI 透传，保留以保持画质行为一致）
         if bool(model_config.get("quality_toggle", True)):
             inner["qualityToggle"] = True
-
-        # SMEA 系列参数（同上，透传给上游 NovelAI 决定）
         if bool(model_config.get("auto_smea", False)):
             inner["autoSmea"] = True
-        if "sm" in model_config and model_config["sm"] not in (None, ""):
-            inner["sm"] = bool(model_config["sm"])
-        if "sm_dyn" in model_config and model_config["sm_dyn"] not in (None, ""):
-            inner["sm_dyn"] = bool(model_config["sm_dyn"])
 
-        # 多样性增强（透传到上游 NovelAI，文档 §5 表外字段）
+        # 多样性增强（文档 §5）
         if bool(model_config.get("variety_boost", False)):
             inner["variety_boost"] = True
 
-        # nai_extra_params 透传（用户在 config.toml 显式声明的扩展字段）
+        # cfg_rescale（文档 §5，Prompt Guidance Rescale，0~1）
+        cfg_rescale = cls._resolve_cfg_rescale(model_config.get("cfg_rescale"))
+        if cfg_rescale is not None:
+            inner["cfg_rescale"] = cfg_rescale
+
+        # noise_schedule（文档 §5/§9，枚举：karras / exponential / polyexponential）
+        noise_schedule = cls._resolve_noise_schedule(model_config.get("noise_schedule"))
+        if noise_schedule:
+            inner["noise_schedule"] = noise_schedule
+
+        # nai_extra_params 透传（用户在 config.toml 显式声明的扩展字段，含 §5 表外字段时由 NewAPI 自行决定）
         extra_params = model_config.get("nai_extra_params") or {}
         if isinstance(extra_params, dict):
             for key, value in extra_params.items():
@@ -259,6 +276,50 @@ class NaiWebClient:
                     inner[key] = value
 
         return inner
+
+    @staticmethod
+    def _resolve_image_format(raw: Any) -> str:
+        """把 image_format 归一为 png/webp，非法值 fallback 到 png。"""
+        text = str(raw or "png").strip().lower()
+        if text in _ALLOWED_IMAGE_FORMATS:
+            return text
+        logger.warning(
+            f"(NewAPI) 非法 image_format {raw!r}，仅支持 png/webp，已回退到 png"
+        )
+        return "png"
+
+    @staticmethod
+    def _resolve_cfg_rescale(raw: Any) -> Optional[float]:
+        """归一 cfg_rescale：留空/0 视为不发送；超界 clamp 到 [0, 1] 并 warn。"""
+        if raw in (None, "", False):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(f"(NewAPI) 非法 cfg_rescale {raw!r}，已忽略")
+            return None
+        if value <= 0:
+            return None
+        if value > 1:
+            logger.warning(f"(NewAPI) cfg_rescale={value} 超过 1，已 clamp 到 1.0")
+            return 1.0
+        return value
+
+    @staticmethod
+    def _resolve_noise_schedule(raw: Any) -> Optional[str]:
+        """归一 noise_schedule：仅接受枚举值，非法值 warn 并丢弃。"""
+        if raw in (None, ""):
+            return None
+        text = str(raw).strip().lower()
+        if not text:
+            return None
+        if text in _ALLOWED_NOISE_SCHEDULES:
+            return text
+        logger.warning(
+            f"(NewAPI) 非法 noise_schedule {raw!r}，仅支持 "
+            f"{sorted(_ALLOWED_NOISE_SCHEDULES)}，已忽略"
+        )
+        return None
 
     @staticmethod
     def _normalize_characters_for_inner(
@@ -349,10 +410,6 @@ class NaiWebClient:
         if not prompt:
             return "prompt 为空，无法发起绘图请求"
 
-        normalized_model_name = str(model_name or "").strip()
-        if "inpainting" in normalized_model_name.lower():
-            return f"NewAPI 当前不支持 inpainting 模型：{normalized_model_name}"
-
         size_value = inner.get("size")
         if not (
             isinstance(size_value, list)
@@ -374,6 +431,29 @@ class NaiWebClient:
         else:
             if width > _MAX_SIZE_LANDSCAPE[0] or height > _MAX_SIZE_LANDSCAPE[1]:
                 return f"横图最大尺寸为 {_MAX_SIZE_LANDSCAPE}，当前收到 {size_value!r}"
+
+        steps_value = inner.get("steps")
+        if not isinstance(steps_value, int) or steps_value < 1 or steps_value > _MAX_STEPS:
+            return f"steps 必须是 1~{_MAX_STEPS} 的整数，当前收到 {steps_value!r}"
+
+        image_format = inner.get("image_format")
+        if image_format not in _ALLOWED_IMAGE_FORMATS:
+            return (
+                f"image_format 只允许 {sorted(_ALLOWED_IMAGE_FORMATS)}，"
+                f"当前收到 {image_format!r}"
+            )
+
+        noise_schedule = inner.get("noise_schedule")
+        if noise_schedule is not None and noise_schedule not in _ALLOWED_NOISE_SCHEDULES:
+            return (
+                f"noise_schedule 只允许 {sorted(_ALLOWED_NOISE_SCHEDULES)}，"
+                f"当前收到 {noise_schedule!r}"
+            )
+
+        cfg_rescale = inner.get("cfg_rescale")
+        if cfg_rescale is not None:
+            if not isinstance(cfg_rescale, (int, float)) or cfg_rescale < 0 or cfg_rescale > 1:
+                return f"cfg_rescale 必须是 0~1 的数值，当前收到 {cfg_rescale!r}"
 
         if int(inner.get("n_samples", 1)) != 1:
             return f"NewAPI 当前只允许 n_samples=1，配置中收到 {inner.get('n_samples')}"
@@ -461,17 +541,8 @@ class NaiWebClient:
             if not base_url:
                 return False, "base_url 未配置"
 
-            endpoint = str(model_config.get("nai_endpoint") or "/v1/chat/completions").strip()
-            if not endpoint.startswith("/"):
-                endpoint = f"/{endpoint}"
-            # NewAPI 协议强制走 chat/completions
-            if not endpoint.lower().endswith("/chat/completions"):
-                logger.warning(
-                    f"{self.log_prefix} (NewAPI) nai_endpoint={endpoint} 不是 chat/completions，"
-                    "已强制覆盖为 /v1/chat/completions"
-                )
-                endpoint = "/v1/chat/completions"
-            url = f"{base_url}{endpoint}"
+            # NewAPI 文档 §3 强制 chat/completions 端点，不再读 nai_endpoint 配置
+            url = f"{base_url}{_NAI_CHAT_ENDPOINT}"
 
             model_name = self._resolve_model_name(model_config)
             effective_characters = self._filter_characters_for_model(

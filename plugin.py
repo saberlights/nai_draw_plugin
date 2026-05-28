@@ -228,7 +228,7 @@ class NaiPicPlugin(MaiBotPlugin):
 
     # 插件基本信息
     plugin_name = "nai_draw_plugin"
-    plugin_version = "1.7.0"
+    plugin_version = "1.8.0"
     plugin_author = "saberlight"
     enable_plugin = True
     dependencies: List[str] = []
@@ -325,7 +325,7 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.5.0",
+                default="1.6.0",
                 description="插件配置版本号"
             ),
             "enabled": ConfigField(
@@ -368,11 +368,6 @@ class NaiPicPlugin(MaiBotPlugin):
                 type=str,
                 default="nai-diffusion-4-5-full",
                 description="当前默认使用的生图模型（从 available_models 中选择）"
-            ),
-            "nai_endpoint": ConfigField(
-                type=str,
-                default="/v1/chat/completions",
-                description="生图端点路径（NewAPI 走 OpenAI 兼容 chat/completions）"
             ),
             "nai_request_timeout": ConfigField(
                 type=float,
@@ -448,6 +443,16 @@ class NaiPicPlugin(MaiBotPlugin):
                 type=bool,
                 default=False,
                 description="作用同 model_nai4_5.variety_boost"
+            ),
+            "cfg_rescale": ConfigField(
+                type=float,
+                default=0.0,
+                description="作用同 model_nai4_5.cfg_rescale"
+            ),
+            "noise_schedule": ConfigField(
+                type=str,
+                default="",
+                description="作用同 model_nai4_5.noise_schedule"
             ),
             "image_format": ConfigField(
                 type=str,
@@ -544,6 +549,16 @@ class NaiPicPlugin(MaiBotPlugin):
                 default=False,
                 description="作用同 model_nai4_5.variety_boost"
             ),
+            "cfg_rescale": ConfigField(
+                type=float,
+                default=0.0,
+                description="作用同 model_nai4_5.cfg_rescale"
+            ),
+            "noise_schedule": ConfigField(
+                type=str,
+                default="",
+                description="作用同 model_nai4_5.noise_schedule"
+            ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
@@ -627,22 +642,32 @@ class NaiPicPlugin(MaiBotPlugin):
             "quality_toggle": ConfigField(
                 type=bool,
                 default=True,
-                description="更高质量路径；透传为 inner.qualityToggle，可能更慢、也更容易影响点数"
+                description="质量增强：开启后追加 NovelAI 的 quality 通路；可填 true/false"
             ),
             "auto_smea": ConfigField(
                 type=bool,
                 default=False,
-                description="底层 SMEA 类增强；透传为 inner.autoSmea"
+                description="底层 SMEA 类增强；可填 true/false"
             ),
             "variety_boost": ConfigField(
                 type=bool,
                 default=False,
-                description="多样性增强；开启后画面构图/姿势更随机，适合避免反复同一构图（透传到 inner.variety_boost）"
+                description="多样性增强（NewAPI §5 variety_boost）；可填 true/false；开启后画面构图/姿势更随机"
+            ),
+            "cfg_rescale": ConfigField(
+                type=float,
+                default=0.0,
+                description="Prompt Guidance Rescale（NewAPI §5 cfg_rescale）；可填 0~1 的数；0 或留空表示不发送让网关用默认；典型值 0.5"
+            ),
+            "noise_schedule": ConfigField(
+                type=str,
+                default="",
+                description="噪声调度算法（NewAPI §5/§9 noise_schedule）；可填 karras / exponential / polyexponential；留空表示不发送让网关用默认"
             ),
             "image_format": ConfigField(
                 type=str,
                 default="png",
-                description="返回图片格式：png / webp"
+                description="返回图片格式；可填 png / webp"
             ),
             "default_size": ConfigField(
                 type=str,
