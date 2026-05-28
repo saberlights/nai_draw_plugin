@@ -1375,7 +1375,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.command.before_execute",
         name="nai_draw_plugin_retag_command_message_cache",
-        description="在 /nai 反推 执行前缓存当前命令消息（保留 reply 信息）",
+        description="在 /nai 反推 / /nai i2i / /nai ref 执行前缓存当前命令消息（保留 reply 信息）",
         order=HookOrder.EARLY,
     )
     async def handle_retag_command_before_execute(
@@ -1384,9 +1384,13 @@ class NaiPicPlugin(MaiBotPlugin):
         command_name: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """仅在 /nai 反推 命令触发前生效，其它命令直接放行。"""
+        """仅在需要引用图的命令触发前生效，其它命令直接放行。"""
         del kwargs
-        if command_name == "nai_retag_command" and isinstance(message, dict):
+        if command_name in {
+            "nai_retag_command",
+            "nai_i2i_command",
+            "nai_ref_command",
+        } and isinstance(message, dict):
             self._image_cache_service.remember_command_message(message)
         return {"action": "continue"}
 
@@ -1776,7 +1780,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_draw",
         description="使用自然语言描述生成图片",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|i2i\b|ref\b|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,
@@ -1885,6 +1889,93 @@ class NaiPicPlugin(MaiBotPlugin):
             matched_groups=matched_groups,
         )
         return await invocation.handle_models_command()
+
+    @Command(
+        "nai_i2i_command",
+        description="图生图：/nai i2i <描述>（需引用一张图）",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+i2i\s+(?P<description>[\s\S]+)$",
+    )
+    async def handle_nai_i2i_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai i2i <描述>`：取引用图执行 NewAPI §20.1 i2i 图生图。"""
+        del kwargs
+        return await self._run_image_to_image_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            mode="i2i",
+        )
+
+    @Command(
+        "nai_ref_command",
+        description="角色参考：/nai ref <描述>（需引用一张图，仅 V4.5 模型支持）",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+ref\s+(?P<description>[\s\S]+)$",
+    )
+    async def handle_nai_ref_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai ref <描述>`：取引用图执行 NewAPI §20.4 character_references。"""
+        del kwargs
+        return await self._run_image_to_image_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            mode="ref",
+        )
+
+    async def _run_image_to_image_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        mode: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai i2i / /nai ref 共享：先解析引用图，再背后投递图生图任务。"""
+        description = str((matched_groups or {}).get("description", "") or "").strip()
+        image_base64 = self._image_cache_service.resolve_image_base64(
+            stream_id=stream_id,
+            user_id=user_id,
+        )
+        if not image_base64:
+            await self.ctx.send.text(
+                "❌ 未找到参考图\n请引用回复一张图后再发送 /nai i2i / /nai ref，或在同一条消息内附图加命令",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "未找到图片", True
+
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        if not await invocation.ensure_generation_permission():
+            return False, "没有权限", True
+
+        if not await self._start_command_image_generation(
+            stream_id,
+            lambda: invocation.handle_image_to_image_draw(
+                description, image_base64=image_base64, mode=mode
+            ),
+        ):
+            return False, "", True
+        return True, "已开始生成图片", True
 
     @Action(
         "nai_web_draw",

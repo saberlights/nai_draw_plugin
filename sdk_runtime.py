@@ -62,6 +62,10 @@ from .core.services.session_state import session_state
 from .core.services.tag_candidate_resolver import resolve_tag_candidates
 from .core.services.user_blacklist import user_blacklist
 from .core.utils.display_message_helper import build_action_image_display_message
+from .core.utils.image_meta import (
+    normalize_image_base64 as _normalize_image_for_payload,
+    read_image_dimensions as _read_image_dimensions,
+)
 from .core.utils.prompt_output_parser import (
     parse_prompt_from_structured_output,
     resolve_multi_character_payload,
@@ -1866,6 +1870,131 @@ class NaiInvocation(ModelConfigMixin):
             return send_result
         except Exception as exc:
             logger.error("%s /nai 命令执行异常: %r", self.log_prefix, exc, exc_info=True)
+            await self.send_text(f"执行失败：{str(exc)[:100]}")
+            return False, f"执行失败: {exc}", True
+
+    async def handle_image_to_image_draw(
+        self,
+        description: str,
+        *,
+        image_base64: str,
+        mode: str,
+        strength: Optional[float] = None,
+        fidelity: Optional[float] = None,
+        type_value: Optional[str] = None,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai i2i` 与 `/nai ref` 共享的图生图流程。
+
+        Args:
+            mode: "i2i" 走文档 §20.1 图生图；"ref" 走文档 §20.4 角色参考。
+            strength: i2i / ref 的整体强度；缺省让网关用默认值。
+            fidelity: ref 专属，主参考强度。
+            type_value: ref 专属，``character`` / ``style`` / ``character&style``。
+        """
+        if mode not in {"i2i", "ref"}:
+            await self.send_text(f"❌ 不支持的图生图模式：{mode!r}")
+            return False, f"模式不支持: {mode}", True
+
+        try:
+            if not await self.ensure_generation_permission():
+                return False, "没有权限", True
+
+            description = str(description or "").strip()
+            if not description:
+                example = "/nai i2i 改成森林背景" if mode == "i2i" else "/nai ref 站在街道，看向镜头"
+                await self.send_text(f"请输入你想画的内容，例如：{example}")
+                return False, "未提供描述", True
+
+            normalized_image = _normalize_image_for_payload(image_base64)
+            if not normalized_image:
+                await self.send_text("❌ 未能解析参考图，请引用回复一张图后再发命令")
+                return False, "未找到图片", True
+
+            llm_result = await self._generate_prompt_with_llm(
+                description,
+                allow_inherit=False,
+                include_custom_system_prompt=True,
+            )
+            if not llm_result:
+                await self.send_text("提示词生成失败，请稍后再试~")
+                return False, "提示词生成失败", True
+            generated_prompt, structured_payload = llm_result
+
+            if self.get_config("prompt_generator.enforce_tag_order", False):
+                generated_prompt = normalize_prompt_order(generated_prompt)
+                structured_payload = self._normalize_structured_order(structured_payload)
+
+            generated_prompt = self._sanitize_prompt_for_sfw_mode(generated_prompt)
+            structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
+
+            if self._is_prompt_show_enabled():
+                await self.send_text(
+                    f"📝 提示词:\n{self._sanitize_prompt_for_sfw_mode(generated_prompt)}",
+                    storage_message=False,
+                )
+
+            model_config = self._get_model_config(is_selfie=False)
+            if not model_config or not model_config.get("base_url"):
+                await self.send_text("NovelAI 配置错误，请检查配置文件")
+                return False, "配置错误", True
+
+            image_size: Any = model_config.get("nai_size") or model_config.get("default_size", "")
+            i2i_payload: Optional[dict[str, Any]] = None
+            character_references_payload: Optional[list[dict[str, Any]]] = None
+
+            if mode == "i2i":
+                dims = _read_image_dimensions(normalized_image)
+                if dims is not None:
+                    width, height = dims
+                    if width % 64 != 0 or height % 64 != 0:
+                        await self.send_text(
+                            f"❌ 参考图尺寸 {width}x{height} 不是 64 的倍数，"
+                            "NewAPI i2i 要求宽高必须 64 整除；请先裁/缩到合规尺寸再发"
+                        )
+                        return False, "尺寸不合规", True
+                    # 文档 §20.1：i2i.image 宽高与外层 size 必须相等，所以以图为准
+                    image_size = [width, height]
+                i2i_payload = {"image": normalized_image}
+                if strength is not None:
+                    i2i_payload["strength"] = strength
+            else:
+                ref_entry: dict[str, Any] = {"image": normalized_image}
+                if type_value:
+                    ref_entry["type"] = type_value
+                if fidelity is not None:
+                    ref_entry["fidelity"] = fidelity
+                if strength is not None:
+                    ref_entry["strength"] = strength
+                character_references_payload = [ref_entry]
+
+            enable_debug = bool(self.get_config("components.enable_debug_info", False))
+            if enable_debug:
+                await self.send_text("正在生成图片，请稍候...")
+
+            request_prompt, request_characters = self._select_send_payload(
+                generated_prompt, structured_payload
+            )
+            success, result = await self.api_client.generate_image(
+                prompt=request_prompt,
+                model_config=model_config,
+                size=image_size,
+                characters=request_characters,
+                i2i_payload=i2i_payload,
+                character_references_payload=character_references_payload,
+            )
+
+            if not success:
+                await self.send_text(f"生成图片失败：{result}")
+                return False, f"生成失败: {result}", True
+
+            send_result = await self._send_image_result(result, description)
+            if send_result[0] and enable_debug:
+                await self.send_text("图片生成完成！")
+            return send_result
+        except Exception as exc:
+            logger.error(
+                "%s /nai %s 命令执行异常: %r", self.log_prefix, mode, exc, exc_info=True
+            )
             await self.send_text(f"执行失败：{str(exc)[:100]}")
             return False, f"执行失败: {exc}", True
 

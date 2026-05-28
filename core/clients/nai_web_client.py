@@ -10,6 +10,8 @@ from requests.exceptions import ProxyError
 
 from src.common.logger import get_logger
 
+from ..utils.image_meta import normalize_image_base64, read_image_dimensions
+
 logger = get_logger("nai_draw_plugin")
 
 
@@ -209,8 +211,12 @@ class NaiWebClient:
         model_config: Dict[str, Any],
         size: Optional[str],
         characters: Optional[List[Dict[str, Any]]] = None,
+        *,
+        i2i_payload: Optional[Dict[str, Any]] = None,
+        controlnet_payload: Optional[Dict[str, Any]] = None,
+        character_references_payload: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """组装 messages[0].content 内层 JSON（NewAPI 文档 §5 / §7）。
+        """组装 messages[0].content 内层 JSON（NewAPI 文档 §5 / §7 / §20）。
 
         Args:
             characters: 已规范化的多角色列表。每项含 ``prompt`` / ``negative_prompt`` / ``position``。
@@ -282,6 +288,19 @@ class NaiWebClient:
                 if value not in (None, ""):
                     inner[key] = value
 
+        # §20 图生图族字段：i2i / controlnet / character_references
+        normalized_i2i = cls._normalize_i2i_payload(i2i_payload)
+        if normalized_i2i is not None:
+            inner["i2i"] = normalized_i2i
+
+        normalized_controlnet = cls._normalize_controlnet_payload(controlnet_payload)
+        if normalized_controlnet is not None:
+            inner["controlnet"] = normalized_controlnet
+
+        normalized_char_refs = cls._normalize_character_references_payload(character_references_payload)
+        if normalized_char_refs:
+            inner["character_references"] = normalized_char_refs
+
         return inner
 
     @staticmethod
@@ -325,6 +344,104 @@ class NaiWebClient:
         logger.warning(
             f"(NewAPI) 非法 noise_schedule {raw!r}，仅支持 "
             f"{sorted(_ALLOWED_NOISE_SCHEDULES)}，已忽略"
+        )
+        return None
+
+    @staticmethod
+    def _normalize_i2i_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """整理 i2i payload；缺图直接返回 None。strength / noise / seed 缺省由网关使用默认值。"""
+        if not isinstance(payload, dict):
+            return None
+        image_raw = payload.get("image")
+        normalized_image = normalize_image_base64(image_raw if isinstance(image_raw, str) else "")
+        if not normalized_image:
+            return None
+        result: Dict[str, Any] = {"image": normalized_image}
+        for key in ("strength", "noise", "seed"):
+            if key in payload and payload[key] is not None:
+                result[key] = payload[key]
+        return result
+
+    @staticmethod
+    def _normalize_controlnet_payload(payload: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """整理 controlnet payload；images 缺失或全空时返回 None。
+
+        每张图保留两种二态：``{image, info_extracted, strength}`` 完整态，或 ``{cache_id, strength?}`` 缓存态。
+        无效条目（既没 image 也没 cache_id）会被剔除。
+        """
+        if not isinstance(payload, dict):
+            return None
+        raw_images = payload.get("images")
+        if not isinstance(raw_images, list) or not raw_images:
+            return None
+        cleaned_images: List[Dict[str, Any]] = []
+        for item in raw_images:
+            if not isinstance(item, dict):
+                continue
+            cache_id = str(item.get("cache_id") or "").strip()
+            if cache_id:
+                entry: Dict[str, Any] = {"cache_id": cache_id}
+                if item.get("strength") is not None:
+                    entry["strength"] = item["strength"]
+                cleaned_images.append(entry)
+                continue
+            image_raw = item.get("image")
+            normalized_image = normalize_image_base64(image_raw if isinstance(image_raw, str) else "")
+            if not normalized_image:
+                continue
+            entry = {"image": normalized_image}
+            for key in ("info_extracted", "strength"):
+                if key in item and item[key] is not None:
+                    entry[key] = item[key]
+            cleaned_images.append(entry)
+        if not cleaned_images:
+            return None
+        result: Dict[str, Any] = {"images": cleaned_images}
+        if payload.get("strength") is not None:
+            result["strength"] = payload["strength"]
+        return result
+
+    @staticmethod
+    def _normalize_character_references_payload(
+        payload: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """整理 character_references 列表；空/无图条目直接丢弃。文档 §20.4 最多 1 张，由调用方控制。"""
+        if not isinstance(payload, list):
+            return []
+        cleaned: List[Dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            image_raw = item.get("image")
+            normalized_image = normalize_image_base64(image_raw if isinstance(image_raw, str) else "")
+            if not normalized_image:
+                continue
+            entry: Dict[str, Any] = {"image": normalized_image}
+            type_value = item.get("type")
+            if isinstance(type_value, str) and type_value.strip():
+                entry["type"] = type_value.strip()
+            for key in ("fidelity", "strength"):
+                if key in item and item[key] is not None:
+                    entry[key] = item[key]
+            cleaned.append(entry)
+        return cleaned
+
+    @classmethod
+    def _filter_character_references_for_model(
+        cls,
+        model_name: str,
+        payload: Optional[List[Dict[str, Any]]],
+        log_prefix: str = "",
+    ) -> Optional[List[Dict[str, Any]]]:
+        """character_references 只对 V4.5 模型生效（文档 §20.4），其它模型自动降级。"""
+        if not payload:
+            return None
+        lowered = str(model_name or "").lower()
+        if "nai-diffusion-4-5" in lowered:
+            return payload
+        logger.warning(
+            f"{log_prefix} (NewAPI) 模型 {model_name!r} 不支持 character_references，"
+            f"已自动降级为单 prompt 路径，{len(payload)} 项参考图已忽略"
         )
         return None
 
@@ -406,8 +523,8 @@ class NaiWebClient:
         )
         return None
 
-    @staticmethod
-    def _validate_inner_payload(model_name: str, inner: Dict[str, Any]) -> Optional[str]:
+    @classmethod
+    def _validate_inner_payload(cls, model_name: str, inner: Dict[str, Any]) -> Optional[str]:
         """对内层参数做最关键的硬约束（参考 NewAPI 文档 §5 / §15）。
 
         返回非空字符串表示拒绝原因；返回 None 表示通过。
@@ -487,6 +604,102 @@ class NaiWebClient:
             if use_coords_value is not None and not isinstance(use_coords_value, bool):
                 return f"use_coords 必须是布尔值，当前收到 {use_coords_value!r}"
 
+        # §20 图生图族互斥与字段约束
+        return cls._validate_image_payloads(inner)
+
+    @classmethod
+    def _validate_image_payloads(cls, inner: Dict[str, Any]) -> Optional[str]:
+        """单独校验 §20 的 i2i / controlnet / character_references 三组字段。"""
+        size_value = inner.get("size")
+        if not (
+            isinstance(size_value, list)
+            and len(size_value) == 2
+            and all(isinstance(value, int) for value in size_value)
+        ):
+            # 上游 size 校验已发生，这里只是防御性提前返回
+            return None
+        outer_width, outer_height = size_value
+
+        i2i = inner.get("i2i")
+        if i2i is not None:
+            if not isinstance(i2i, dict) or not i2i.get("image"):
+                return f"i2i 必须包含非空 image 字段，当前收到 {i2i!r}"
+            strength = i2i.get("strength")
+            if strength is not None:
+                if not isinstance(strength, (int, float)) or strength < 0.01 or strength > 0.99:
+                    return f"i2i.strength 必须在 0.01~0.99 之间，当前收到 {strength!r}"
+            noise = i2i.get("noise")
+            if noise is not None:
+                if not isinstance(noise, (int, float)) or noise < 0.0 or noise > 0.99:
+                    return f"i2i.noise 必须在 0~0.99 之间，当前收到 {noise!r}"
+            # 文档 §20.1：i2i.image 宽高必须与外层 size 严格相等
+            dims = read_image_dimensions(i2i["image"])
+            if dims is not None and (dims[0] != outer_width or dims[1] != outer_height):
+                return (
+                    f"i2i.image 宽高 {dims} 与外层 size [{outer_width}, {outer_height}] 不一致，"
+                    "NewAPI 会直接 400；请把 nai_size 改成与原图相同的尺寸再发起请求"
+                )
+
+        controlnet = inner.get("controlnet")
+        character_references = inner.get("character_references")
+        if controlnet is not None and character_references:
+            return "controlnet 与 character_references 不能同时存在（文档 §20.5）"
+
+        if controlnet is not None:
+            if not isinstance(controlnet, dict):
+                return f"controlnet 必须是对象，当前收到 {controlnet!r}"
+            images = controlnet.get("images")
+            if not isinstance(images, list) or not images:
+                return f"controlnet.images 必须是非空数组，当前收到 {images!r}"
+            if len(images) > 4:
+                return f"controlnet.images 最多 4 张，当前收到 {len(images)} 张"
+            for index, item in enumerate(images):
+                if not isinstance(item, dict):
+                    return f"controlnet.images[{index}] 必须是对象"
+                has_image = bool(item.get("image"))
+                has_cache_id = bool(item.get("cache_id"))
+                if has_image and has_cache_id:
+                    return (
+                        f"controlnet.images[{index}] 不能同时提供 image 和 cache_id；"
+                        "文档 §20.3.1 要求二态严格互斥"
+                    )
+                if not has_image and not has_cache_id:
+                    return f"controlnet.images[{index}] 至少要提供 image 或 cache_id 之一"
+                strength = item.get("strength")
+                if strength is not None:
+                    if not isinstance(strength, (int, float)) or strength < 0.0 or strength > 1.0:
+                        return f"controlnet.images[{index}].strength 必须在 0~1 之间"
+                info_extracted = item.get("info_extracted")
+                if info_extracted is not None:
+                    if has_cache_id:
+                        return (
+                            f"controlnet.images[{index}] 处于 cache_id 复用态，"
+                            "不允许再传 info_extracted"
+                        )
+                    if not isinstance(info_extracted, (int, float)) or info_extracted < 0.01 or info_extracted > 1.0:
+                        return f"controlnet.images[{index}].info_extracted 必须在 0.01~1 之间"
+
+        if character_references:
+            if not isinstance(character_references, list):
+                return f"character_references 必须是数组，当前收到 {character_references!r}"
+            if len(character_references) > 1:
+                return f"character_references 最多 1 张（文档 §20.4），当前收到 {len(character_references)} 张"
+            for index, item in enumerate(character_references):
+                if not isinstance(item, dict) or not item.get("image"):
+                    return f"character_references[{index}] 必须包含非空 image 字段"
+                type_value = item.get("type")
+                if type_value is not None:
+                    if type_value not in ("character", "style", "character&style"):
+                        return (
+                            f"character_references[{index}].type 仅允许 "
+                            f"character / style / character&style，当前收到 {type_value!r}"
+                        )
+                for key in ("fidelity", "strength"):
+                    value = item.get(key)
+                    if value is not None:
+                        if not isinstance(value, (int, float)) or value < 0.0 or value > 1.0:
+                            return f"character_references[{index}].{key} 必须在 0~1 之间"
+
         return None
 
     @staticmethod
@@ -528,8 +741,11 @@ class NaiWebClient:
         prompt: str,
         model_config: Dict[str, Any],
         size: Optional[str] = None,
-        input_image_base64: Optional[str] = None,
         characters: Optional[List[Dict[str, Any]]] = None,
+        *,
+        i2i_payload: Optional[Dict[str, Any]] = None,
+        controlnet_payload: Optional[Dict[str, Any]] = None,
+        character_references_payload: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[bool, str]:
         """调用 NewAPI 兼容网关生成图片。
 
@@ -538,11 +754,14 @@ class NaiWebClient:
         Args:
             characters: 可选的多角色 payload，每项含 ``prompt`` / ``negative_prompt`` / ``position``。
                 仅当模型支持（nai-diffusion-4 系列）时生效；其它模型会自动降级为单字符串路径。
+            i2i_payload: 文档 §20.1 i2i 图生图 payload，含 ``image`` / ``strength`` / ``noise`` / ``seed``。
+                与 ``controlnet`` / ``character_references`` 不互斥，但与 inpaint 互斥（本插件不支持 inpaint）。
+            controlnet_payload: 文档 §20.3 Vibe Transfer payload，含 ``images``(最多 4 张)与可选整体 ``strength``。
+                与 ``character_references`` 互斥。每张可走 ``image+info_extracted`` 完整态或
+                ``cache_id`` 复用态，由调用方组装。
+            character_references_payload: 文档 §20.4 角色参考列表（最多 1 张），仅 V4.5 系列模型生效；
+                非 V4.5 模型自动降级为单字符串路径并打 warning。
         """
-        if input_image_base64:
-            logger.warning(f"{self.log_prefix} (NewAPI) 当前网关不支持图生图")
-            return False, "NewAPI 当前不支持图生图"
-
         try:
             base_url = str(model_config.get("base_url") or "").rstrip("/")
             if not base_url:
@@ -555,8 +774,17 @@ class NaiWebClient:
             effective_characters = self._filter_characters_for_model(
                 model_name, characters, log_prefix=self.log_prefix
             )
+            effective_char_refs = self._filter_character_references_for_model(
+                model_name, character_references_payload, log_prefix=self.log_prefix
+            )
             inner_params = self._build_inner_draw_params(
-                prompt, model_config, size, characters=effective_characters
+                prompt,
+                model_config,
+                size,
+                characters=effective_characters,
+                i2i_payload=i2i_payload,
+                controlnet_payload=controlnet_payload,
+                character_references_payload=effective_char_refs,
             )
             reject_reason = self._validate_inner_payload(model_name, inner_params)
             if reject_reason:
@@ -571,13 +799,21 @@ class NaiWebClient:
 
             size_value = inner_params.get("size")
             character_count = len(inner_params.get("characters") or [])
+            extra_modes: List[str] = []
+            if "i2i" in inner_params:
+                extra_modes.append("i2i")
+            if "controlnet" in inner_params:
+                extra_modes.append(f"controlnet({len(inner_params['controlnet'].get('images') or [])})")
+            if "character_references" in inner_params:
+                extra_modes.append(f"char_ref({len(inner_params['character_references'])})")
+            modes_text = ",".join(extra_modes) if extra_modes else "-"
             logger.info(
                 f"{self.log_prefix} (NewAPI) 请求URL: {url}, model={model_name}, "
                 f"size={size_value}, steps={inner_params['steps']}, "
                 f"scale={inner_params['scale']}, sampler={inner_params['sampler']}, "
                 f"seed={inner_params.get('seed')}, characters={character_count}, "
-                f"use_coords={inner_params.get('use_coords')}, max_tokens={max_tokens}, "
-                f"proxy={proxy_mode}, timeout={request_timeout:.1f}s"
+                f"use_coords={inner_params.get('use_coords')}, extra={modes_text}, "
+                f"max_tokens={max_tokens}, proxy={proxy_mode}, timeout={request_timeout:.1f}s"
             )
             logger.debug(
                 f"{self.log_prefix} (NewAPI) inner_params keys: "
