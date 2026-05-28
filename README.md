@@ -80,10 +80,12 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai vibe存 <名字>` | 把引用回复的图存入 vibe 图库（跨重启保留） |
 | `/nai vibe图库` | 列出 vibe 图库（★ 标记本会话默认选定） |
 | `/nai vibe删 <名字>` | 从 vibe 图库删一张 |
+| `/nai vibe清空` | 一键清空 vibe 图库 + 重置本会话选定（不可逆） |
 | `/nai vibe选 <名字1> [<名字2>...]` | 把本会话默认 vibe 设为 1~4 张（§20.3 `controlnet.images` 最多 4 张） |
 | `/nai vibe @<名字1> [@<名字2>...] <描述>` | 单次用指定 vibe 图（1~4 张，不动默认选定） |
 | `/nai vibe <描述>` | 用本会话默认 vibe 图生图（§20.3） |
-| `/nai ref存 / ref图库 / ref删 / ref选 / ref @<名字> / ref <描述>` | 角色参考族，结构与 vibe 对称但**仅 1 张**（§20.4 `character_references`，仅 V4.5 系列模型） |
+| `/nai0 vibe [@<名字...>] <英文 tags>` | 同 `/nai vibe` 但直接发英文 tags，**不过 LLM** |
+| `/nai ref存 / ref图库 / ref删 / ref清空 / ref选 / ref @<名字> / ref <描述>` 与 `/nai0 ref ...` | 角色参考族，结构与 vibe 对称但**仅 1 张**（§20.4 `character_references`，仅 V4.5 系列模型） |
 | `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
 | `/nai set [3/f3/4c/4/4.5c/4.5]` | 查看/切换模型 |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
@@ -349,7 +351,10 @@ Rabbit
 ### v1.9.0 (2026-05-28)
 - **Vibe / 角色参考改走命名图库**：先 `/nai vibe存 <名字>` 把图入库（按 `user_id` 隔离，跨群可用），再 `/nai vibe选 <名字1> [<名字2>...]` 设当前会话默认图；之后 `/nai vibe <描述>` 直接用默认图，或 `/nai vibe @<名字1> [@<名字2>...] <描述>` 单次指定。ref 命令族结构对称（仅 1 张）。
 - **Vibe 选定支持 1~4 张多图**（§20.3 `controlnet.images` 上限）：`vibe选` 与 `vibe @` 都可接多个名字空格分隔；store 层做硬上限校验（vibe 4 / ref 1），超量统一报错。selection.json 旧版单字符串形态自动升级为列表，无需手动迁移。
-- 新命令：`/nai vibe存` / `/nai vibe图库` / `/nai vibe删` / `/nai vibe选` + ref 同名 8 条
+- 新增一键清空：`/nai vibe清空` / `/nai ref清空` 删该用户该 scope 的全部图 + 重置该 (scope, user) 在所有 stream 上的选定。
+- 新增不过 LLM 版本：`/nai0 vibe [@<名字...>] <英文 tags>` 与 `/nai0 ref [@<名字...>] <英文 tags>`，对应 `/nai0` 的"直发英文 tags"习惯，仍走命名图库的选定/单次覆盖逻辑。
+- 修复 Action 链路把"画一张初音未来"误判 bot 自拍：`_compose_description_from_action_data` 不再丢 `description` 字段（之前 5 结构化字段非空就忽略，导致核心锚点"初音未来"被丢）；`handle_action` 的 `is_selfie` 改用 `detect_bot_self_image_intent(raw_description)`，跟 `/nai` 命令链路对齐，不再被 LLM 用作 framing 的 `portrait photo` / `full body portrait` 误命中。
+- 新命令：`/nai vibe存` / `/nai vibe图库` / `/nai vibe删` / `/nai vibe选` / `/nai vibe清空` + ref / nai0 对称 11 条
 - 命名图库走文件系统（`data/named_refs/users/<sha256>/(vibe|ref)/<名字>.<ext>`，原始字节，文件管理器可直接打开），选定状态用 `data/named_refs/selection.json` 跨重启保留
 - 单库容量默认 20 张 / 用户；命名规则：1~32 字符，汉字 + 英文字母 + 数字 + 下划线（禁路径符与 `@`）
 - 修复 `/nai i2i` 在引用回复图为缩略图（dims 解不出 / <256）时静默走默认 size 触发上游 400，改为立即拒绝并指引用户改走"同消息附图"

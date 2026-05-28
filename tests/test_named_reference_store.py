@@ -400,3 +400,52 @@ def test_legacy_string_selection_format_upgraded_on_read(tmp_path) -> None:
     # 重新拉一个实例读
     store2 = NamedReferenceStore(root)
     assert store2.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["角色A"]
+
+
+# ── 一键清空（clear_all） ────────────────────────────────────────────────
+
+
+def test_clear_all_removes_every_image_and_returns_count(tmp_path) -> None:
+    """clear_all 应删该 (scope, user) 下所有图，返回删除张数。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    for name in ["a", "b", "c"]:
+        store.save(scope=SCOPE_VIBE, user_id="u1", name=name, image_bytes=png)
+    assert store.clear_all(scope=SCOPE_VIBE, user_id="u1") == 3
+    assert store.list(scope=SCOPE_VIBE, user_id="u1") == []
+
+
+def test_clear_all_returns_zero_when_already_empty(tmp_path) -> None:
+    """空图库 / 目录不存在时 clear_all 应安全返回 0。"""
+    store = _make_store(tmp_path)
+    assert store.clear_all(scope=SCOPE_VIBE, user_id="ghost") == 0
+
+
+def test_clear_all_resets_selections_across_all_streams(tmp_path) -> None:
+    """清空时同一 (scope, user) 在所有 stream 上的选定都应被同步清掉。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    for name in ["a", "b"]:
+        store.save(scope=SCOPE_VIBE, user_id="u1", name=name, image_bytes=png)
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["a", "b"])
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2", names=["a"])
+    store.clear_all(scope=SCOPE_VIBE, user_id="u1")
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == []
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2") == []
+
+
+def test_clear_all_does_not_affect_other_user_or_scope(tmp_path) -> None:
+    """clear_all 隔离边界：只动当前 (scope, user)，不动其它 user 或其它 scope。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    store.save(scope=SCOPE_VIBE, user_id="alice", name="x", image_bytes=png)
+    store.save(scope=SCOPE_VIBE, user_id="bob", name="y", image_bytes=png)
+    store.save(scope=SCOPE_REF, user_id="alice", name="z", image_bytes=png)
+    store.set_selection(scope=SCOPE_VIBE, user_id="bob", stream_id="s1", names=["y"])
+
+    assert store.clear_all(scope=SCOPE_VIBE, user_id="alice") == 1
+    # 仅 alice 的 vibe 图被清；bob 的 vibe / alice 的 ref 不受影响
+    assert store.get(scope=SCOPE_VIBE, user_id="alice", name="x") is None
+    assert store.get(scope=SCOPE_VIBE, user_id="bob", name="y") is not None
+    assert store.get(scope=SCOPE_REF, user_id="alice", name="z") is not None
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="bob", stream_id="s1") == ["y"]

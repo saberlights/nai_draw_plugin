@@ -1820,7 +1820,8 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_0_draw",
         description="直接使用英文标签生成图片",
-        pattern=r"^(?:.*，说：\s*)?/nai0\s+(?P<tags>[\s\S]+)$",
+        # 排除 /nai0 vibe / /nai0 ref 子命令；与 /nai 主命令对齐用 CJK 边界覆盖
+        pattern=r"^(?:.*，说：\s*)?/nai0\s+(?!vibe(?:\b|[一-鿿])|ref(?:\b|[一-鿿]))(?P<tags>[\s\S]+)$",
     )
     async def handle_nai_0_draw(
         self,
@@ -1849,6 +1850,53 @@ class NaiPicPlugin(MaiBotPlugin):
         ):
             return False, "", True
         return True, "已开始生成图片", True
+
+    @Command(
+        "nai_0_vibe_command",
+        description="Vibe Transfer（直发英文 tags 不过 LLM）：/nai0 vibe [@<名字1> [@<名字2>...]] <英文 tags>",
+        # 与 /nai vibe 同结构：可选 @<名字>... 单次覆盖，否则用 /nai vibe选 的粘性选定；
+        # tags 直接当 prompt 送 NAI（跳过 LLM 翻译，对照 /nai0 的纯英文 tag 习惯）
+        pattern=r"^(?:.*，说：\s*)?/nai0\s+vibe\s+(?P<at_names>(?:@\S+\s+)*)(?P<tags>[\s\S]+)$",
+    )
+    async def handle_nai0_vibe_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_draw_raw_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    @Command(
+        "nai_0_ref_command",
+        description="角色参考（直发英文 tags 不过 LLM）：/nai0 ref [@<名字>] <英文 tags>",
+        # ref 固定 1 张参考图，pattern 与 vibe 对齐多 @ 段；store 层 set_selection 上限管 ≤1
+        pattern=r"^(?:.*，说：\s*)?/nai0\s+ref\s+(?P<at_names>(?:@\S+\s+)*)(?P<tags>[\s\S]+)$",
+    )
+    async def handle_nai0_ref_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_draw_raw_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="ref",
+        )
 
     @Command(
         "nai_prompt_show_command",
@@ -2066,6 +2114,28 @@ class NaiPicPlugin(MaiBotPlugin):
         )
 
     @Command(
+        "nai_vibe_clear_command",
+        description="一键清空 vibe 图库（当前用户）：/nai vibe清空",
+        pattern=r"^(?:.*?)/nai\s+vibe清空\s*$",
+    )
+    async def handle_nai_vibe_clear_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_clear_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    @Command(
         "nai_ref_save_command",
         description="把引用回复的图存入角色参考图库：/nai ref存 <名字>",
         pattern=r"^(?:.*?)/nai\s+ref存\s+(?P<name>\S+)\s*$",
@@ -2147,6 +2217,28 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         del kwargs
         return await self._run_named_reference_select_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="ref",
+        )
+
+    @Command(
+        "nai_ref_clear_command",
+        description="一键清空角色参考图库（当前用户）：/nai ref清空",
+        pattern=r"^(?:.*?)/nai\s+ref清空\s*$",
+    )
+    async def handle_nai_ref_clear_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_clear_command(
             stream_id=stream_id,
             group_id=group_id,
             user_id=user_id,
@@ -2331,6 +2423,65 @@ class NaiPicPlugin(MaiBotPlugin):
             matched_groups=matched_groups,
         )
         return await invocation.handle_named_reference_select(scope=scope, names=names)
+
+    async def _run_named_reference_clear_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai vibe清空 / /nai ref清空：一键清空当前用户该 scope 的全部图 + 选定。"""
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        return await invocation.handle_named_reference_clear_all(scope=scope)
+
+    async def _run_named_reference_draw_raw_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai0 vibe / /nai0 ref：用图库里的图 + 用户给的英文 tags，跳过 LLM 翻译。
+
+        与 /nai vibe / /nai ref 的区别仅在于 raw_prompt 透传 — description 同 raw_prompt
+        以满足下游空检查；store 层选定 / @<名字...> 单次覆盖、controlnet / character_references
+        组装等逻辑全部复用 handle_named_reference_draw 已有路径。
+        """
+        raw_tags = str((matched_groups or {}).get("tags", "") or "").strip()
+        at_names_str = str((matched_groups or {}).get("at_names", "") or "")
+        explicit_names_list = re.findall(r"@(\S+)", at_names_str)
+        explicit_names = explicit_names_list or None
+
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        if not await invocation.ensure_generation_permission():
+            return False, "没有权限", True
+
+        if not await self._start_command_image_generation(
+            stream_id,
+            lambda: invocation.handle_named_reference_draw(
+                scope=scope,
+                description=raw_tags,
+                explicit_names=explicit_names,
+                raw_prompt=raw_tags,
+            ),
+        ):
+            return False, "", True
+        return True, "已开始生成图片", True
 
     @Action(
         "nai_web_draw",

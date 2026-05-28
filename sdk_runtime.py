@@ -70,6 +70,10 @@ from .core.services.named_reference_store import (
     get_named_reference_store,
     max_selection_for_scope as _max_selection_for_scope,
 )
+from .core.utils.action_payload import (
+    STRUCTURED_DESCRIPTION_FIELDS,
+    compose_description_from_action_payload,
+)
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.help_renderer import HELP_FALLBACK_TEXT as _HELP_FALLBACK_TEXT
 from .core.utils.image_meta import (
@@ -1947,6 +1951,7 @@ class NaiInvocation(ModelConfigMixin):
         strength: Optional[float] = None,
         fidelity: Optional[float] = None,
         type_value: Optional[str] = None,
+        raw_prompt: Optional[str] = None,
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai i2i` 与 `/nai ref` 共享的图生图流程。
 
@@ -1955,6 +1960,7 @@ class NaiInvocation(ModelConfigMixin):
             strength: i2i / ref 的整体强度；缺省让网关用默认值。
             fidelity: ref 专属，主参考强度。
             type_value: ref 专属，``character`` / ``style`` / ``character&style``。
+            raw_prompt: 不为 None 时跳过 LLM 翻译，``/nai0 ref`` 路径使用。
         """
         if mode not in {"i2i", "ref"}:
             await self.send_text(f"❌ 不支持的图生图模式：{mode!r}")
@@ -1967,6 +1973,7 @@ class NaiInvocation(ModelConfigMixin):
             strength=strength,
             fidelity=fidelity,
             type_value=type_value,
+            raw_prompt=raw_prompt,
         )
 
     async def handle_nai_vibe_draw(
@@ -1976,11 +1983,14 @@ class NaiInvocation(ModelConfigMixin):
         image_base64_list: List[str],
         info_extracted: Optional[float] = None,
         strength: Optional[float] = None,
+        raw_prompt: Optional[str] = None,
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai vibe`：1~4 张 Vibe Transfer（文档 §20.3 / §20.3.2）。
 
         image_base64_list 支持 1~4 张参考图，全部命中本地 vibe cache 时整个请求
         免 1 anlas 流量附加费（§20.3.2）；部分命中只省命中那几张的编码成本。
+
+        raw_prompt 不为 None 时跳过 LLM 翻译，``/nai0 vibe`` 路径使用。
         """
         return await self._run_image_pipeline(
             description=description,
@@ -1989,6 +1999,7 @@ class NaiInvocation(ModelConfigMixin):
             mode="vibe",
             info_extracted=info_extracted,
             strength=strength,
+            raw_prompt=raw_prompt,
         )
 
     # ====== 命名图库 (vibe / ref 共用骨架) ======
@@ -2115,6 +2126,37 @@ class NaiInvocation(ModelConfigMixin):
         await self.send_text(f"🗑 已删除 {scope_label} 图库的 {name}")
         return True, "已删除", True
 
+    async def handle_named_reference_clear_all(
+        self,
+        *,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai (vibe|ref)清空`：一键删除当前用户该 scope 的全部图 + 选定。
+
+        语义是"清空我的整个 {scope} 图库"，跨 stream 生效（store 层不区分 stream，按
+        user_id 隔离）。返回实际删除的张数，便于用户确认。
+        """
+        scope_label = _scope_label(scope)
+        store = get_named_reference_store()
+        try:
+            deleted = store.clear_all(scope=scope, user_id=self.user_id)
+        except Exception as exc:
+            logger.error(
+                "%s /nai %s清空 执行异常: %r", self.log_prefix, scope, exc, exc_info=True
+            )
+            await self.send_text(f"❌ 清空 {scope_label} 图库失败：{str(exc)[:100]}")
+            return False, "清空失败", True
+
+        if deleted == 0:
+            await self.send_text(f"📂 {scope_label} 图库本来就是空的，没有可删除的图")
+            return True, "图库为空", True
+
+        await self.send_text(
+            f"🧹 已清空 {scope_label} 图库共 {deleted} 张图，"
+            f"本会话的 {scope_label} 选定也已重置；想用先 /nai {scope}存 <名字> 再来。"
+        )
+        return True, "已清空", True
+
     async def handle_named_reference_select(
         self,
         *,
@@ -2167,12 +2209,16 @@ class NaiInvocation(ModelConfigMixin):
         scope: str,
         description: str,
         explicit_names: Optional[List[str]] = None,
+        raw_prompt: Optional[str] = None,
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai vibe <描述>` 或 `/nai ref <描述>`（可选 @<名字> 单次覆盖）。
+        """处理 `/nai vibe <描述>` / `/nai ref <描述>` 与 `/nai0 vibe` / `/nai0 ref`。
 
         explicit_names 来自命令里的 ``@<名字> @<名字>...`` 单次指定（vibe 最多 4 张，
         ref 最多 1 张）；为空时回退到本会话的粘性选定列表。两者都没有则报错并指引
         用户如何入库 / 选定。
+
+        raw_prompt 不为 None 时跳过 LLM 翻译，直接用作 prompt（``/nai0`` 路径）；
+        description 仍作为请求文本沿用 sanity 检查（空时报错）。
         """
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
@@ -2238,11 +2284,16 @@ class NaiInvocation(ModelConfigMixin):
 
         if scope == _NAMED_SCOPE_VIBE:
             return await self.handle_nai_vibe_draw(
-                description, image_base64_list=images_base64
+                description,
+                image_base64_list=images_base64,
+                raw_prompt=raw_prompt,
             )
         # ref 固定 1 张：store 层 set_selection 已限制 ≤1，这里再兜底取第一张
         return await self.handle_image_to_image_draw(
-            description, image_base64=images_base64[0], mode="ref"
+            description,
+            image_base64=images_base64[0],
+            mode="ref",
+            raw_prompt=raw_prompt,
         )
 
     async def _run_image_pipeline(
@@ -2256,11 +2307,13 @@ class NaiInvocation(ModelConfigMixin):
         fidelity: Optional[float] = None,
         type_value: Optional[str] = None,
         info_extracted: Optional[float] = None,
+        raw_prompt: Optional[str] = None,
     ) -> tuple[bool, str | None, bool]:
         """共享 i2i / ref / vibe 三条命令的"取参考图 → LLM → 发请求"主干。
 
         - i2i / ref：用 image_base64 单图
         - vibe：用 vibe_images_base64 列表（1~4 张），逐张组装到 controlnet.images[]
+        - raw_prompt：不为 None 时跳过 LLM 翻译，直接当 prompt 用（``/nai0 vibe`` / ``/nai0 ref`` 路径）
         """
         try:
             if not await self.ensure_generation_permission():
@@ -2312,15 +2365,24 @@ class NaiInvocation(ModelConfigMixin):
                     len(n_img),
                 )
 
-            llm_result = await self._generate_prompt_with_llm(
-                description,
-                allow_inherit=False,
-                include_custom_system_prompt=True,
-            )
-            if not llm_result:
-                await self.send_text("提示词生成失败，请稍后再试~")
-                return False, "提示词生成失败", True
-            generated_prompt, structured_payload = llm_result
+            # /nai0 路径：raw_prompt 给定时跳过 LLM 翻译，直接当 prompt 用。
+            # raw_prompt 仍走 sanitize 链以剔除 CJK / SFW 违规，避免上游 §8 直接 400。
+            if raw_prompt is not None:
+                generated_prompt = str(raw_prompt or "").strip()
+                if not generated_prompt:
+                    await self.send_text("❌ /nai0 路径下英文 tags 不能为空")
+                    return False, "未提供 tags", True
+                structured_payload: Optional[Dict[str, Any]] = None
+            else:
+                llm_result = await self._generate_prompt_with_llm(
+                    description,
+                    allow_inherit=False,
+                    include_custom_system_prompt=True,
+                )
+                if not llm_result:
+                    await self.send_text("提示词生成失败，请稍后再试~")
+                    return False, "提示词生成失败", True
+                generated_prompt, structured_payload = llm_result
 
             if self.get_config("prompt_generator.enforce_tag_order", False):
                 generated_prompt = normalize_prompt_order(generated_prompt)
@@ -2472,29 +2534,17 @@ class NaiInvocation(ModelConfigMixin):
 
     # 结构化字段顺序固定为：主体视角 → 动作 → 情绪 → 场景增量 → 构图。
     # 这个顺序与 NAI tag 标准排序对齐，下游 prompt 模板里"tag 顺序"硬规则也基于此排序解析。
-    _STRUCTURED_DESCRIPTION_FIELDS = (
-        "subject_and_pov",
-        "action",
-        "emotion",
-        "scene_delta",
-        "framing",
-    )
+    # 实际取值与拼接逻辑见 core/utils/action_payload.py（提到独立模块方便单测）。
+    _STRUCTURED_DESCRIPTION_FIELDS = STRUCTURED_DESCRIPTION_FIELDS
 
     def _compose_description_from_action_data(self) -> str:
-        """把 Planner 拆分的 5 个结构化字段拼成单行 request 文本。
+        """把 Planner 拆分的 5 个结构化字段 + ``description`` 拼成单行 request 文本。
 
-        - 5 字段全空时回落到旧版 ``description`` 字段，保持对 Planner 偶发只填 description 的兼容。
-        - 拼接时各字段之间用空格连接，与原 description 关键词串风格保持一致。
-        - 任何一个字段非空都视为"走结构化路径"，此时忽略 description（防止 Planner 同时填 6 个字段导致重复）。
+        细节见 ``compose_description_from_action_payload``：``description`` 字段含**独有的
+        核心锚点**（角色名 / 服装款式 / 场景物件），不能因为结构化字段非空就丢——否则
+        会导致"画一张初音未来"丢失"初音未来"，下游 LLM 只能猜场景。
         """
-        structured_parts: list[str] = []
-        for key in self._STRUCTURED_DESCRIPTION_FIELDS:
-            value = str(self.action_data.get(key, "") or "").strip()
-            if value:
-                structured_parts.append(value)
-        if structured_parts:
-            return " ".join(structured_parts)
-        return str(self.action_data.get("description", "") or "").strip()
+        return compose_description_from_action_payload(self.action_data)
 
     async def handle_action(self) -> tuple[bool, str]:
         """处理 `nai_web_draw` Action。"""
@@ -2553,7 +2603,7 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text("提示词生成器开小差了，请直接告诉我想画什么，或者稍后再试一次~")
             return False, "图片描述为空"
 
-        is_selfie = detect_selfie_from_output(description)
+        is_selfie = detect_bot_self_image_intent(raw_description)
         selfie_base_prompt = description
         if is_selfie:
             description = self._process_selfie_prompt(

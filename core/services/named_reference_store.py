@@ -227,6 +227,35 @@ class NamedReferenceStore:
                 )
         return deleted
 
+    def clear_all(self, *, scope: str, user_id: str) -> int:
+        """删 (scope, user_id) 下的所有图 + 清掉该 (scope, user_id) 在所有 stream 上的选定。
+
+        语义是"一键清空当前用户在该图库的状态"，专给 /nai vibe清空 / /nai ref清空 用。
+        删除按 best-effort 推进：单张 unlink 失败不会回滚已成功的删除（文件系统级原子性靠
+        rename/unlink 自身保证；多张删一半失败时下次调用可继续清剩下的）。
+
+        Returns:
+            实际删除的图片张数；目录不存在或图库本来就空时返回 0。
+        """
+        self._validate_scope(scope)
+        scope_dir = self._scope_dir(scope, user_id)
+        deleted = 0
+        with self._lock:
+            if scope_dir.exists():
+                for path in self._list_files(scope_dir):
+                    try:
+                        path.unlink()
+                        deleted += 1
+                    except OSError:
+                        continue
+            # 整体清掉该 (scope, user) 在所有 stream 上的选定，跟 delete 的语义对齐
+            self._mutate_selection(
+                lambda data: self._drop_all_selections_for_user(
+                    data, scope=scope, user_id=user_id
+                )
+            )
+        return deleted
+
     # ── 公共：选定 ────────────────────────────────────────────────────────
 
     def set_selection(
@@ -526,6 +555,22 @@ class NamedReferenceStore:
                 user_bucket.pop(stream_id, None)
         if not user_bucket:
             scope_bucket.pop(user_dir_name, None)
+        if not scope_bucket:
+            data.pop(scope, None)
+
+    def _drop_all_selections_for_user(
+        self,
+        data: Dict,
+        *,
+        scope: str,
+        user_id: str,
+    ) -> None:
+        """清空该 (scope, user_id) 在所有 stream 上的选定，配合 clear_all 用。"""
+        user_dir_name = self._user_dir_name(user_id)
+        scope_bucket = data.get(scope)
+        if not isinstance(scope_bucket, dict):
+            return
+        scope_bucket.pop(user_dir_name, None)
         if not scope_bucket:
             data.pop(scope, None)
 

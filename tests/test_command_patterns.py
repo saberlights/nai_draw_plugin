@@ -100,10 +100,12 @@ def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
         "/nai vibe选 角色A",
         "/nai vibe选 角色A 角色B",  # 多名字选定
         "/nai vibe @角色A @角色B 描述",  # 多 @ 单次覆盖
+        "/nai vibe清空",  # 一键清空（CJK 子命令）
         "/nai ref存 角色A",
         "/nai ref图库",
         "/nai ref删 角色A",
         "/nai ref选 角色A",
+        "/nai ref清空",
     ]
     for sample in skip_samples:
         assert generic.match(sample) is None, f"通用 /nai 不应吞掉 {sample!r}"
@@ -208,3 +210,65 @@ def test_subcommand_patterns_tolerate_quote_reply_prefix() -> None:
         for prefix in prefixes:
             message = f"{prefix}{body}"
             assert regex.match(message) is not None, f"{cmd_name} 应匹配 {message!r}"
+
+
+def test_vibe_ref_clear_patterns_match_keyword_only() -> None:
+    """/nai vibe清空 / /nai ref清空 是纯关键字命令，不接参数。"""
+    patterns = _load_command_patterns()
+    for cmd_name, sample in [
+        ("nai_vibe_clear_command", "/nai vibe清空"),
+        ("nai_ref_clear_command", "/nai ref清空"),
+    ]:
+        regex = _compile(patterns[cmd_name])
+        assert regex.match(sample) is not None, f"{cmd_name} 应匹配 {sample!r}"
+    # 接了多余参数应不匹配（防止误吞）
+    assert _compile(patterns["nai_vibe_clear_command"]).match("/nai vibe清空 角色A") is None
+
+
+def test_nai0_vibe_ref_patterns_capture_tags_and_at_names() -> None:
+    """/nai0 vibe / /nai0 ref 走"不过 LLM 英文 tag"路径，支持 @<名字>... 单次覆盖。
+
+    pattern 与 /nai vibe / /nai ref 同结构，仅 tags 段直接当 prompt 而非 LLM 翻译。
+    """
+    patterns = _load_command_patterns()
+    cases = [
+        ("nai_0_vibe_command", "/nai0 vibe 1girl, blue sky", "", "1girl, blue sky"),
+        (
+            "nai_0_vibe_command",
+            "/nai0 vibe @角色A @角色B 1girl, looking at viewer",
+            "@角色A @角色B ",
+            "1girl, looking at viewer",
+        ),
+        ("nai_0_ref_command", "/nai0 ref 1girl, smile", "", "1girl, smile"),
+        (
+            "nai_0_ref_command",
+            "/nai0 ref @角色A 1girl, standing",
+            "@角色A ",
+            "1girl, standing",
+        ),
+    ]
+    for cmd_name, sample, expected_at, expected_tags in cases:
+        regex = _compile(patterns[cmd_name])
+        match = regex.match(sample)
+        assert match is not None, f"{cmd_name} 应匹配 {sample!r}"
+        assert match.group("at_names") == expected_at
+        assert match.group("tags") == expected_tags
+
+
+def test_generic_nai0_pattern_skips_vibe_and_ref_subcommands() -> None:
+    """通用 /nai0 命令的负向预查应跳过 /nai0 vibe / /nai0 ref，否则会把 ``vibe`` 当成 tag。
+
+    与 /nai 同结构：vibe / ref 后用 CJK 边界覆盖，避免 latin→CJK 边界让 ``\\b`` 不成立。
+    """
+    patterns = _load_command_patterns()
+    nai0 = _compile(patterns["nai_0_draw"])
+    skip_samples = [
+        "/nai0 vibe 1girl, blue sky",
+        "/nai0 vibe @角色A 1girl",
+        "/nai0 ref 1girl, smile",
+        "/nai0 ref @角色A 1girl",
+    ]
+    for sample in skip_samples:
+        assert nai0.match(sample) is None, f"通用 /nai0 不应吞掉 {sample!r}"
+    # 但正常 /nai0 <英文 tags> 仍需匹配
+    assert nai0.match("/nai0 1girl, hatsune miku, smile") is not None

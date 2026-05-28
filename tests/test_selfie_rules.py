@@ -7,6 +7,7 @@ from plugins.nai_draw_plugin.core.rules.selfie_rules import (
     detect_bot_self_image_intent,
     detect_explicit_image_request,
     detect_negative_image_intent,
+    detect_selfie_from_output,
     merge_selfie_prompt,
 )
 
@@ -129,3 +130,33 @@ def test_bot_self_image_intent_neutral_descriptions_do_not_match() -> None:
     assert detect_bot_self_image_intent("赛博朋克城市夜景") is False
     assert detect_bot_self_image_intent("一个女孩在雨中") is False
     assert detect_bot_self_image_intent("") is False
+
+
+def test_bot_self_image_intent_planner_composed_text_for_named_character() -> None:
+    """Action 链路真实样本：Planner 把"画一张初音未来"拆成 5 字段 + description，
+    compose_description_from_action_payload 拼出的整段不应命中 bot 自拍意图。
+
+    历史 bug：handle_action 之前用 detect_selfie_from_output(LLM 翻译后 prompt)
+    判 selfie，会被 LLM 用作 framing 的 portrait/full body portrait 误命中，把
+    用户点名的二次元角色洗成 bot 自拍。修复后改用 detect_bot_self_image_intent
+    判定 raw_description，本用例守护"初音未来 + 第三视角 + 特写"不会被误判。
+    """
+    raw_description = (
+        "一女, 初音未来, 公式服, 葱色双马尾, 精致的面容, 灵动的眼神, "
+        "背景为舞台, 特写 一女 第三视角 站立 俏皮 微笑 特写"
+    )
+    assert detect_bot_self_image_intent(raw_description) is False
+
+
+def test_selfie_from_output_misfires_on_framing_words_documented_behavior() -> None:
+    """文档化 detect_selfie_from_output 的已知误判：framing 词 ``portrait photo`` /
+    ``full body portrait`` 即使非 bot 自拍意图也会触发 True——这正是当前 Action 链路
+    不再依赖它判 selfie 的原因。
+
+    本用例仅锁定该行为，避免未来"治好它"再回归——真正的判定要走
+    detect_bot_self_image_intent(用户原话/raw_description) 这条治根路径。
+    """
+    # LLM 翻译"初音未来，全身像"时常输出含 full body portrait 的 framing
+    assert detect_selfie_from_output("1girl, hatsune miku, full body portrait, smile") is True
+    # 哪怕主体是命名二次元角色（非 bot），detect_selfie_from_output 仍会误命中
+    assert detect_selfie_from_output("1girl, nakano nino, portrait photo") is True
