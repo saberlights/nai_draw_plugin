@@ -320,36 +320,36 @@ class NaiPicPlugin(MaiBotPlugin):
             "name": ConfigField(
                 type=str,
                 default="nai_draw_plugin",
-                description="插件标识，通常不需要修改",
+                description="插件标识；可填任意字符串，通常不需要修改",
                 required=True
             ),
             "config_version": ConfigField(
                 type=str,
                 default="1.6.0",
-                description="插件配置版本号"
+                description="插件配置版本号；由插件自行维护，请勿手动修改"
             ),
             "enabled": ConfigField(
                 type=bool,
                 default=False,
-                description="是否启用插件"
+                description="是否启用插件；可填 true / false"
             )
         },
         "model": {
             "name": ConfigField(
                 type=str,
                 default="NovelAI NewAPI Gateway",
-                description="模型显示名称，仅用于展示"
+                description="网关显示名称；可填任意字符串，仅用于日志/展示"
             ),
             "base_url": ConfigField(
                 type=str,
                 default="https://api.tuercha.com",
-                description="NewAPI 兼容网关基础地址（必填，由服务提供方给出）",
+                description="NewAPI 兼容网关基础地址；可填 https://xxx 格式 URL，必填，由服务提供方给出",
                 required=True
             ),
             "api_key": ConfigField(
                 type=str,
                 default="",
-                description="NewAPI 鉴权密钥（OpenAI 风格 Bearer Token，由服务提供方给出）",
+                description="NewAPI 鉴权密钥；可填以 sk- 开头的 OpenAI 风格 Bearer Token，由服务提供方给出",
                 required=False
             ),
             "available_models": ConfigField(
@@ -362,27 +362,27 @@ class NaiPicPlugin(MaiBotPlugin):
                     "nai-diffusion-4-5-curated",
                     "nai-diffusion-4-5-full",
                 ],
-                description="可用的 NovelAI 模型列表"
+                description="可用模型列表；填字符串数组，每项需与服务方 /v1/models 返回的 id 一致，供 /nai set 切换"
             ),
             "default_model": ConfigField(
                 type=str,
                 default="nai-diffusion-4-5-full",
-                description="当前默认使用的生图模型（从 available_models 中选择）"
+                description="默认生图模型；可填 available_models 中任意一项，作为新会话的初始模型"
             ),
             "nai_request_timeout": ConfigField(
                 type=float,
                 default=600.0,
-                description="生图请求超时（秒）"
+                description="生图请求超时；单位秒，可填正数；建议 300~600 以容忍长尾排队"
             ),
             "nai_proxy_mode": ConfigField(
                 type=str,
                 default="auto",
-                description="代理模式：auto=先继承环境代理，失败时回退直连；inherit=始终继承；direct=始终直连"
+                description="代理模式；可填 auto / inherit / direct：auto=先继承环境代理，失败回退直连；inherit=始终继承；direct=始终直连"
             ),
             "nai_max_tokens": ConfigField(
                 type=int,
                 default=100000,
-                description="单次绘图允许消耗的 token 预算（1 Anlas = 10000 tokens，推荐 100000=10 Anlas，超出会被网关拒绝）"
+                description="单次绘图 token 预算；可填正整数，1 Anlas = 10000 tokens；常用 100000(=10 Anlas)，超出网关返回 400"
             ),
         },
         "model_nai3": {
@@ -602,57 +602,57 @@ class NaiPicPlugin(MaiBotPlugin):
                     {"name": "风格示例1", "prompt": "1.2::artist:example1::, 1.0::artist:example2::, 0.8::artist:example3::"},
                     {"name": "风格示例2", "prompt": "1.5::artist:example4::, 1.3::artist:example5::"}
                 ],
-                description="画师预设；每条可填 name / prompt 和可选的 negative_prompt_add（留空则继承本段的 negative_prompt_add）"
+                description="画师预设列表；每项含 name / prompt，可选 negative_prompt_add；通过 /nai art <名称或序号> 切换"
             ),
             "default_artist_preset": ConfigField(
                 type=str,
                 default="",
-                description="默认画师预设：可填名称，也可填序号；留空时使用第一个预设"
+                description="默认画师预设；可填预设名称或序号（从 1 开始），留空时使用第一个预设"
             ),
             "nai_artist_prompt": ConfigField(
                 type=str,
                 default="",
-                description="直接写死的画师串；只有不用 artist_presets 时才建议改这里"
+                description="直接写死的画师串；可填英文 prompt 片段，仅在不用 artist_presets 时设置"
             ),
             "nai_size": ConfigField(
                 type=str,
                 default="竖图",
-                description="图片尺寸：可填 竖图 / 横图 / 方图（v/h/s）或 832x1216 / 1216x832 / 1024x1024；请求会自动转换成 NewAPI 要求的 [宽,高] 整数数组"
+                description="图片尺寸；可填 竖图 / 横图 / 方图（或别名 v/h/s、portrait/landscape/square），也可直接写 832x1216 / 1216x832 / 1024x1024；请求时自动转成 [宽,高] 整数数组"
             ),
             "sampler": ConfigField(
                 type=str,
                 default="k_euler_ancestral",
-                description="采样器；当前仓库只确认 k_euler / k_euler_ancestral"
+                description="采样器；可填 k_euler / k_euler_ancestral / k_dpm_2 / k_dpm_2_ancestral / k_dpmpp_2m / k_dpmpp_2s_ancestral / k_dpmpp_sde / ddim；常用 k_euler_ancestral"
             ),
             "num_inference_steps": ConfigField(
                 type=int,
                 default=28,
-                description="去噪步数；越高一般细节越多，但也更慢、更容易加点数"
+                description="去噪步数；可填 1~28 的整数（NewAPI §5 上限）；越高细节越多但也更慢、更耗 anlas"
             ),
             "guidance_scale": ConfigField(
                 type=float,
                 default=5.0,
-                description="提示词跟随强度；越高越听 prompt，也越容易僵硬"
+                description="提示词跟随强度；可填正浮点数，常用 5.0；越高越听 prompt，也越容易僵硬"
             ),
             "seed": ConfigField(
                 type=int,
                 default=-1,
-                description="随机种子；填 -1 表示请求里省略 seed，由 NewAPI 随机"
+                description="随机种子；可填整数固定结果，填 -1 表示由 NewAPI 随机"
             ),
             "quality_toggle": ConfigField(
                 type=bool,
                 default=True,
-                description="质量增强：开启后追加 NovelAI 的 quality 通路；可填 true/false"
+                description="质量增强；可填 true / false；开启后追加 NovelAI 的 quality 通路"
             ),
             "auto_smea": ConfigField(
                 type=bool,
                 default=False,
-                description="底层 SMEA 类增强；可填 true/false"
+                description="底层 SMEA 类增强；可填 true / false"
             ),
             "variety_boost": ConfigField(
                 type=bool,
                 default=False,
-                description="多样性增强（NewAPI §5 variety_boost）；可填 true/false；开启后画面构图/姿势更随机"
+                description="多样性增强（NewAPI §5 variety_boost）；可填 true / false；开启后画面构图/姿势更随机"
             ),
             "cfg_rescale": ConfigField(
                 type=float,
@@ -672,144 +672,144 @@ class NaiPicPlugin(MaiBotPlugin):
             "default_size": ConfigField(
                 type=str,
                 default="832x1216",
-                description="当 nai_size 为空或无法解析时的兜底尺寸；建议保持 832x1216 / 1216x832 / 1024x1024"
+                description="兜底尺寸；当 nai_size 为空或无法解析时使用；可填 832x1216 / 1216x832 / 1024x1024"
             ),
             "custom_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="固定追加到正向提示词，影响整体画质词、风格词、通用修饰词"
+                description="固定追加到正向提示词；可填英文 prompt 片段；通常放质量词、风格词、通用修饰词"
             ),
             "negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="固定追加到负面提示词，主要用于压低坏手、多人乱入、水印等问题"
+                description="固定追加到负面提示词；可填英文 prompt 片段；用于压低坏手、多人乱入、水印等问题"
             ),
             "selfie_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="自拍模式额外正向外貌词"
+                description="自拍模式额外正向外貌词；可填英文 prompt 片段；命中 selfie 时拼到正向"
             ),
             "selfie_negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="自拍模式额外负向外貌词，会追加到 negative_prompt_add 后面"
+                description="自拍模式额外负向外貌词；可填英文 prompt 片段；命中 selfie 时拼在 negative_prompt_add 之前，优先级更高"
             ),
             "nai_extra_params": ConfigField(
                 type=dict,
                 default={},
-                description="额外透传到 NewAPI 内层 draw_params 的字段；文档 §5 之外的字段不保证识别，需按服务方说明使用"
+                description="额外透传到 NewAPI 内层 draw_params 的字段；可填 {key=value} 表；文档 §5 之外的字段不保证被识别，按服务方说明使用"
             )
         },
         "components": {
             "enable_debug_info": ConfigField(
                 type=bool,
                 default=False,
-                description="是否显示调试信息"
+                description="是否输出调试日志；可填 true / false"
             ),
         },
         "auto_recall": {
             "enabled": ConfigField(
                 type=bool,
                 default=False,
-                description="是否默认启用自动撤回"
+                description="是否默认启用自动撤回；可填 true / false；运行时可用 /nai on|off 切换"
             ),
             "delay_seconds": ConfigField(
                 type=int,
                 default=5,
-                description="撤回延迟时间（秒）"
+                description="自动撤回延迟时间；单位秒，可填正整数"
             ),
             "id_wait_seconds": ConfigField(
                 type=int,
                 default=15,
-                description="等待正式消息ID的最长时间（秒）"
+                description="等待正式消息 ID 的最长时间；单位秒，可填正整数；超出后改用本地消息 ID 兜底"
             ),
             "manual_max_age_seconds": ConfigField(
                 type=int,
                 default=3600,
-                description="手动撤回允许命中的最老图片年龄（秒）；超出时直接视为不可撤回，避免反复命中老图"
+                description="手动撤回允许命中的最老图片年龄；单位秒，可填正整数；超出视为不可撤回，避免反复命中老图"
             ),
             "allowed_groups": ConfigField(
                 type=list,
                 default=[],
-                description="允许使用自动撤回功能的会话白名单（格式：platform:chat_id）"
+                description="自动撤回会话白名单；填 platform:chat_id 字符串数组，留空数组表示所有会话都允许"
             )
         },
         "admin": {
             "admin_users": ConfigField(
                 type=list,
                 default=[],
-                description="管理员用户ID列表（字符串格式），管理员可以使用 /nai st/sp 命令控制管理员模式"
+                description="管理员用户 ID 列表；填字符串数组（含纯数字 ID 也用字符串包），管理员可用 /nai st/sp 控制管理员模式"
             ),
             "default_admin_mode": ConfigField(
                 type=bool,
                 default=False,
-                description="是否默认启用管理员模式（开启后仅管理员可使用 /nai 生图命令）"
+                description="是否默认启用管理员模式；可填 true / false；开启后仅 admin_users 中的用户可使用 /nai 生图命令"
             )
         },
         "prompt_show": {
             "enabled": ConfigField(
                 type=bool,
                 default=False,
-                description="是否默认启用提示词显示（使用 /nai pt on|off 可在运行时切换）"
+                description="是否默认启用提示词显示；可填 true / false；运行时可用 /nai pt on|off 切换"
             ),
             "hide_selfie_prompt_add": ConfigField(
                 type=bool,
                 default=False,
-                description="提示词显示时是否隐藏配置文件中的自拍补充提示词（selfie_prompt_add）。仅影响展示，不影响实际生图。"
+                description="提示词显示时是否隐藏 selfie_prompt_add；可填 true / false；仅影响展示，不影响实际生图"
             )
         },
         "nsfw_filter": {
             "enabled": ConfigField(
                 type=bool,
                 default=False,
-                description="是否默认启用NSFW内容过滤（使用 /nai nsfw on|off 可在运行时切换）"
+                description="是否默认启用 NSFW 内容过滤；可填 true / false；运行时可用 /nai nsfw on|off 切换"
             ),
             "filter_tags": ConfigField(
                 type=str,
                 default="{{{{{nsfw}}}}}",
-                description="NSFW过滤标签（高权重），当启用过滤时自动添加到负面提示词"
+                description="NSFW 过滤标签；可填英文 prompt 片段（建议高权重大括号）；启用过滤时自动追加到负面提示词最前"
             )
         },
         "prompt_generator": {
             "model_name": ConfigField(
                 type=str,
                 default="",
-                description="提示词生成使用的LLM模型代号，留空则自动选择"
+                description="提示词生成使用的 LLM 模型代号；可填 model_config 中已定义的代号，留空则自动选择 planner/replyer"
             ),
             "output_format": ConfigField(
                 type=str,
                 default="json",
-                description="提示词生成输出格式：json=结构化输出（默认，支持多人分段与意图元数据），text=纯提示词"
+                description="提示词生成输出格式；可填 json / text；json 支持多人分段与意图元数据，text 为纯提示词"
             ),
             "selfie_appearance_policy": ConfigField(
                 type=str,
                 default="auto",
-                description="自拍外貌标签策略：auto=仅在用户未指定外貌时移除LLM随机发色/发型/瞳色（尽量保留配置中的自拍特征），never=始终移除（除非用户明确指定），keep=不移除"
+                description="自拍外貌标签策略；可填 auto / never / keep；auto=仅在用户未指定外貌时移除 LLM 随机外貌；never=始终移除（除非用户指定）；keep=不移除"
             ),
             "enforce_tag_order": ConfigField(
                 type=bool,
                 default=False,
-                description="是否对最终提示词做轻量排序（人数/视角前置、year后置），降低顺序混乱"
+                description="是否对最终提示词做轻量排序；可填 true / false；开启后人数/视角前置、year 后置，降低顺序混乱"
             ),
             "temperature": ConfigField(
                 type=float,
                 default=0.2,
-                description="提示词生成LLM的温度设置"
+                description="提示词生成 LLM 温度；可填正浮点数；常用 0.2~1.5，越高越发散"
             ),
             "max_tokens": ConfigField(
                 type=int,
                 default=500,
-                description="提示词生成LLM响应的最大token"
+                description="提示词生成 LLM 响应的最大 token；可填正整数"
             ),
             "prompt_template": ConfigField(
                 type=str,
                 default="",
-                description="自定义提示词生成模板，支持<<USER_REQUEST>>、<<SELFIE_HINT>>、<<CURRENT_TIME_CONTEXT>>、<<SELFIE_SCENE_CONTEXT>>占位符"
+                description="自定义提示词生成模板；可填多行字符串，支持占位符 <<USER_REQUEST>> / <<SELFIE_HINT>> / <<CURRENT_TIME_CONTEXT>> / <<SELFIE_SCENE_CONTEXT>>；留空使用内置模板"
             ),
             "inherit_ttl": ConfigField(
                 type=int,
                 default=3600,
-                description="上一轮提示词继承的有效时间（秒），超过后不再继承。默认3600（1小时），0=永不过期"
+                description="上一轮提示词继承的有效时间；单位秒，可填正整数；默认 3600（1 小时），0 表示永不过期"
             ),
             "custom_model": ConfigField(
                 type=dict,
@@ -819,68 +819,68 @@ class NaiPicPlugin(MaiBotPlugin):
                     "temperature": 0.2,
                     "slow_threshold": 30.0
                 },
-                description="自定义模型配置（可选），model_list 中的模型名称必须是系统 model_config 中已定义的模型"
+                description="自定义模型配置；填 {model_list, max_tokens, temperature, slow_threshold}；model_list 中的模型名必须在系统 model_config 中已定义；留空表示使用上面的 model_name"
             )
         },
         "action_guard": {
             "enabled": ConfigField(
                 type=bool,
                 default=True,
-                description="是否启用 nai_web_draw Action 的触发保护：① 否定意图兜底（用户说'不要画'仍调用时拦截）② 频率分级保护"
+                description="是否启用 nai_web_draw Action 的触发保护；可填 true / false；含否定意图兜底与频率分级保护"
             ),
             "explicit_request_min_interval_seconds": ConfigField(
                 type=int,
                 default=5,
-                description="用户原话含明确画图/自拍/肖像/追图等强信号时的最小间隔（秒）；默认 5 秒只防同一秒内重复触发，不再做长冷却"
+                description="用户原话含明确画图/自拍/肖像/追图等强信号时的最小间隔；单位秒，可填正整数；默认 5 秒仅防同秒重复触发"
             ),
             "proactive_min_interval_seconds": ConfigField(
                 type=int,
                 default=10,
-                description="用户原话未含强信号、由 bot 主动判断要发图时的最小间隔（秒）；默认 10 秒，给 Planner 两轮 reasoning 之间一点缓冲"
+                description="bot 主动判断要发图时的最小间隔；单位秒，可填正整数；默认 10 秒，给 Planner 两轮 reasoning 之间一点缓冲"
             ),
             "weak_negative_ttl_seconds": ConfigField(
                 type=int,
                 default=60,
-                description="弱否定关键词（如'用文字''文字就行'）拦截的时效；超过此秒数视为 stale，不再拦截"
+                description="弱否定关键词拦截的时效；单位秒，可填正整数；超过此秒数视为 stale，不再拦截"
             ),
             "proactive_self_image_boost": ConfigField(
                 type=bool,
                 default=True,
-                description="Planner 主动出图（category=proactive）且 description 不含自拍/肖像关键词时，自动注入'肖像照 近景'，让主动出图更像 bot 本人分享"
+                description="主动出图自动注入自拍/肖像标签；可填 true / false；命中 proactive 且描述不含自拍/肖像关键词时启用"
             ),
         },
         "auto_draw_on_reply": {
             "enabled": ConfigField(
                 type=bool,
                 default=True,
-                description="开启 reply 后置自动跟图：bot 写出的 reply 命中视觉自指/情感节点时，自动跟一张图"
+                description="reply 后置自动跟图开关；可填 true / false；开启后 bot 写出的 reply 命中视觉自指/情感节点时自动跟一张图"
             ),
             "score_threshold": ConfigField(
                 type=float,
                 default=0.6,
-                description="reply 评分 ≥ 阈值才触发跟图；阈值越高越保守。范围 0.0~1.0"
+                description="reply 评分阈值；可填 0.0~1.0 的浮点数；评分 ≥ 阈值才触发跟图，越高越保守"
             ),
             "min_interval_seconds": ConfigField(
                 type=int,
                 default=15,
-                description="reply 自动跟图的独立最小间隔（秒）；默认 15 秒，与显式出图独立计时，关键词召回噪音大故略高于 explicit/proactive"
+                description="reply 自动跟图的最小间隔；单位秒，可填正整数；与显式出图独立计时，关键词召回噪音大故略高于 explicit/proactive"
             ),
             "self_image_boost": ConfigField(
                 type=bool,
                 default=True,
-                description="跟图描述不含自拍/肖像关键词时，自动注入对应模式标签，让图更像 bot 本人分享"
+                description="跟图自动注入自拍/肖像标签；可填 true / false；不含自拍/肖像关键词时启用"
             ),
         },
         "random_scene": {
             "temperature": ConfigField(
                 type=float,
                 default=1.0,
-                description="随机场景生成LLM的温度设置"
+                description="随机场景生成 LLM 温度；可填正浮点数；常用 1.0~1.5，越高越发散"
             ),
             "max_tokens": ConfigField(
                 type=int,
                 default=200,
-                description="随机场景生成LLM响应的最大token"
+                description="随机场景生成 LLM 响应的最大 token；可填正整数"
             ),
             "custom_model": ConfigField(
                 type=dict,
@@ -890,133 +890,133 @@ class NaiPicPlugin(MaiBotPlugin):
                     "temperature": 1.0,
                     "slow_threshold": 30.0
                 },
-                description="随机场景生成自定义模型配置（可选），model_list 中的模型名称必须是系统 model_config 中已定义的模型"
+                description="随机场景自定义模型配置；填 {model_list, max_tokens, temperature, slow_threshold}；留空则继承 prompt_generator.custom_model"
             ),
         },
         "custom_prompt": {
             "system_prompt": ConfigField(
                 type=str,
                 default="",
-                description="自定义系统提示词，会添加到 LLM 提示词规则的最前面，可用于自定义额外指导或规则"
+                description="自定义系统提示词；可填多行字符串；会拼到 LLM 提示词规则的最前面，用于自定义额外指导或规则"
             ),
         },
         "tag_retriever": {
             "enabled": ConfigField(
                 type=bool,
                 default=True,
-                description="是否启用 Danbooru Tag 检索增强"
+                description="是否启用 Danbooru Tag 检索增强；可填 true / false"
             ),
             "mode": ConfigField(
                 type=str,
                 default="online",
-                description="检索模式：online = 远程 DanbooruSearchOnline API，local = 本地 embedding"
+                description="检索模式；可填 online / local；online=远程 DanbooruSearchOnline API，local=本地 embedding（需 data/tag_embeddings.npy）"
             ),
             "api_url": ConfigField(
                 type=str,
                 default="https://sakizuki-danboorusearch.hf.space/api",
-                description="DanbooruSearchOnline API 地址"
+                description="DanbooruSearchOnline API 地址；可填完整 https:// URL"
             ),
             "timeout": ConfigField(
                 type=float,
                 default=90.0,
-                description="在线检索请求超时（秒）"
+                description="在线检索请求超时；单位秒，可填正数"
             ),
             "search_limit": ConfigField(
                 type=int,
                 default=30,
-                description="在线 /search 返回标签上限"
+                description="在线 /search 返回标签上限；可填正整数"
             ),
             "search_top_k": ConfigField(
                 type=int,
                 default=5,
-                description="在线 /search 每个分词段召回数"
+                description="在线 /search 每个分词段召回数；可填正整数"
             ),
             "related_limit": ConfigField(
                 type=int,
                 default=20,
-                description="在线 /related 返回推荐上限"
+                description="在线 /related 返回推荐上限；可填正整数"
             ),
             "related_seed_count": ConfigField(
                 type=int,
                 default=8,
-                description="在线共现推荐使用的种子标签数量"
+                description="在线共现推荐使用的种子标签数量；可填正整数"
             ),
             "show_nsfw": ConfigField(
                 type=bool,
                 default=True,
-                description="在线检索是否允许返回 NSFW 标签"
+                description="在线检索是否允许返回 NSFW 标签；可填 true / false"
             ),
             "popularity_weight": ConfigField(
                 type=float,
                 default=0.15,
-                description="在线检索标签热度权重"
+                description="在线检索标签热度权重；可填 0~1 的浮点数；越高越偏向热门 tag"
             ),
             "top_k": ConfigField(
                 type=int,
                 default=50,
-                description="本地检索返回的候选 tag 数量"
+                description="本地检索返回的候选 tag 数量；可填正整数（仅 mode=local 生效）"
             ),
             "min_score": ConfigField(
                 type=float,
                 default=0.6,
-                description="本地检索最低相似度阈值（低于此分数的不返回）"
+                description="本地检索最低相似度阈值；可填 0~1 的浮点数；低于此分数的不返回"
             ),
         },
         "retag": {
             "enabled": ConfigField(
                 type=bool,
                 default=True,
-                description="是否启用 /nai 反推 命令（PNG 元数据 → WD14 兜底，只输出正向 prompt）"
+                description="是否启用 /nai 反推 命令；可填 true / false；PNG 元数据命中走元数据，否则用 WD14 兜底，只输出正向 prompt"
             ),
             "cache_ttl_seconds": ConfigField(
                 type=int,
                 default=3600,
-                description="入站图片缓存保留秒数；超过后即便回引也无法定位旧图"
+                description="入站图片缓存保留时间；单位秒，可填正整数；超过后即便回引也无法定位旧图"
             ),
             "image_cache_per_stream": ConfigField(
                 type=int,
                 default=20,
-                description="每个会话保留的最近图片消息数量上限"
+                description="每个会话保留的最近图片消息数量上限；可填正整数"
             ),
             "wd14_enabled": ConfigField(
                 type=bool,
                 default=True,
-                description="非原图（无元数据）时是否调用 WD14 在线 Space 兜底；需安装 gradio_client"
+                description="非原图（无元数据）时是否调用 WD14 在线 Space 兜底；可填 true / false；需安装 gradio_client"
             ),
             "wd14_model": ConfigField(
                 type=str,
                 default="SmilingWolf/wd-eva02-large-tagger-v3",
-                description="WD14 模型名（仅 official 类 Space 生效）"
+                description="WD14 模型名；可填 Hugging Face 模型 ID；仅 official 类 Space 生效，其它 Space 走各自固定模型"
             ),
             "wd14_threshold": ConfigField(
                 type=float,
                 default=0.35,
-                description="通用标签置信度阈值（0~1）"
+                description="通用标签置信度阈值；可填 0~1 的浮点数；越高越保守"
             ),
             "wd14_character_threshold": ConfigField(
                 type=float,
                 default=0.8,
-                description="角色标签置信度阈值（0~1）"
+                description="角色标签置信度阈值；可填 0~1 的浮点数；越高越保守"
             ),
             "wd14_request_timeout": ConfigField(
                 type=float,
                 default=35.0,
-                description="单个 Space 请求超时（秒）；1~2MB 大图实测需 16~23s，留点余量"
+                description="单个 Space 请求超时；单位秒，可填正数；1~2MB 大图实测需 16~23s，留点余量"
             ),
             "wd14_max_retries": ConfigField(
                 type=int,
                 default=1,
-                description="单个 Space 失败时的重试次数"
+                description="单个 Space 失败时的重试次数；可填非负整数"
             ),
             "wd14_retry_delay": ConfigField(
                 type=float,
                 default=0.5,
-                description="单个 Space 重试间隔（秒）"
+                description="单个 Space 重试间隔；单位秒，可填非负数"
             ),
             "wd14_proxy": ConfigField(
                 type=str,
                 default="",
-                description="访问 Hugging Face Space 时使用的代理 URL（形如 http://127.0.0.1:7890）；留空则继承环境变量"
+                description="访问 Hugging Face Space 时使用的代理 URL；可填 http://host:port 或留空；留空则继承 HTTPS_PROXY 环境变量"
             ),
             "wd14_spaces": ConfigField(
                 type=list,
@@ -1037,7 +1037,7 @@ class NaiPicPlugin(MaiBotPlugin):
                         "api": "/run_inference",
                     },
                 ],
-                description="可并发轮询的 HF Space 列表；每条需 name/type/api 三字段"
+                description="可并发轮询的 HF Space 列表；填 [{name, type, api}] 数组；name 是 HF Space 全名，type 决定 payload 结构，api 是 Space 入口"
             ),
         },
     }

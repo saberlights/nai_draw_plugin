@@ -137,11 +137,11 @@ def test_rendered_config_has_per_field_comments() -> None:
     text = _render_default_config_text()
     # 每个字段前都该有一行 # 注释
     must_have = [
-        ("# 入站图片缓存保留秒数", "cache_ttl_seconds"),
+        ("# 入站图片缓存保留时间", "cache_ttl_seconds"),
         ("# 单个 Space 请求超时", "wd14_request_timeout"),
         ("# 访问 Hugging Face Space", "wd14_proxy"),
-        ("# 图片尺寸：可填 竖图 / 横图 / 方图（v/h/s）或 832x1216 / 1216x832 / 1024x1024；请求会自动转换成 NewAPI 要求的 [宽,高] 整数数组", "nai_size"),
-        ("# 随机种子；填 -1 表示请求里省略 seed，由 NewAPI 随机", "seed"),
+        ("# 图片尺寸；可填 竖图 / 横图 / 方图", "nai_size"),
+        ("# 随机种子；可填整数固定结果", "seed"),
     ]
     for comment_prefix, field_name in must_have:
         assert comment_prefix in text, f"缺少 {field_name} 的注释行"
