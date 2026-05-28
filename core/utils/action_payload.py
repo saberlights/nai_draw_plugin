@@ -22,6 +22,29 @@ STRUCTURED_DESCRIPTION_FIELDS = (
 )
 
 
+# Planner 在 ``subject_and_pov`` 里声明"本轮画的是指定角色（非 bot 出镜）"用的约定 token。
+# 该 token 用于把"用户要看 bot 自己"和"用户/bot 要画一个指定二次元角色"两类意图在
+# 链路上层分开：命中后 sdk_runtime 不会注入 self-image 提示，也不会走 selfie 后处理
+# （即不会用 bot 默认外貌覆盖角色发色/瞳色）。
+#
+# 选用 ``画指定角色`` 作为 token：纯中文、不会被 NAI tag 误解析、与 selfie/portrait
+# 三类标签语义正交，Planner 容易理解。
+NAMED_CHARACTER_TOKEN = "画指定角色"
+
+
+def is_named_character_intent(action_data: Dict[str, Any]) -> bool:
+    """判断 Planner 是否声明"本轮画的是指定角色，而非 bot 出镜"。
+
+    Planner 通过在 ``subject_and_pov`` 字段中包含 ``NAMED_CHARACTER_TOKEN``
+    显式声明。链路上层据此跳过 self-image 注入与 selfie 后处理。
+
+    注意：cosplay bot 出镜不算"指定角色"（出镜的还是 bot 本人），由 Planner 自行判断
+    不写该 token。
+    """
+    subject = str(action_data.get("subject_and_pov", "") or "")
+    return NAMED_CHARACTER_TOKEN in subject
+
+
 def compose_description_from_action_payload(
     action_data: Dict[str, Any],
     *,

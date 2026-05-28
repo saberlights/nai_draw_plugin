@@ -37,6 +37,7 @@ _HARD_RULES = """
 - 写法：`character_name (series)`，如 `hatsune miku (vocaloid)`、`rem (re zero)`、`flandre scarlet (touhou)`
 - 日文角色名用罗马音，使用完整名字而非昵称
 - **禁止补充发色/发型/瞳色/体型等外貌 tag**：模型已知该角色默认外貌，手动添加会冲突导致画崩
+- **禁止叠加 `selfie` / `mirror selfie` / `group selfie` / `portrait photo` / `candid photo` 等"bot 出镜"语义的 framing tag**：本轮主体是指定角色而非 bot，加这些会让下游误判成 bot 自拍，把角色洗成 bot 默认外貌。需要构图时用 `close-up` / `upper body` / `cowboy shot` / `full body` 等纯 framing tag 替代
 - 仅当用户明确要求改变外貌时，才在角色名后追加变化项
 
 **形式 B · 原创人物（无具体出处）**

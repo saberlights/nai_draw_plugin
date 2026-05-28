@@ -113,6 +113,11 @@ SELFIE_HINT_FOR_LLM = """
 
 **【最高优先级】** 用户输入只要含肖像类关键词（肖像/头像照/portrait/生活照/立绘/证件照/candid），**强制走肖像路径**，禁止输出任何 `selfie` 系标签，即使下方"自拍意图"也匹配。
 
+**【画指定角色优先级 > 肖像/自拍】** 用户输入含具体二次元角色名（如"初音未来"/"蕾姆"/"芙兰朵露"）或前缀 `画指定角色`，**强制走普通画图路径**，本轮主体是角色而非 bot：
+- 禁止输出任何 `selfie` / `mirror selfie` / `group selfie` / `portrait photo` / `candid photo` / `upper body portrait` / `full body portrait` 等"bot 出镜"语义 framing
+- 即使 description 同时含"肖像照 近景"等中文 framing 提示词也不要翻译成上述 tag——这些是上游为 bot 出镜准备的兜底，与本轮角色主体冲突
+- 需要构图时改用纯 framing tag：`close-up` / `upper body` / `cowboy shot` / `full body`
+
 ## 肖像路径输出规则
 
 肖像意图时：

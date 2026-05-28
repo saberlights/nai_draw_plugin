@@ -73,6 +73,7 @@ from .core.services.named_reference_store import (
 from .core.utils.action_payload import (
     STRUCTURED_DESCRIPTION_FIELDS,
     compose_description_from_action_payload,
+    is_named_character_intent,
 )
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.help_renderer import HELP_FALLBACK_TEXT as _HELP_FALLBACK_TEXT
@@ -2546,6 +2547,16 @@ class NaiInvocation(ModelConfigMixin):
         """
         return compose_description_from_action_payload(self.action_data)
 
+    def _is_named_character_intent(self) -> bool:
+        """Planner 是否声明"本轮画指定角色，非 bot 出镜"。
+
+        命中后跳过 ``_inject_self_image_hint`` 与 ``_process_selfie_prompt``——这两步
+        是为"bot 自己出镜"设计的兜底（注入肖像/自拍语义、把 bot 默认外貌锚点合进
+        prompt 并删冲突发色/瞳色），对"用户/bot 点名画指定二次元角色"是有害注入：
+        会把 ``初音未来`` 的绿色双马尾洗成 bot 自己的发色。
+        """
+        return is_named_character_intent(self.action_data)
+
     async def handle_action(self) -> tuple[bool, str]:
         """处理 `nai_web_draw` Action。"""
         if not await self.ensure_user_not_blacklisted():
@@ -2565,6 +2576,11 @@ class NaiInvocation(ModelConfigMixin):
         # LLM 改写前的版本（与最终 description 区分）。
         raw_description = description
 
+        # "画指定角色" 短路：Planner 明确标记本轮主体不是 bot 时，跳过 self-image 注入与
+        # selfie 后处理。这两步原本是给"bot 自己出镜"兜底的——会把"肖像照"塞进 description、
+        # 把 bot 默认外貌锚点合进 prompt，对画指定角色（如初音未来）就是把角色洗成 bot。
+        is_named_character = self._is_named_character_intent()
+
         trigger_assessment = await self._assess_action_trigger(reasoning=self.reasoning)
         if self._is_action_guard_enabled() and not trigger_assessment["should_generate"]:
             logger.info(
@@ -2579,10 +2595,12 @@ class NaiInvocation(ModelConfigMixin):
 
         # 主动出图自动 self-image 增强：bot 自己想发图时，让出来的图更像"她给你看一眼自己"
         # 而不是"画了一张陌生女孩"。explicit 路径不动，保持用户原意。
+        # 画指定角色路径不注入：本轮主体是指定角色而非 bot，加"肖像照 近景"会把角色洗成 bot 肖像。
         if (
             trigger_assessment["category"] == "proactive"
             and bool(self.get_config("action_guard.proactive_self_image_boost", True))
             and description
+            and not is_named_character
             and not detect_selfie_from_output(description)
         ):
             description = _inject_self_image_hint(description, mode="portrait")
@@ -2603,7 +2621,11 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text("提示词生成器开小差了，请直接告诉我想画什么，或者稍后再试一次~")
             return False, "图片描述为空"
 
-        is_selfie = detect_bot_self_image_intent(raw_description)
+        is_selfie = (
+            False
+            if is_named_character
+            else detect_bot_self_image_intent(raw_description)
+        )
         selfie_base_prompt = description
         if is_selfie:
             description = self._process_selfie_prompt(
