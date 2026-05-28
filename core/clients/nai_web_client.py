@@ -47,6 +47,13 @@ _CHAT_IMAGE_DATA_URI_PATTERN = re.compile(
 # 末尾 seed 注释，例如 <!-- seeds:[123456789,null] -->
 _SEEDS_COMMENT_PATTERN = re.compile(r"<!--\s*seeds:\s*(\[[^\]]*])\s*-->")
 
+# 末尾 vibe_cache_ids 注释（文档 §20.3.1），例如：
+# <!-- vibe_cache_ids:[{"index":0,"cache_id":"AbCdEf..."},...] -->
+_VIBE_CACHE_COMMENT_PATTERN = re.compile(r"<!--\s*vibe_cache_ids:\s*(\[.*?])\s*-->")
+
+# NewAPI 模型列表端点（文档 §2）
+_NAI_MODELS_ENDPOINT: str = "/v1/models"
+
 
 class NaiWebClient:
     """NewAPI（OpenAI 兼容）网关客户端。
@@ -593,6 +600,93 @@ class NaiWebClient:
             logger.error(f"{self.log_prefix} (NewAPI) 请求异常: {exc!r}", exc_info=True)
             return False, f"NewAPI 请求失败: {str(exc)[:160]}"
 
+    # ========== 模型列表（文档 §2） ==========
+
+    async def list_models(
+        self,
+        model_config: Dict[str, Any],
+    ) -> Tuple[bool, List[str] | str]:
+        """调用 ``GET /v1/models`` 拉取实时可用模型列表（文档 §2）。
+
+        成功时返回 ``(True, [model_id, ...])``；失败时返回 ``(False, 错误描述)``。
+        模型列表与发图请求复用同一个 ``base_url`` / ``api_key`` / 代理 / 超时配置。
+        """
+        try:
+            base_url = str(model_config.get("base_url") or "").rstrip("/")
+            if not base_url:
+                return False, "base_url 未配置"
+
+            url = f"{base_url}{_NAI_MODELS_ENDPOINT}"
+            headers = self._build_request_headers(model_config.get("api_key") or "")
+            proxy_mode = self._resolve_proxy_mode(model_config)
+            # 模型列表请求轻量，给一个较短的固定超时
+            request_timeout = min(self._resolve_request_timeout(model_config), 30.0)
+
+            response = await asyncio.to_thread(
+                self._send_get_request,
+                url,
+                headers,
+                proxy_mode,
+                request_timeout,
+            )
+        except requests.RequestException as exc:
+            logger.error(f"{self.log_prefix} (NewAPI) /v1/models 网络异常: {exc}")
+            return False, self._format_request_exception(exc)
+        except Exception as exc:
+            logger.error(
+                f"{self.log_prefix} (NewAPI) /v1/models 请求异常: {exc!r}", exc_info=True
+            )
+            return False, f"NewAPI 请求失败: {str(exc)[:160]}"
+
+        return self._parse_models_response(response)
+
+    def _send_get_request(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        proxy_mode: str,
+        request_timeout: float,
+    ) -> requests.Response:
+        """同步发送 GET 请求；与 POST 路径共享 session 与代理回退策略。"""
+        if proxy_mode == "direct":
+            return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
+        if proxy_mode == "inherit":
+            return self.session.get(url=url, headers=headers, timeout=request_timeout)
+        if self._auto_proxy_direct_only:
+            return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
+        try:
+            return self.session.get(url=url, headers=headers, timeout=request_timeout)
+        except requests.RequestException as exc:
+            if not self._is_proxy_related_exception(exc):
+                raise
+            self._auto_proxy_direct_only = True
+            logger.warning(
+                f"{self.log_prefix} (NewAPI) 代理连接失败，自动回退直连: {exc}"
+            )
+            return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
+
+    def _parse_models_response(self, response: requests.Response) -> Tuple[bool, List[str] | str]:
+        """解析 /v1/models 响应；返回字符串数组或失败原因。"""
+        if response.status_code != 200:
+            return False, self._extract_error_message(response)
+        try:
+            data = response.json()
+        except Exception:
+            return False, f"/v1/models 返回了非 JSON: {response.text[:160]}"
+        if not isinstance(data, dict):
+            return False, "/v1/models 响应格式错误"
+        items = data.get("data")
+        if not isinstance(items, list):
+            return False, self._extract_json_error_message(data) or "/v1/models 未返回 data 数组"
+        model_ids: List[str] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            if model_id and model_id not in model_ids:
+                model_ids.append(model_id)
+        return True, model_ids
+
     # ========== HTTP 发送与重试 ==========
 
     async def _send_request_with_retry(
@@ -753,13 +847,17 @@ class NaiWebClient:
             return False, self._extract_json_error_message(data) or "NewAPI 未返回 message.content"
 
         seeds = self._extract_seeds(content_text)
+        vibe_cache_ids = self._extract_vibe_cache_ids(content_text)
+        usage_text = self._format_usage(data.get("usage"))
+        info_parts: List[str] = []
         if seeds:
-            logger.info(
-                f"{self.log_prefix} (NewAPI) 返回 seeds={seeds}, "
-                f"usage={data.get('usage')}"
-            )
-        else:
-            logger.info(f"{self.log_prefix} (NewAPI) 返回 usage={data.get('usage')}")
+            info_parts.append(f"seeds={seeds}")
+        if vibe_cache_ids:
+            info_parts.append(f"vibe_cache_ids={vibe_cache_ids}")
+        if usage_text:
+            info_parts.append(usage_text)
+        if info_parts:
+            logger.info(f"{self.log_prefix} (NewAPI) 返回 " + ", ".join(info_parts))
 
         matches = list(_CHAT_IMAGE_DATA_URI_PATTERN.finditer(content_text))
         if matches:
@@ -817,6 +915,50 @@ class NaiWebClient:
         except (ValueError, TypeError):
             return []
         return data if isinstance(data, list) else []
+
+    @staticmethod
+    def _extract_vibe_cache_ids(content: str) -> List[Dict[str, Any]]:
+        """解析 §20.3.1 vibe_cache_ids 注释：[{"index": int, "cache_id": str}, ...]。"""
+        match = _VIBE_CACHE_COMMENT_PATTERN.search(content or "")
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(1))
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        cleaned: List[Dict[str, Any]] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            cache_id = str(item.get("cache_id") or "").strip()
+            if not cache_id:
+                continue
+            try:
+                index = int(item.get("index", 0))
+            except (TypeError, ValueError):
+                index = 0
+            cleaned.append({"index": index, "cache_id": cache_id})
+        return cleaned
+
+    @staticmethod
+    def _format_usage(usage: Any) -> str:
+        """把 usage dict 渲染成稳定字段顺序的紧凑日志串。"""
+        if not isinstance(usage, dict):
+            return ""
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+        parts: List[str] = []
+        if isinstance(prompt_tokens, int):
+            parts.append(f"prompt={prompt_tokens}")
+        if isinstance(completion_tokens, int):
+            anlas = completion_tokens / 10000
+            parts.append(f"completion={completion_tokens}({anlas:.2f} anlas)")
+        if isinstance(total_tokens, int):
+            parts.append(f"total={total_tokens}")
+        return f"usage[{', '.join(parts)}]" if parts else ""
 
     def _extract_error_message(self, response: requests.Response) -> str:
         try:

@@ -323,3 +323,113 @@ def test_validate_inner_payload_accepts_steps_at_max_and_valid_noise_schedule() 
         _make_valid_inner(steps=28, noise_schedule="karras", cfg_rescale=0.7),
     )
     assert reason is None
+
+
+def test_extract_vibe_cache_ids_parses_comment_block() -> None:
+    """§20.3.1：响应正文末尾以 HTML 注释附加 vibe_cache_ids。"""
+    content = (
+        "![image_0](data:image/png;base64,iVBORw0KGgo)\n"
+        "<!-- seeds:[123456789] -->\n"
+        '<!-- vibe_cache_ids:[{"index":0,"cache_id":"AbCdEfGhIjKlMnOpQrStUv"},'
+        '{"index":1,"cache_id":"ZyXwVuTsRqPoNmLkJiHgFe"}] -->'
+    )
+    parsed = NaiWebClient._extract_vibe_cache_ids(content)
+    assert parsed == [
+        {"index": 0, "cache_id": "AbCdEfGhIjKlMnOpQrStUv"},
+        {"index": 1, "cache_id": "ZyXwVuTsRqPoNmLkJiHgFe"},
+    ]
+
+
+def test_extract_vibe_cache_ids_returns_empty_without_comment() -> None:
+    content = "![image_0](data:image/png;base64,xxxx)\n<!-- seeds:[1] -->"
+    assert NaiWebClient._extract_vibe_cache_ids(content) == []
+
+
+def test_extract_vibe_cache_ids_skips_invalid_entries() -> None:
+    """缺 cache_id 或非 dict 的条目应被丢弃，避免污染缓存键。"""
+    content = (
+        '<!-- vibe_cache_ids:[{"index":0,"cache_id":""},'
+        '"bad",{"index":1,"cache_id":"ok"}] -->'
+    )
+    assert NaiWebClient._extract_vibe_cache_ids(content) == [
+        {"index": 1, "cache_id": "ok"}
+    ]
+
+
+def test_format_usage_renders_compact_fields() -> None:
+    """usage 渲染应保持字段顺序并附带 anlas 换算，方便对账。"""
+    formatted = NaiWebClient._format_usage(
+        {"prompt_tokens": 1, "completion_tokens": 30000, "total_tokens": 30001}
+    )
+    assert formatted == "usage[prompt=1, completion=30000(3.00 anlas), total=30001]"
+
+
+def test_format_usage_handles_missing_or_invalid() -> None:
+    assert NaiWebClient._format_usage(None) == ""
+    assert NaiWebClient._format_usage("not-a-dict") == ""
+    assert NaiWebClient._format_usage({"prompt_tokens": "x"}) == ""
+
+
+def _make_response(status_code: int, json_body: object | None = None, text: str = "") -> object:
+    """构造一个最小可用的 requests.Response 替身。"""
+
+    class _FakeResponse:
+        def __init__(self) -> None:
+            self.status_code = status_code
+            self._json = json_body
+            self.text = text or (json.dumps(json_body) if json_body is not None else "")
+
+        def json(self):
+            if self._json is None:
+                raise ValueError("no json")
+            return self._json
+
+    return _FakeResponse()
+
+
+def _make_client_stub() -> NaiWebClient:
+    """绕过 __init__ 的 Session 创建，只测纯解析逻辑。"""
+    return NaiWebClient.__new__(NaiWebClient)
+
+
+def test_parse_models_response_extracts_ids_in_order() -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    response = _make_response(
+        200,
+        {
+            "object": "list",
+            "data": [
+                {"id": "nai-diffusion-4-5-full", "object": "model"},
+                {"id": "nai-diffusion-4-full"},
+                {"id": "nai-diffusion-4-5-full"},  # 重复条目应被去重
+                {"id": ""},  # 空 id 应被忽略
+                "not-a-dict",  # 非 dict 应被忽略
+            ],
+        },
+    )
+    success, payload = client._parse_models_response(response)
+    assert success is True
+    assert payload == ["nai-diffusion-4-5-full", "nai-diffusion-4-full"]
+
+
+def test_parse_models_response_reports_http_error_with_body() -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    response = _make_response(
+        401,
+        {"error": {"message": "invalid api key", "code": "UNAUTHORIZED"}},
+    )
+    success, payload = client._parse_models_response(response)
+    assert success is False
+    assert "401" in payload  # type: ignore[operator]
+    assert "invalid api key" in payload  # type: ignore[operator]
+
+
+def test_parse_models_response_rejects_missing_data_array() -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    response = _make_response(200, {"object": "list"})
+    success, payload = client._parse_models_response(response)
+    assert success is False
+    assert "data" in payload  # type: ignore[operator]

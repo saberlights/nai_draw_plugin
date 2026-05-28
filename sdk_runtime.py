@@ -2700,6 +2700,55 @@ class NaiInvocation(ModelConfigMixin):
         await self.send_text("✅ 已开启提示词显示" if enabled else "✅ 已关闭提示词显示")
         return True, "提示词显示状态已更新", True
 
+    async def handle_models_command(self) -> tuple[bool, str | None, bool]:
+        """处理 `/nai models`：拉 ``GET /v1/models`` 展示网关实时模型列表，
+        并与 ``[model].available_models`` 对比标注配置漂移。
+        """
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        model_config = self.get_config("model", {}) or {}
+        if not isinstance(model_config, dict) or not model_config.get("base_url"):
+            await self.send_text("❌ NewAPI 网关 base_url 未配置")
+            return False, "配置错误", True
+
+        success, payload = await self.api_client.list_models(model_config)
+        if not success:
+            await self.send_text(f"❌ 获取模型列表失败：{payload}")
+            return False, f"list_models 失败: {payload}", True
+
+        remote_models: list[str] = payload if isinstance(payload, list) else []
+        if not remote_models:
+            await self.send_text("⚠️ 网关返回的模型列表为空")
+            return True, "list_models 空结果", True
+
+        configured = list(model_config.get("available_models") or [])
+        current = str(model_config.get("default_model") or "").strip()
+
+        configured_set = set(configured)
+        remote_set = set(remote_models)
+        missing_locally = [m for m in remote_models if m not in configured_set]
+        missing_remotely = [m for m in configured if m not in remote_set]
+
+        lines: list[str] = [f"🌐 NewAPI 返回 {len(remote_models)} 个模型："]
+        for model_id in remote_models:
+            marker = " ⭐(当前默认)" if model_id == current else ""
+            local_marker = "" if model_id in configured_set else " 🆕(未列入 available_models)"
+            lines.append(f"  • {model_id}{marker}{local_marker}")
+
+        if missing_remotely:
+            lines.append("")
+            lines.append("⚠️ 以下模型在 available_models 配置里，但网关此次未返回：")
+            for model_id in missing_remotely:
+                lines.append(f"  • {model_id}")
+
+        if missing_locally:
+            lines.append("")
+            lines.append("💡 上述带 🆕 的模型可加入 [model].available_models 后用 /nai set 切换。")
+
+        await self.send_text("\n".join(lines))
+        return True, f"列出 {len(remote_models)} 个模型", True
+
     @staticmethod
     def _extract_target_user_id(raw_value: str) -> str:
         """从命令参数中提取目标用户 ID。"""

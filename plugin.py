@@ -1776,7 +1776,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_draw",
         description="使用自然语言描述生成图片",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,
@@ -1862,6 +1862,29 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         action = str((matched_groups or {}).get("action", "") or "").strip().lower()
         return await invocation.handle_prompt_show_command(action)
+
+    @Command(
+        "nai_models_command",
+        description="拉取 NewAPI 网关实时可用模型列表：/nai models",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+models$",
+    )
+    async def handle_nai_models_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai models`。"""
+        del kwargs
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        return await invocation.handle_models_command()
 
     @Action(
         "nai_web_draw",
