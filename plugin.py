@@ -4,6 +4,7 @@ from weakref import WeakSet
 import asyncio
 import inspect
 import os
+import re
 import tomllib
 
 import tomlkit
@@ -1925,8 +1926,9 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_ref_command",
         description="角色参考：/nai ref [@<名字>] <描述>（用图库里的角色参考图，仅 V4.5 模型）",
-        # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字> 单次覆盖，否则用 /nai ref选 的粘性选定
-        pattern=r"^(?:.*?)/nai\s+ref\s+(?:@(?P<at_name>\S+)\s+)?(?P<description>[\s\S]+)$",
+        # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字>... 单次覆盖，否则用 /nai ref选 的粘性选定
+        # ref 最多 1 张：pattern 允许多个 @<名字> 透传，store 层做硬上限校验给统一错误提示
+        pattern=r"^(?:.*?)/nai\s+ref\s+(?P<at_names>(?:@\S+\s+)*)(?P<description>[\s\S]+)$",
     )
     async def handle_nai_ref_command(
         self,
@@ -1948,9 +1950,11 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @Command(
         "nai_vibe_command",
-        description="Vibe Transfer：/nai vibe [@<名字>] <描述>（用图库里的 vibe 图）",
-        # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字> 单次覆盖，否则用 /nai vibe选 的粘性选定
-        pattern=r"^(?:.*?)/nai\s+vibe\s+(?:@(?P<at_name>\S+)\s+)?(?P<description>[\s\S]+)$",
+        description="Vibe Transfer：/nai vibe [@<名字1> [@<名字2>...]] <描述>（用图库里的 vibe 图，最多 4 张）",
+        # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字>... 单次覆盖，否则用 /nai vibe选 的粘性选定
+        # at_names 用 (?:@\S+\s+)* 整体捕获 0~N 个 @ 前缀，命令层 re.findall 拆解；
+        # vibe 最多 4 张走 store 层硬限制，超 4 走统一错误提示
+        pattern=r"^(?:.*?)/nai\s+vibe\s+(?P<at_names>(?:@\S+\s+)*)(?P<description>[\s\S]+)$",
     )
     async def handle_nai_vibe_command(
         self,
@@ -2040,8 +2044,9 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @Command(
         "nai_vibe_select_command",
-        description="把本会话的默认 vibe 图设为某张命名图：/nai vibe选 <名字>",
-        pattern=r"^(?:.*?)/nai\s+vibe选\s+(?P<name>\S+)\s*$",
+        description="把本会话的默认 vibe 图设为 1~4 张命名图：/nai vibe选 <名字1> [<名字2>...]",
+        # 1 ~ N 个名字，空格分隔；store 层会做 vibe ≤ 4 的硬限制
+        pattern=r"^(?:.*?)/nai\s+vibe选\s+(?P<names>\S+(?:\s+\S+)*)\s*$",
     )
     async def handle_nai_vibe_select_command(
         self,
@@ -2129,7 +2134,8 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_ref_select_command",
         description="把本会话的默认角色参考图设为某张命名图：/nai ref选 <名字>",
-        pattern=r"^(?:.*?)/nai\s+ref选\s+(?P<name>\S+)\s*$",
+        # ref 固定最多 1 张，pattern 与 vibe 选保持一致捕获 names 组；store 层若收到 >1 会拒
+        pattern=r"^(?:.*?)/nai\s+ref选\s+(?P<names>\S+(?:\s+\S+)*)\s*$",
     )
     async def handle_nai_ref_select_command(
         self,
@@ -2200,9 +2206,15 @@ class NaiPicPlugin(MaiBotPlugin):
         matched_groups: dict[str, str] | None,
         scope: str,
     ) -> tuple[bool, str | None, bool]:
-        """/nai vibe / /nai ref 共用：从图库取图（@<名字> 或粘性选定），背后投递。"""
+        """/nai vibe / /nai ref 共用：从图库取图（@<名字>... 或粘性选定），背后投递。
+
+        命令 pattern 用 ``(?P<at_names>(?:@\\S+\\s+)*)`` 把 0~N 个 ``@<名字>`` 整体捕获，
+        这里 ``re.findall`` 拆成 List[str] 透传给 invocation；空列表退化成 None 走粘性选定。
+        """
         description = str((matched_groups or {}).get("description", "") or "").strip()
-        explicit_name = str((matched_groups or {}).get("at_name", "") or "").strip() or None
+        at_names_str = str((matched_groups or {}).get("at_names", "") or "")
+        explicit_names_list = re.findall(r"@(\S+)", at_names_str)
+        explicit_names = explicit_names_list or None
 
         invocation = await self._create_invocation(
             stream_id,
@@ -2218,7 +2230,7 @@ class NaiPicPlugin(MaiBotPlugin):
             lambda: invocation.handle_named_reference_draw(
                 scope=scope,
                 description=description,
-                explicit_name=explicit_name,
+                explicit_names=explicit_names,
             ),
         ):
             return False, "", True
@@ -2305,15 +2317,20 @@ class NaiPicPlugin(MaiBotPlugin):
         matched_groups: dict[str, str] | None,
         scope: str,
     ) -> tuple[bool, str | None, bool]:
-        """/nai vibe选 / /nai ref选。"""
-        name = str((matched_groups or {}).get("name", "") or "").strip()
+        """/nai vibe选 / /nai ref选：把"空格分隔的多名字"拆成 List[str] 透给 invocation。
+
+        vibe / ref 的 pattern 都用 ``(?P<names>\\S+(?:\\s+\\S+)*)`` 捕获 1~N 个 token，
+        store 层会按 scope 的上限（vibe 4 / ref 1）做硬校验，错误统一冒泡。
+        """
+        names_str = str((matched_groups or {}).get("names", "") or "").strip()
+        names = [token for token in names_str.split() if token]
         invocation = await self._create_invocation(
             stream_id,
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.handle_named_reference_select(scope=scope, name=name)
+        return await invocation.handle_named_reference_select(scope=scope, names=names)
 
     @Action(
         "nai_web_draw",

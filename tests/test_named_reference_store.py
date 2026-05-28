@@ -245,25 +245,31 @@ def test_user_id_with_special_chars_safe_on_filesystem(tmp_path) -> None:
     assert store.get(scope=SCOPE_VIBE, user_id=weird, name="x") == png
 
 
-# ── 选定（粘性） ────────────────────────────────────────────────────────
+# ── 选定（粘性，list 形态） ──────────────────────────────────────────────
 
 
 def test_set_and_get_selection_round_trip(tmp_path) -> None:
     store = _make_store(tmp_path)
     store.save(scope=SCOPE_VIBE, user_id="u1", name="角色A", image_bytes=_make_png_bytes())
-    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", name="角色A")
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == "角色A"
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["角色A"])
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["角色A"]
 
 
-def test_get_selection_returns_none_when_unset(tmp_path) -> None:
+def test_get_selection_returns_empty_list_when_unset(tmp_path) -> None:
     store = _make_store(tmp_path)
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") is None
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == []
 
 
 def test_set_selection_rejects_nonexistent_name(tmp_path) -> None:
     store = _make_store(tmp_path)
     with pytest.raises(KeyError):
-        store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", name="ghost")
+        store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["ghost"])
+
+
+def test_set_selection_rejects_empty_names(tmp_path) -> None:
+    store = _make_store(tmp_path)
+    with pytest.raises(ValueError):
+        store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=[])
 
 
 def test_selection_isolated_by_stream_user_and_scope(tmp_path) -> None:
@@ -272,14 +278,14 @@ def test_selection_isolated_by_stream_user_and_scope(tmp_path) -> None:
     for s in [SCOPE_VIBE, SCOPE_REF]:
         store.save(scope=s, user_id="u1", name="角色A", image_bytes=png)
         store.save(scope=s, user_id="u1", name="角色B", image_bytes=png)
-    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", name="角色A")
-    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2", name="角色B")
-    store.set_selection(scope=SCOPE_REF, user_id="u1", stream_id="s1", name="角色B")
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == "角色A"
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2") == "角色B"
-    assert store.get_selection(scope=SCOPE_REF, user_id="u1", stream_id="s1") == "角色B"
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["角色A"])
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2", names=["角色B"])
+    store.set_selection(scope=SCOPE_REF, user_id="u1", stream_id="s1", names=["角色B"])
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["角色A"]
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2") == ["角色B"]
+    assert store.get_selection(scope=SCOPE_REF, user_id="u1", stream_id="s1") == ["角色B"]
     # 不同 user 完全独立
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u2", stream_id="s1") is None
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u2", stream_id="s1") == []
 
 
 def test_selection_persists_across_store_instances(tmp_path) -> None:
@@ -287,17 +293,17 @@ def test_selection_persists_across_store_instances(tmp_path) -> None:
     root = tmp_path / "store"
     s1 = NamedReferenceStore(root)
     s1.save(scope=SCOPE_VIBE, user_id="u1", name="角色A", image_bytes=_make_png_bytes())
-    s1.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", name="角色A")
+    s1.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["角色A"])
     s2 = NamedReferenceStore(root)
-    assert s2.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == "角色A"
+    assert s2.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["角色A"]
 
 
 def test_clear_selection_removes_entry(tmp_path) -> None:
     store = _make_store(tmp_path)
     store.save(scope=SCOPE_VIBE, user_id="u1", name="x", image_bytes=_make_png_bytes())
-    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", name="x")
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["x"])
     store.clear_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1")
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") is None
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == []
 
 
 def test_clear_selection_when_unset_is_safe(tmp_path) -> None:
@@ -310,9 +316,87 @@ def test_delete_image_clears_selection_pointing_to_it(tmp_path) -> None:
     """避免选定指向已删除的图，导致后续命令找不到。"""
     store = _make_store(tmp_path)
     store.save(scope=SCOPE_VIBE, user_id="u1", name="角色A", image_bytes=_make_png_bytes())
-    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", name="角色A")
-    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2", name="角色A")
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["角色A"])
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2", names=["角色A"])
     store.delete(scope=SCOPE_VIBE, user_id="u1", name="角色A")
-    # 两个 stream 都被同步清掉
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") is None
-    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2") is None
+    # 两个 stream 都被同步清掉（list 剩空，整条 stream key 被移除）
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == []
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s2") == []
+
+
+# ── 多图选定（vibe 最多 4，ref 最多 1） ─────────────────────────────────
+
+
+def test_vibe_set_selection_accepts_up_to_four_names(tmp_path) -> None:
+    """§20.3 controlnet.images 最多 4 张：set_selection 应允许 1~4。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    for n in ["a", "b", "c", "d"]:
+        store.save(scope=SCOPE_VIBE, user_id="u1", name=n, image_bytes=png)
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["a", "b", "c", "d"])
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["a", "b", "c", "d"]
+
+
+def test_vibe_set_selection_rejects_more_than_four(tmp_path) -> None:
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    for n in ["a", "b", "c", "d", "e"]:
+        store.save(scope=SCOPE_VIBE, user_id="u1", name=n, image_bytes=png)
+    with pytest.raises(ValueError):
+        store.set_selection(
+            scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["a", "b", "c", "d", "e"]
+        )
+
+
+def test_ref_set_selection_rejects_more_than_one(tmp_path) -> None:
+    """§20.4 character_references 最多 1 张：ref 选定多于 1 应报错。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    store.save(scope=SCOPE_REF, user_id="u1", name="a", image_bytes=png)
+    store.save(scope=SCOPE_REF, user_id="u1", name="b", image_bytes=png)
+    with pytest.raises(ValueError):
+        store.set_selection(scope=SCOPE_REF, user_id="u1", stream_id="s1", names=["a", "b"])
+
+
+def test_set_selection_is_atomic_on_partial_invalid_names(tmp_path) -> None:
+    """names 里有一个不存在 → 整批拒绝，旧选定保留不变。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    store.save(scope=SCOPE_VIBE, user_id="u1", name="a", image_bytes=png)
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["a"])
+    with pytest.raises(KeyError):
+        store.set_selection(
+            scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["a", "nope"]
+        )
+    # 旧选定仍在
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["a"]
+
+
+def test_delete_one_of_multi_selection_keeps_remainder(tmp_path) -> None:
+    """多图选定下删某张图：该张从 list 剔除，其它图仍在选定里。"""
+    store = _make_store(tmp_path)
+    png = _make_png_bytes()
+    for n in ["a", "b", "c"]:
+        store.save(scope=SCOPE_VIBE, user_id="u1", name=n, image_bytes=png)
+    store.set_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1", names=["a", "b", "c"])
+    store.delete(scope=SCOPE_VIBE, user_id="u1", name="b")
+    assert store.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["a", "c"]
+
+
+def test_legacy_string_selection_format_upgraded_on_read(tmp_path) -> None:
+    """selection.json 里旧版单 string 形态应被读取层自动当成 [string] 升级。"""
+    import json
+
+    root = tmp_path / "store"
+    root.mkdir(parents=True)
+    store = NamedReferenceStore(root)
+    store.save(scope=SCOPE_VIBE, user_id="u1", name="角色A", image_bytes=_make_png_bytes())
+    # 手动写一份旧 string 形态的 selection.json
+    user_dir = store._user_dir_name("u1")
+    legacy = {"vibe": {user_dir: {"s1": "角色A"}}}
+    (root / "selection.json").write_text(
+        json.dumps(legacy, ensure_ascii=False), encoding="utf-8"
+    )
+    # 重新拉一个实例读
+    store2 = NamedReferenceStore(root)
+    assert store2.get_selection(scope=SCOPE_VIBE, user_id="u1", stream_id="s1") == ["角色A"]

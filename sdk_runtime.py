@@ -68,6 +68,7 @@ from .core.services.named_reference_store import (
     SCOPE_REF as _NAMED_SCOPE_REF,
     SCOPE_VIBE as _NAMED_SCOPE_VIBE,
     get_named_reference_store,
+    max_selection_for_scope as _max_selection_for_scope,
 )
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.image_meta import (
@@ -1925,17 +1926,19 @@ class NaiInvocation(ModelConfigMixin):
         self,
         description: str,
         *,
-        image_base64: str,
+        image_base64_list: List[str],
         info_extracted: Optional[float] = None,
         strength: Optional[float] = None,
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai vibe`：单图 Vibe Transfer（文档 §20.3）。
+        """处理 `/nai vibe`：1~4 张 Vibe Transfer（文档 §20.3 / §20.3.2）。
 
-        命中本地 vibe cache 时自动改写为 cache_id 复用态，省 1 anlas 流量附加费。
+        image_base64_list 支持 1~4 张参考图，全部命中本地 vibe cache 时整个请求
+        免 1 anlas 流量附加费（§20.3.2）；部分命中只省命中那几张的编码成本。
         """
         return await self._run_image_pipeline(
             description=description,
-            image_base64=image_base64,
+            image_base64=None,
+            vibe_images_base64=list(image_base64_list or []),
             mode="vibe",
             info_extracted=info_extracted,
             strength=strength,
@@ -2016,21 +2019,32 @@ class NaiInvocation(ModelConfigMixin):
             )
             return True, "空库", True
 
-        # 标出"当前选定"项，方便用户知道下一条 /nai (vibe|ref) <描述> 会用哪张
-        selected = store.get_selection(
+        # 标出"当前选定"项（list），方便用户知道下一条裸命令会用哪几张
+        selected_list = store.get_selection(
             scope=scope, user_id=self.user_id, stream_id=self.stream_id
         )
+        selected_set = set(selected_list)
         lines = [f"📂 {scope_label} 图库（{len(entries)} 张）"]
         for ref in entries:
-            marker = "★ " if ref.name == selected else "  "
+            marker = "★ " if ref.name in selected_set else "  "
             lines.append(
                 f"{marker}{ref.name}（{ref.image_format.upper()} "
                 f"{ref.width}x{ref.height}，{ref.byte_size / 1024:.1f}KB）"
             )
-        if selected:
-            lines.append(f"\n当前会话选定：{selected}（裸命令 /nai {scope} <描述> 会用这张）")
+        if selected_list:
+            lines.append(
+                f"\n当前会话选定（{len(selected_list)} 张）：{' / '.join(selected_list)}"
+                f"（裸命令 /nai {scope} <描述> 会一起用）"
+            )
         else:
-            lines.append(f"\n本会话未选定，可用 /nai {scope}选 <名字> 设置默认图")
+            max_count = _max_selection_for_scope(scope)
+            if max_count > 1:
+                lines.append(
+                    f"\n本会话未选定，可用 /nai {scope}选 <名字1> [<名字2>...]"
+                    f" 设置默认图（最多 {max_count} 张）"
+                )
+            else:
+                lines.append(f"\n本会话未选定，可用 /nai {scope}选 <名字> 设置默认图")
         await self.send_text("\n".join(lines))
         return True, "已列出图库", True
 
@@ -2058,30 +2072,45 @@ class NaiInvocation(ModelConfigMixin):
         self,
         *,
         scope: str,
-        name: str,
+        names: List[str],
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai (vibe|ref)选 <名字>`：把当前会话的粘性选定指向某张图。"""
+        """处理 `/nai (vibe|ref)选 <名字> [<名字>...]`：把当前会话的粘性选定指向若干张图。
+
+        vibe 接受 1~4 张（§20.3），ref 接受 1 张（§20.4）。"""
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
+        max_count = _max_selection_for_scope(scope)
+        if not names:
+            await self.send_text(f"❌ 请至少给一张名字：/nai {scope}选 <名字>")
+            return False, "名字为空", True
+        if len(names) > max_count:
+            await self.send_text(
+                f"❌ {scope_label} 最多同时选 {max_count} 张参考图，本次给了 {len(names)} 张"
+            )
+            return False, "超过上限", True
         try:
             store.set_selection(
                 scope=scope,
                 user_id=self.user_id,
                 stream_id=self.stream_id,
-                name=name,
+                names=names,
             )
         except _NamedRefInvalidNameError as exc:
             await self.send_text(f"❌ 名字不合规：{exc}")
             return False, "名字不合规", True
-        except KeyError:
+        except KeyError as exc:
             await self.send_text(
-                f"❌ {scope_label} 图库里没有 {name}\n"
+                f"❌ {scope_label} 图库里 {exc.args[0] if exc.args else '某张图'} 不存在\n"
                 f"用 /nai {scope}图库 查看现有命名图"
             )
             return False, "未找到命名图", True
+        except ValueError as exc:
+            await self.send_text(f"❌ {exc}")
+            return False, "选定参数非法", True
+        names_str = " / ".join(names)
         await self.send_text(
-            f"✅ 已把本会话的 {scope_label} 默认图设为 {name}\n"
-            f"之后 /nai {scope} <描述> 会用这张；想换图请重新 /nai {scope}选 <名字>"
+            f"✅ 已把本会话的 {scope_label} 默认图设为：{names_str}（共 {len(names)} 张）\n"
+            f"之后 /nai {scope} <描述> 会一并用这些；想换图请重新 /nai {scope}选 <名字...>"
         )
         return True, "已设置选定", True
 
@@ -2090,86 +2119,102 @@ class NaiInvocation(ModelConfigMixin):
         *,
         scope: str,
         description: str,
-        explicit_name: Optional[str],
+        explicit_names: Optional[List[str]] = None,
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai vibe <描述>` 或 `/nai ref <描述>`（可选 @<名字> 单次覆盖）。
 
-        explicit_name 来自命令里的 ``@<名字>`` 单次指定；为空时回退到本会话的
-        粘性选定。两者都没有则报错并指引用户如何入库 / 选定。"""
+        explicit_names 来自命令里的 ``@<名字> @<名字>...`` 单次指定（vibe 最多 4 张，
+        ref 最多 1 张）；为空时回退到本会话的粘性选定列表。两者都没有则报错并指引
+        用户如何入库 / 选定。
+        """
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
+        max_count = _max_selection_for_scope(scope)
 
-        # 决定本次用哪张图：优先 @<名字> 单次覆盖 → 否则粘性选定
-        if explicit_name:
+        chosen_names: List[str] = []
+        if explicit_names:
+            if len(explicit_names) > max_count:
+                await self.send_text(
+                    f"❌ {scope_label} 单次最多用 {max_count} 张参考图，本次收到 {len(explicit_names)} 张"
+                )
+                return False, "超过单次上限", True
+            chosen_names = list(explicit_names)
+        else:
+            chosen_names = store.get_selection(
+                scope=scope, user_id=self.user_id, stream_id=self.stream_id
+            )
+            if not chosen_names:
+                await self.send_text(
+                    f"❌ 还未在本会话选定 {scope_label} 图\n"
+                    f"先 /nai {scope}存 <名字> 入库，再 /nai {scope}选 <名字...>；"
+                    f"或单次用 /nai {scope} @<名字>... <描述>"
+                )
+                return False, "未选定命名图", True
+
+        # 逐张取图字节；vibe 多图时任何一张拿不到都整体报错（保留剩余的不进入后续）
+        images_bytes: List[bytes] = []
+        for name in chosen_names:
             try:
                 image_bytes = store.get(
-                    scope=scope, user_id=self.user_id, name=explicit_name
+                    scope=scope, user_id=self.user_id, name=name
                 )
             except _NamedRefInvalidNameError as exc:
                 await self.send_text(f"❌ 名字不合规：{exc}")
                 return False, "名字不合规", True
             if image_bytes is None:
+                # 没在 @<名字> 指定中：可能粘性选定指向已删图，清掉选定
+                if not explicit_names:
+                    store.clear_selection(
+                        scope=scope, user_id=self.user_id, stream_id=self.stream_id
+                    )
+                    await self.send_text(
+                        f"❌ 选定列表里的 {name} 已不在 {scope_label} 图库（可能已被删），"
+                        f"已自动清除整段选定；请 /nai {scope}选 <名字...> 重新选择"
+                    )
+                    return False, "选定的图已不存在", True
                 await self.send_text(
-                    f"❌ {scope_label} 图库里没有 {explicit_name}\n"
-                    f"用 /nai {scope}图库 查看，或 /nai {scope}存 {explicit_name} 先入库"
+                    f"❌ {scope_label} 图库里没有 {name}\n"
+                    f"用 /nai {scope}图库 查看，或 /nai {scope}存 {name} 先入库"
                 )
                 return False, "未找到命名图", True
-            chosen_name = explicit_name
-        else:
-            chosen_name = store.get_selection(
-                scope=scope, user_id=self.user_id, stream_id=self.stream_id
-            )
-            if not chosen_name:
-                await self.send_text(
-                    f"❌ 还未在本会话选定 {scope_label} 图\n"
-                    f"先 /nai {scope}存 <名字> 入库，再 /nai {scope}选 <名字>；"
-                    f"或单次用 /nai {scope} @<名字> <描述>"
-                )
-                return False, "未选定命名图", True
-            image_bytes = store.get(
-                scope=scope, user_id=self.user_id, name=chosen_name
-            )
-            if image_bytes is None:
-                # 理论上 delete 时同步清掉选定就不该到这里，留作兜底
-                store.clear_selection(
-                    scope=scope, user_id=self.user_id, stream_id=self.stream_id
-                )
-                await self.send_text(
-                    f"❌ 选定的 {chosen_name} 已不在 {scope_label} 图库（可能已被删），"
-                    f"已自动清除选定；请 /nai {scope}选 <名字> 重新选择"
-                )
-                return False, "选定的图已不存在", True
+            images_bytes.append(image_bytes)
 
-        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        images_base64 = [base64.b64encode(b).decode("ascii") for b in images_bytes]
         logger.info(
-            "%s /nai %s 取命名图：name=%s, 字节=%.1fKB",
+            "%s /nai %s 取命名图：names=%s, 共 %d 张，合计字节=%.1fKB",
             self.log_prefix,
             scope,
-            chosen_name,
-            len(image_bytes) / 1024.0,
+            chosen_names,
+            len(images_bytes),
+            sum(len(b) for b in images_bytes) / 1024.0,
         )
 
         if scope == _NAMED_SCOPE_VIBE:
             return await self.handle_nai_vibe_draw(
-                description, image_base64=image_base64
+                description, image_base64_list=images_base64
             )
-        # ref 走 image_to_image_draw mode="ref"
+        # ref 固定 1 张：store 层 set_selection 已限制 ≤1，这里再兜底取第一张
         return await self.handle_image_to_image_draw(
-            description, image_base64=image_base64, mode="ref"
+            description, image_base64=images_base64[0], mode="ref"
         )
 
     async def _run_image_pipeline(
         self,
         *,
         description: str,
-        image_base64: str,
+        image_base64: Optional[str] = None,
+        vibe_images_base64: Optional[List[str]] = None,
         mode: str,
         strength: Optional[float] = None,
         fidelity: Optional[float] = None,
         type_value: Optional[str] = None,
         info_extracted: Optional[float] = None,
     ) -> tuple[bool, str | None, bool]:
-        """共享 i2i / ref / vibe 三条命令的"取参考图 → LLM → 发请求"主干。"""
+        """共享 i2i / ref / vibe 三条命令的"取参考图 → LLM → 发请求"主干。
+
+        - i2i / ref：用 image_base64 单图
+        - vibe：用 vibe_images_base64 列表（1~4 张），逐张组装到 controlnet.images[]
+        """
         try:
             if not await self.ensure_generation_permission():
                 return False, "没有权限", True
@@ -2184,23 +2229,41 @@ class NaiInvocation(ModelConfigMixin):
                 await self.send_text(f"请输入你想画的内容，例如：{example}")
                 return False, "未提供描述", True
 
-            normalized_image = _normalize_image_for_payload(image_base64)
-            if not normalized_image:
-                await self.send_text("❌ 未能解析参考图，请引用回复一张图后再发命令")
-                return False, "未找到图片", True
+            # 按模式收集 normalized image(s)：vibe 走 list，其余走 single
+            normalized_images: List[str] = []
+            if mode == "vibe":
+                source_list = list(vibe_images_base64 or [])
+                if not source_list:
+                    await self.send_text("❌ vibe 模式需要至少一张参考图")
+                    return False, "未找到图片", True
+                for raw in source_list:
+                    n = _normalize_image_for_payload(raw)
+                    if not n:
+                        await self.send_text("❌ 有一张参考图解析失败，请检查图库内容")
+                        return False, "图片解析失败", True
+                    normalized_images.append(n)
+            else:
+                normalized_image = _normalize_image_for_payload(image_base64 or "")
+                if not normalized_image:
+                    await self.send_text("❌ 未能解析参考图，请引用回复一张图后再发命令")
+                    return False, "未找到图片", True
+                normalized_images = [normalized_image]
 
             # 临时 debug：把拿到的图实际尺寸 + 字节大小 log 出来，
             # 用来诊断"原图 vs 协议 thumb"的来源问题；后续根因解决（bot 出图原图缓存）落地后可删
-            _probe_dims = _read_image_dimensions(normalized_image)
-            _probe_byte_len = (len(normalized_image) * 3) // 4
-            logger.info(
-                "%s /nai %s 取到参考图：dims=%s, 估算字节=%.1fKB (base64 长度=%d)",
-                self.log_prefix,
-                mode,
-                _probe_dims,
-                _probe_byte_len / 1024.0,
-                len(normalized_image),
-            )
+            for idx, n_img in enumerate(normalized_images):
+                _probe_dims = _read_image_dimensions(n_img)
+                _probe_byte_len = (len(n_img) * 3) // 4
+                logger.info(
+                    "%s /nai %s 取到参考图[%d/%d]：dims=%s, 估算字节=%.1fKB (base64 长度=%d)",
+                    self.log_prefix,
+                    mode,
+                    idx + 1,
+                    len(normalized_images),
+                    _probe_dims,
+                    _probe_byte_len / 1024.0,
+                    len(n_img),
+                )
 
             llm_result = await self._generate_prompt_with_llm(
                 description,
@@ -2236,6 +2299,7 @@ class NaiInvocation(ModelConfigMixin):
             character_references_payload: Optional[list[dict[str, Any]]] = None
 
             if mode == "i2i":
+                normalized_image = normalized_images[0]
                 dims = _read_image_dimensions(normalized_image)
                 if dims is None:
                     # 文档 §20.1 要求 image 宽高严格等于外层 size；解析不出尺寸就一定送不出合规请求，
@@ -2266,6 +2330,7 @@ class NaiInvocation(ModelConfigMixin):
                 if strength is not None:
                     i2i_payload["strength"] = strength
             elif mode == "ref":
+                normalized_image = normalized_images[0]
                 ref_entry: dict[str, Any] = {"image": normalized_image}
                 if type_value:
                     ref_entry["type"] = type_value
@@ -2275,12 +2340,16 @@ class NaiInvocation(ModelConfigMixin):
                     ref_entry["strength"] = strength
                 character_references_payload = [ref_entry]
             elif mode == "vibe":
-                vibe_entry: dict[str, Any] = {"image": normalized_image}
-                if info_extracted is not None:
-                    vibe_entry["info_extracted"] = info_extracted
-                if strength is not None:
-                    vibe_entry["strength"] = strength
-                controlnet_payload = {"images": [vibe_entry]}
+                # §20.3：controlnet.images[] 最多 4 张，逐张组装 image+info_extracted+strength
+                vibe_entries: List[Dict[str, Any]] = []
+                for n_img in normalized_images:
+                    entry: Dict[str, Any] = {"image": n_img}
+                    if info_extracted is not None:
+                        entry["info_extracted"] = info_extracted
+                    if strength is not None:
+                        entry["strength"] = strength
+                    vibe_entries.append(entry)
+                controlnet_payload = {"images": vibe_entries}
 
             enable_debug = bool(self.get_config("components.enable_debug_info", False))
             if enable_debug:
@@ -2830,11 +2899,11 @@ class NaiInvocation(ModelConfigMixin):
 /nai vibe存 <名字> - 引用一张图，存入 vibe 图库
 /nai vibe图库 - 列出当前的 vibe 命名图（★ 标记选中项）
 /nai vibe删 <名字> - 删除一张 vibe 图
-/nai vibe选 <名字> - 把本会话默认 vibe 图设为这张
-/nai vibe @<名字> <描述> - 单次用指定 vibe 图（不动默认选定）
+/nai vibe选 <名字1> [<名字2>...] - 把本会话默认 vibe 设为 1~4 张
+/nai vibe @<名字1> [@<名字2>...] <描述> - 单次用指定 vibe 图（1~4 张，不动默认选定）
 /nai vibe <描述> - 用本会话默认 vibe 图生图（先 /nai vibe选）
-🔁 ref 同结构：/nai ref存 / ref图库 / ref删 / ref选 / ref @<名字> / ref <描述>
-   · vibe 走 §20.3，全量 cache_id 命中可省 1 anlas
+🔁 ref 同结构（仅 1 张）：/nai ref存 / ref图库 / ref删 / ref选 / ref @<名字> / ref <描述>
+   · vibe 走 §20.3，最多 4 张，全量 cache_id 命中可省 1 anlas
    · ref 走 §20.4，仅 V4.5 系列模型支持，其它模型自动降级
 
 【模型 / 尺寸 / 画师】（所有人可用，会话级，重启回退默认）

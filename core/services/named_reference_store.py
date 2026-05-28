@@ -36,6 +36,7 @@ __all__ = [
     "SCOPE_VIBE",
     "SCOPE_REF",
     "MAX_NAME_LENGTH",
+    "max_selection_for_scope",
     "InvalidNameError",
     "InvalidImageError",
     "CapacityExceededError",
@@ -45,6 +46,18 @@ __all__ = [
 SCOPE_VIBE = "vibe"
 SCOPE_REF = "ref"
 _VALID_SCOPES = frozenset({SCOPE_VIBE, SCOPE_REF})
+
+# §20.3 controlnet.images 最多 4 张；§20.4 character_references 最多 1 张
+_MAX_SELECTION_PER_SCOPE: Dict[str, int] = {
+    SCOPE_VIBE: 4,
+    SCOPE_REF: 1,
+}
+
+
+def max_selection_for_scope(scope: str) -> int:
+    """对外暴露每个 scope 的选定上限，供命令层做错误提示用。"""
+    return _MAX_SELECTION_PER_SCOPE.get(scope, 1)
+
 
 # 1-32 字符，汉字 + 英文字母 + 数字 + 下划线；空格、路径符、@ 一律拒
 MAX_NAME_LENGTH = 32
@@ -222,20 +235,35 @@ class NamedReferenceStore:
         scope: str,
         user_id: str,
         stream_id: str,
-        name: str,
+        names: List[str],
     ) -> None:
-        """把 (scope, user_id, stream_id) 的粘性选定指向 name。
+        """把 (scope, user_id, stream_id) 的粘性选定指向 names 列表。
+
+        ``vibe`` 接受 1~4 张（§20.3 controlnet.images 最多 4 张），
+        ``ref`` 仅接受 1 张（§20.4 character_references 最多 1 张）。
 
         Raises:
-            InvalidNameError: name 不合规则
-            KeyError: name 对应的图不存在
+            InvalidNameError: 任一 name 不合规则
+            KeyError: 任一 name 对应的图不存在
+            ValueError: names 数量超出 scope 允许的上限 / 为空 / stream_id 为空
         """
         self._validate_scope(scope)
-        self._validate_name(name)
         if not stream_id:
             raise ValueError("stream_id 不能为空")
-        if self.get(scope=scope, user_id=user_id, name=name) is None:
-            raise KeyError(f"{scope} 图库里没有命名图 {name!r}")
+        if not isinstance(names, (list, tuple)) or not names:
+            raise ValueError("names 必须是非空列表；没图请用 clear_selection")
+        max_count = _MAX_SELECTION_PER_SCOPE.get(scope, 1)
+        if len(names) > max_count:
+            raise ValueError(
+                f"{scope} 最多选 {max_count} 张，收到 {len(names)} 张"
+            )
+        # 名字校验 + 存在性校验全部通过后才落库，避免半成功
+        normalized: List[str] = []
+        for n in names:
+            self._validate_name(n)
+            if self.get(scope=scope, user_id=user_id, name=n) is None:
+                raise KeyError(f"{scope} 图库里没有命名图 {n!r}")
+            normalized.append(n)
         user_dir_name = self._user_dir_name(user_id)
         with self._lock:
             self._mutate_selection(
@@ -244,7 +272,7 @@ class NamedReferenceStore:
                     scope=scope,
                     user_dir_name=user_dir_name,
                     stream_id=stream_id,
-                    name=name,
+                    names=normalized,
                 )
             )
 
@@ -254,21 +282,29 @@ class NamedReferenceStore:
         scope: str,
         user_id: str,
         stream_id: str,
-    ) -> Optional[str]:
-        """读 (scope, user_id, stream_id) 的粘性选定；没选过返回 None。"""
+    ) -> List[str]:
+        """读 (scope, user_id, stream_id) 的粘性选定列表；没选过返回空列表。
+
+        兼容旧版 selection.json 里的单字符串形态：读到 str 时自动升级为 [str]。
+        """
         self._validate_scope(scope)
         if not stream_id:
-            return None
+            return []
         data = self._read_selection()
         user_dir_name = self._user_dir_name(user_id)
         scope_data = data.get(scope)
         if not isinstance(scope_data, dict):
-            return None
+            return []
         user_data = scope_data.get(user_dir_name)
         if not isinstance(user_data, dict):
-            return None
+            return []
         value = user_data.get(stream_id)
-        return value if isinstance(value, str) and value else None
+        # 旧格式：单 string；新格式：list[str]
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, list):
+            return [v for v in value if isinstance(v, str) and v]
+        return []
 
     def clear_selection(
         self,
@@ -422,7 +458,7 @@ class NamedReferenceStore:
         scope: str,
         user_dir_name: str,
         stream_id: str,
-        name: str,
+        names: List[str],
     ) -> None:
         scope_bucket = data.setdefault(scope, {})
         if not isinstance(scope_bucket, dict):
@@ -432,7 +468,7 @@ class NamedReferenceStore:
         if not isinstance(user_bucket, dict):
             user_bucket = {}
             scope_bucket[user_dir_name] = user_bucket
-        user_bucket[stream_id] = name
+        user_bucket[stream_id] = list(names)
 
     @staticmethod
     def _clear_selection_entry(
@@ -462,7 +498,10 @@ class NamedReferenceStore:
         user_id: str,
         name: str,
     ) -> None:
-        """图被删时，把所有指向它的粘性选定也一起清掉。"""
+        """图被删时，把所有指向它的粘性选定也一起清掉。
+
+        新版选定是 list，所以这里要从每个 stream 的列表里把 name 剔掉；
+        剔完为空再删 stream key。兼容旧 string 格式（直接整条删）。"""
         user_dir_name = self._user_dir_name(user_id)
         scope_bucket = data.get(scope)
         if not isinstance(scope_bucket, dict):
@@ -471,7 +510,19 @@ class NamedReferenceStore:
         if not isinstance(user_bucket, dict):
             return
         for stream_id in list(user_bucket.keys()):
-            if user_bucket.get(stream_id) == name:
+            value = user_bucket.get(stream_id)
+            if isinstance(value, str):
+                # 旧 string 格式：仅在等于待删名时整条干掉
+                if value == name:
+                    user_bucket.pop(stream_id, None)
+            elif isinstance(value, list):
+                new_list = [v for v in value if v != name]
+                if not new_list:
+                    user_bucket.pop(stream_id, None)
+                else:
+                    user_bucket[stream_id] = new_list
+            else:
+                # 异常格式直接清掉
                 user_bucket.pop(stream_id, None)
         if not user_bucket:
             scope_bucket.pop(user_dir_name, None)

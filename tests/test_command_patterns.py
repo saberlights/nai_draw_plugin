@@ -98,6 +98,8 @@ def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
         "/nai vibe图库",
         "/nai vibe删 角色A",
         "/nai vibe选 角色A",
+        "/nai vibe选 角色A 角色B",  # 多名字选定
+        "/nai vibe @角色A @角色B 描述",  # 多 @ 单次覆盖
         "/nai ref存 角色A",
         "/nai ref图库",
         "/nai ref删 角色A",
@@ -113,22 +115,27 @@ def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
 
 
 def test_named_reference_subcommands_match_with_chinese_name() -> None:
-    """8 条 (vibe|ref)(存|图库|删|选) 子命令应能匹中文 / 英文 / 下划线名字。"""
+    """7 条命名图库子命令（save / delete / select）应能匹中文 / 英文 / 下划线名字。
+
+    save / delete pattern 用 ``(?P<name>...)`` 单 token 捕获；
+    select pattern 用 ``(?P<names>...)`` 捕获 1~N 个空格分隔的 token（vibe 多图 / ref 单图）。
+    """
     patterns = _load_command_patterns()
+    # (cmd_name, sample, expected, group_name)
     cases = [
-        ("nai_vibe_save_command", "/nai vibe存 角色A", "角色A"),
-        ("nai_vibe_save_command", "/nai vibe存 char_b", "char_b"),
-        ("nai_vibe_delete_command", "/nai vibe删 角色A", "角色A"),
-        ("nai_vibe_select_command", "/nai vibe选 角色A", "角色A"),
-        ("nai_ref_save_command", "/nai ref存 角色A", "角色A"),
-        ("nai_ref_delete_command", "/nai ref删 角色A", "角色A"),
-        ("nai_ref_select_command", "/nai ref选 角色A", "角色A"),
+        ("nai_vibe_save_command", "/nai vibe存 角色A", "角色A", "name"),
+        ("nai_vibe_save_command", "/nai vibe存 char_b", "char_b", "name"),
+        ("nai_vibe_delete_command", "/nai vibe删 角色A", "角色A", "name"),
+        ("nai_vibe_select_command", "/nai vibe选 角色A", "角色A", "names"),
+        ("nai_ref_save_command", "/nai ref存 角色A", "角色A", "name"),
+        ("nai_ref_delete_command", "/nai ref删 角色A", "角色A", "name"),
+        ("nai_ref_select_command", "/nai ref选 角色A", "角色A", "names"),
     ]
-    for cmd_name, sample, expected_name in cases:
+    for cmd_name, sample, expected, group_name in cases:
         regex = _compile(patterns[cmd_name])
         match = regex.match(sample)
         assert match is not None, f"{cmd_name} 应匹配 {sample!r}"
-        assert match.group("name") == expected_name
+        assert match.group(group_name) == expected
 
 
 def test_named_reference_list_subcommand_matches_without_args() -> None:
@@ -142,21 +149,51 @@ def test_named_reference_list_subcommand_matches_without_args() -> None:
         assert regex.match(sample) is not None, f"{cmd_name} 应匹配 {sample!r}"
 
 
-def test_vibe_ref_draw_patterns_capture_optional_at_name() -> None:
-    """/nai vibe @<名字> <描述> 时 at_name 应该被独立捕获；不带 @ 时 at_name 为空。"""
+def test_vibe_ref_draw_patterns_capture_at_names_block() -> None:
+    """/nai vibe @<n1> [@<n2>...] <描述> / /nai ref @<n> <描述> 的 at_names 整段应被独立捕获。
+
+    pattern 用 ``(?P<at_names>(?:@\\S+\\s+)*)`` 把 0~N 个 ``@<名字>`` 整体捕获成一段字符串，
+    命令层用 ``re.findall(r"@(\\S+)", ...)`` 拆解成 List[str]。不带 @ 时 at_names 为空串。
+    """
     patterns = _load_command_patterns()
     cases = [
-        ("nai_vibe_command", "/nai vibe @角色A 都市夜景", "角色A", "都市夜景"),
-        ("nai_vibe_command", "/nai vibe 都市夜景", None, "都市夜景"),
-        ("nai_ref_command", "/nai ref @角色A 站街道", "角色A", "站街道"),
-        ("nai_ref_command", "/nai ref 站街道", None, "站街道"),
+        ("nai_vibe_command", "/nai vibe @角色A 都市夜景", "@角色A ", "都市夜景"),
+        ("nai_vibe_command", "/nai vibe @角色A @角色B 都市夜景", "@角色A @角色B ", "都市夜景"),
+        ("nai_vibe_command", "/nai vibe @a @b @c @d 描述", "@a @b @c @d ", "描述"),
+        ("nai_vibe_command", "/nai vibe 都市夜景", "", "都市夜景"),
+        ("nai_ref_command", "/nai ref @角色A 站街道", "@角色A ", "站街道"),
+        ("nai_ref_command", "/nai ref 站街道", "", "站街道"),
     ]
-    for cmd_name, sample, expected_at, expected_desc in cases:
+    for cmd_name, sample, expected_at_names, expected_desc in cases:
         regex = _compile(patterns[cmd_name])
         match = regex.match(sample)
         assert match is not None, f"{cmd_name} 应匹配 {sample!r}"
-        assert match.group("at_name") == expected_at
+        assert match.group("at_names") == expected_at_names, (
+            f"{cmd_name} 的 at_names 段不匹配 {sample!r}"
+        )
         assert match.group("description") == expected_desc
+
+
+def test_vibe_ref_select_patterns_capture_multiple_names() -> None:
+    """/nai vibe选 <n1> [<n2>...] 的 names 段应捕获 1~N 个空格分隔的 token；ref选 同结构。
+
+    store 层会按 scope 上限（vibe 4 / ref 1）做硬校验，pattern 不在这里限张数，
+    避免 pattern 拒绝后用户看不到上限错误。
+    """
+    patterns = _load_command_patterns()
+    cases = [
+        ("nai_vibe_select_command", "/nai vibe选 角色A", "角色A"),
+        ("nai_vibe_select_command", "/nai vibe选 角色A 角色B", "角色A 角色B"),
+        ("nai_vibe_select_command", "/nai vibe选 a b c d", "a b c d"),
+        ("nai_ref_select_command", "/nai ref选 角色A", "角色A"),
+        # ref 单图 scope 也允许多 token 透传到 store 层报错（避免 pattern 静默吞）
+        ("nai_ref_select_command", "/nai ref选 a b", "a b"),
+    ]
+    for cmd_name, sample, expected_names in cases:
+        regex = _compile(patterns[cmd_name])
+        match = regex.match(sample)
+        assert match is not None, f"{cmd_name} 应匹配 {sample!r}"
+        assert match.group("names") == expected_names
 
 
 def test_subcommand_patterns_tolerate_quote_reply_prefix() -> None:
