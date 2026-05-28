@@ -19,6 +19,7 @@ parse_structured_prompt_payload = _mod.parse_structured_prompt_payload
 extract_multi_character_payload = _mod.extract_multi_character_payload
 extract_multi_character_payload_from_text = _mod.extract_multi_character_payload_from_text
 resolve_multi_character_payload = _mod.resolve_multi_character_payload
+extract_last_code_block = _mod.extract_last_code_block
 
 
 class PromptOutputParserTest(unittest.TestCase):
@@ -209,6 +210,82 @@ class PromptOutputParserTest(unittest.TestCase):
     def test_resolve_returns_none_for_single_person(self):
         rendered = "solo, 1girl, smile"
         self.assertIsNone(resolve_multi_character_payload("not a json", rendered))
+
+
+class ExtractLastCodeBlockTest(unittest.TestCase):
+    """LLM 输出"思考过程 + ```prompt``` "混合格式：抠最后一个代码块内容。
+
+    覆盖场景：完整闭合 / 未闭合截断 / 多块取末尾 / lang 标识 / 无代码块。
+    """
+
+    def test_returns_none_when_no_triple_backtick(self):
+        self.assertIsNone(extract_last_code_block(""))
+        self.assertIsNone(extract_last_code_block("plain text without fence"))
+
+    def test_extracts_content_of_fully_closed_block(self):
+        text = "thought stuff\n```\n1girl, blue dress, smile\n```"
+        self.assertEqual(
+            extract_last_code_block(text),
+            "1girl, blue dress, smile",
+        )
+
+    def test_picks_last_block_when_multiple(self):
+        """多个代码块时取最后一个，因为 LLM 习惯把最终 prompt 放末尾。"""
+        text = (
+            "```json\n"
+            '{"old": true}\n'
+            "```\n"
+            "more thought\n"
+            "```\n"
+            "1girl, final tags\n"
+            "```"
+        )
+        self.assertEqual(extract_last_code_block(text), "1girl, final tags")
+
+    def test_strips_language_identifier_line(self):
+        """```python / ```json 这种 lang 行不应进入提取内容。"""
+        text = "```python\n1girl, ok\n```"
+        self.assertEqual(extract_last_code_block(text), "1girl, ok")
+
+    def test_extracts_tail_when_truncated_unclosed(self):
+        """LLM 在 max_tokens 截断时尾部 ``` 未闭合：取最后一个 ``` 之后的内容。"""
+        text = (
+            "thought\n"
+            "- 角色：路障僵尸\n"
+            "- 动作：吃冰淇淋\n"
+            "```\n"
+            "(masterpiece, best quality), solo, 1boy"
+        )
+        self.assertEqual(
+            extract_last_code_block(text),
+            "(masterpiece, best quality), solo, 1boy",
+        )
+
+    def test_real_llm_thought_plus_unclosed_block(self):
+        """真实样本：thought 5 行 + 未闭合 ``` + 纯英文 prompt。"""
+        text = (
+            "thought\n"
+            "- 意图判定：普通画图（normal）。\n"
+            "- 角色特征：路障僵尸（Conehead Zombie）。\n"
+            "- 动作：吃冰淇淋（eating ice cream）。\n"
+            "- 构图：中景。\n"
+            "```\n"
+            "(masterpiece, best quality), solo, 1boy, conehead zombie, "
+            "eating ice cream, street at night"
+        )
+        self.assertEqual(
+            extract_last_code_block(text),
+            "(masterpiece, best quality), solo, 1boy, conehead zombie, "
+            "eating ice cream, street at night",
+        )
+
+    def test_empty_block_falls_through_to_tail_branch(self):
+        """``` 内容为空时不应误返回空串，应继续走截断兜底。"""
+        # 这里测试"开头空块 + 末尾真实块"的情况：取最后真实块
+        text = "```\n```\nactual prompt tags"
+        # 第一个块为空，第二个 ``` 后是 "actual prompt tags"——未闭合分支兜底
+        result = extract_last_code_block(text)
+        self.assertEqual(result, "actual prompt tags")
 
 
 if __name__ == "__main__":

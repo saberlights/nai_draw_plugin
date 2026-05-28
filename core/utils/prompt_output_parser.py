@@ -44,6 +44,53 @@ def _strip_code_fence(text: str) -> str:
     return inner.strip()
 
 
+# 完整闭合的代码块：``` 或 ```lang 起手 + 任意内容 + ``` 收尾
+_FULL_CODE_BLOCK_RE = re.compile(
+    r"```([a-zA-Z][\w-]*)?[ \t]*\n?(.*?)```",
+    re.DOTALL,
+)
+
+
+def extract_last_code_block(text: str) -> Optional[str]:
+    """从含 thought + 代码块的 LLM 输出里提取最后一个 ``` 代码块的内容。
+
+    应对场景：LLM 输出"思考过程 + ```prompt```" 这种混合格式时，``_strip_code_fence``
+    只能识别"整段被 ``` 包裹"，识别不到"前面有 thought / 后面才是代码块"的情形，
+    导致 thought 段被当成 prompt 送 API。
+
+    匹配优先级：
+    1. 完整闭合的 ```...```（多个时取**最后一个**——LLM 习惯把最终 prompt 放在末尾）
+    2. 未闭合（被 max_tokens 截断）：取最后一个 ``` 之后到末尾的内容
+    3. 完全没有 ```：返回 None，调用方按"整段即 prompt"处理
+
+    返回内容已 strip 前后空白；首行若是 ``json`` / ``markdown`` 这种语言标识也会被剥掉。
+    """
+    if not text or "```" not in text:
+        return None
+
+    matches = list(_FULL_CODE_BLOCK_RE.finditer(text))
+    if matches:
+        last = matches[-1]
+        content = last.group(2).strip()
+        if content:
+            return content
+        # 闭合代码块但内容为空：当作没找到，继续走截断分支
+
+    # 未闭合：找最后一个 ```，把后面的内容当 prompt
+    last_open = text.rfind("```")
+    if last_open == -1:
+        return None
+    tail = text[last_open + 3:]
+    # 跳过可选的 lang 标识行（```python\n / ```json\n）
+    if "\n" in tail:
+        head_line, rest = tail.split("\n", 1)
+        head_stripped = head_line.strip()
+        if head_stripped.isalpha() and len(head_stripped) < 15:
+            tail = rest
+    tail = tail.strip()
+    return tail or None
+
+
 def _join_tags(tags) -> str:
     if not tags:
         return ""

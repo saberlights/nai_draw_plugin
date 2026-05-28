@@ -76,6 +76,7 @@ from .core.utils.image_meta import (
     read_image_dimensions as _read_image_dimensions,
 )
 from .core.utils.prompt_output_parser import (
+    extract_last_code_block,
     parse_prompt_from_structured_output,
     resolve_multi_character_payload,
 )
@@ -85,6 +86,8 @@ from .core.utils.prompt_postprocessor import (
     remove_selfie_appearance_tags,
     sanitize_sfw_characters,
     sanitize_sfw_prompt,
+    strip_cjk_and_fullwidth,
+    strip_cjk_and_fullwidth_from_characters,
     user_mentions_appearance,
 )
 from .core.utils.random_scene_description import (
@@ -655,33 +658,53 @@ class NaiInvocation(ModelConfigMixin):
         return session_state.is_prompt_show_enabled(platform, chat_id, self.get_config)
 
     def _sanitize_prompt_for_sfw_mode(self, prompt: str) -> str:
-        """在启用 NSFW 过滤时进一步剔除擦边/色情标签。"""
+        """LLM 翻译完到送 API 之间的最后清洗钩子：
+
+        1. 启用 NSFW 过滤时进一步剔除擦边/色情标签（受 stream 级开关控制）；
+        2. **无条件**剔除 LLM 残留的 CJK 字符与全角符号——NewAPI §8 明确要求
+           prompt / negative_prompt 必须英文，含 CJK 一律 400。SFW 不开也必须清。
+        """
         if not prompt:
             return prompt
-        if not session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
-            return prompt
-        return sanitize_sfw_prompt(prompt)
+        if session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
+            prompt = sanitize_sfw_prompt(prompt)
+        return strip_cjk_and_fullwidth(prompt)
 
     def _sanitize_structured_for_sfw_mode(
         self,
         structured: Optional[dict[str, Any]],
     ) -> Optional[dict[str, Any]]:
-        """SFW 过滤多角色 payload；过滤后人数不足 2 时返回 None 触发字符串降级。"""
+        """送 API 前多角色 payload 的最后清洗钩子。
+
+        与 _sanitize_prompt_for_sfw_mode 行为对称：先按 SFW 开关做擦边过滤，再做无条件
+        CJK + 全角清洗。任一步骤后角色数 < 2 都返回 None 触发字符串降级，避免把
+        "只剩 1 个角色"的不合规 payload 硬送上游。
+        """
         if not structured:
             return None
-        if not session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
-            return structured
-        new_global, new_chars = sanitize_sfw_characters(
-            structured.get("global_text", ""),
-            structured.get("characters") or [],
+
+        global_text = structured.get("global_text", "")
+        characters = structured.get("characters") or []
+
+        if session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
+            global_text, characters = sanitize_sfw_characters(global_text, characters)
+            if len(characters) < 2:
+                logger.info(
+                    f"{self.log_prefix} SFW 过滤后多角色 payload 剩余 {len(characters)} 项，"
+                    "降级回单字符串路径"
+                )
+                return None
+
+        global_text, characters = strip_cjk_and_fullwidth_from_characters(
+            global_text, characters
         )
-        if len(new_chars) < 2:
+        if len(characters) < 2:
             logger.info(
-                f"{self.log_prefix} SFW 过滤后多角色 payload 剩余 {len(new_chars)} 项，"
+                f"{self.log_prefix} CJK 清洗后多角色 payload 剩余 {len(characters)} 项，"
                 "降级回单字符串路径"
             )
             return None
-        return {**structured, "global_text": new_global, "characters": new_chars}
+        return {**structured, "global_text": global_text, "characters": characters}
 
     def _normalize_structured_order(
         self,
@@ -1769,22 +1792,24 @@ class NaiInvocation(ModelConfigMixin):
         return normalized_tags
 
     def _cleanup_llm_prompt(self, prompt: str) -> str:
-        """清理 LLM 返回的提示词。"""
+        """清理 LLM 返回的提示词。
+
+        LLM 偶尔输出"思考过程 + ```prompt``` " 混合格式（max_tokens 内会截断闭合 ```），
+        本函数优先用 ``extract_last_code_block`` 抠最后一个 ``` 代码块的内容，避免 thought
+        段被当成 prompt 送给 NAI 污染 tag；没有代码块时退回到整段文本清洗。
+        """
         if not prompt:
             return ""
 
-        parsed_prompt = parse_prompt_from_structured_output(prompt)
+        # 先剥代码块（覆盖"整段 ``` 包裹"/"thought + 代码块"/"未闭合截断"三种形态）
+        extracted = extract_last_code_block(prompt)
+        candidate = extracted if extracted is not None else prompt
+
+        parsed_prompt = parse_prompt_from_structured_output(candidate)
         if parsed_prompt:
             return parsed_prompt
 
-        cleaned = prompt.strip()
-        if cleaned.startswith("```") and cleaned.endswith("```"):
-            cleaned = cleaned[3:-3].strip()
-            if "\n" in cleaned:
-                first_line, rest = cleaned.split("\n", 1)
-                if first_line.strip().isalpha() and len(first_line.strip()) < 15:
-                    cleaned = rest.strip()
-
+        cleaned = candidate.strip()
         cleaned = re.sub(r"^\s*prompt\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = cleaned.replace("，", ", ")
         cleaned = re.sub(r"\s*\n\s*", "\n", cleaned)

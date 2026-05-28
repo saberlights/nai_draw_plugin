@@ -299,6 +299,92 @@ def remove_selfie_appearance_tags(prompt: str) -> str:
     return _join_prompt_segments(out_lines, prompt)
 
 
+# CJK + 全角清洗：覆盖中文 / 日文假名 / 韩文 / CJK 标点 / 全角形式
+# 文档 §8 明确要求 prompt / negative_prompt / characters[i].prompt 必须英文，
+# 含 CJK 字符或全角符号一律 400。LLM 偶尔会留中文解释、未翻译角色词、全角逗号；
+# 本规则在送 API 前做最后一道清洗。
+#
+# 范围说明：
+# - U+1100–U+11FF / U+A960–U+A97F / U+AC00–U+D7AF：韩文谚文字母 / 扩展 A / 音节
+# - U+3000–U+303F：CJK 符号与标点（含全角空格、。、〈〉「」『』）
+# - U+3040–U+30FF / U+31F0–U+31FF：平假名 + 片假名 + 片假名拼音扩展
+# - U+3400–U+4DBF / U+4E00–U+9FFF：CJK 扩展 A + 统一表意基本区
+# - U+F900–U+FAFF：CJK 兼容表意
+# - U+FE30–U+FE4F：CJK 兼容形式（中文标点兼容变体）
+# - U+FF00–U+FFEF：半/全角形式（全角字母数字、全角标点、半角片假名）
+_CJK_AND_FULLWIDTH_RE = re.compile(
+    "["
+    "ᄀ-ᇿ"
+    "　-〿"
+    "぀-ヿ"
+    "ㇰ-ㇿ"
+    "㐀-䶿"
+    "一-鿿"
+    "ꥠ-꥿"
+    "가-힯"
+    "豈-﫿"
+    "︰-﹏"
+    "＀-￯"
+    "]+"
+)
+
+
+def strip_cjk_and_fullwidth(prompt: str) -> str:
+    """剔除 LLM 翻译残留的 CJK 字符与全角符号。
+
+    NewAPI §8 要求 prompt 必须英文，含 CJK 或全角符号一律 400。LLM 偶尔会漏译，
+    本函数在送 API 前做最后一道清洗：
+    1. 把连续 CJK / 全角符号整段替换为单个空格（不直接删，避免 "red红色dress" 合成 "reddress"）
+    2. 按现有多人段（`|` / `\\n`）拆分，再按 `,` 拆 tag，复用其它后处理函数的分段约定
+    3. 单 tag 内合并连续空白、trim；空 tag 直接丢弃；行内全部 tag 被丢弃则整行删
+    """
+    if not prompt or not prompt.strip():
+        return prompt
+
+    lines = _split_prompt_segments(prompt)
+    out_lines: List[str] = []
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        raw_line = raw
+
+        prefix = ""
+        if raw.startswith("|"):
+            prefix = "|"
+            raw = raw[1:].strip()
+
+        # 与 sanitize_sfw_prompt 对齐：保留 char1:/char2: 角色前缀，不在替换里被吃掉
+        role_prefix = ""
+        role_match = re.match(r"^(char\d+:)\s*(.*)$", raw, re.IGNORECASE)
+        if role_match:
+            role_prefix = role_match.group(1)
+            raw = role_match.group(2)
+
+        # 把"中文版的逗号"（全角逗号 U+FF0C / 顿号 U+3001）先转成英文逗号，
+        # 保留 LLM 输出里"逗号当 tag 分隔符"的原本语义；其余 CJK + 全角符号统一替换为空格
+        cleaned = raw.replace("，", ",").replace("、", ",")
+        cleaned = _CJK_AND_FULLWIDTH_RE.sub(" ", cleaned)
+
+        tags: List[str] = []
+        for token in cleaned.split(","):
+            t = re.sub(r"\s+", " ", token).strip()
+            if t:
+                tags.append(t)
+        if not tags:
+            continue
+
+        joined = ", ".join(tags)
+        joined = _preserve_trailing_comma(joined, raw_line)
+        rebuilt = f"{role_prefix}{joined}" if role_prefix else joined
+        if prefix:
+            out_lines.append(f"{prefix} {rebuilt}".strip())
+        else:
+            out_lines.append(rebuilt)
+
+    return _join_prompt_segments(out_lines, prompt)
+
+
 def sanitize_sfw_prompt(prompt: str) -> str:
     """移除 SFW 模式下不应出现的擦边/色情标签。"""
     if not prompt or not prompt.strip():
@@ -453,6 +539,20 @@ def sanitize_sfw_characters(
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """SFW 模式下的多角色 payload 清洗：与 sanitize_sfw_prompt 行为一致。"""
     return _apply_string_filter_to_characters(global_text, characters, sanitize_sfw_prompt)
+
+
+def strip_cjk_and_fullwidth_from_characters(
+    global_text: str,
+    characters: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """多角色 payload 上的 CJK + 全角清洗：与 strip_cjk_and_fullwidth 行为一致。
+
+    某个 character 的 prompt 被清光时整个 character 会被丢弃，调用方负责按结构化通道
+    最低人数（≥ 2）判断是否需要降级回字符串路径。
+    """
+    return _apply_string_filter_to_characters(
+        global_text, characters, strip_cjk_and_fullwidth
+    )
 
 
 def normalize_characters_order(
