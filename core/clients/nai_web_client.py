@@ -11,6 +11,11 @@ from requests.exceptions import ProxyError
 from src.common.logger import get_logger
 
 from ..utils.image_meta import normalize_image_base64, read_image_dimensions
+from ..services.vibe_cache import (
+    compute_image_hash,
+    get_vibe_cache_service,
+    quantize_info_extracted,
+)
 
 logger = get_logger("nai_draw_plugin")
 
@@ -78,6 +83,9 @@ class NaiWebClient:
         self.session: requests.Session = self._create_session(trust_env=True)
         self.direct_session: requests.Session = self._create_session(trust_env=False)
         self._auto_proxy_direct_only = False
+        # 上一次 _parse_response 提取出的 vibe cache 注释（文档 §20.3.1）；
+        # generate_image 在 controlnet 路径里读取该字段做缓存落库
+        self._last_response_vibe_cache_ids: List[Dict[str, Any]] = []
 
     def close(self) -> None:
         """关闭底层 HTTP Session，供插件热重载时清理资源。"""
@@ -734,6 +742,169 @@ class NaiWebClient:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
+    # ========== Vibe cache 协同（文档 §20.3.1 / §20.3.2） ==========
+
+    def _apply_vibe_cache_to_controlnet(
+        self,
+        controlnet_payload: Optional[Dict[str, Any]],
+        model_name: str,
+    ) -> Tuple[
+        List[Tuple[int, str, float]],
+        Optional[Dict[str, Any]],
+        List[Tuple[str, float]],
+    ]:
+        """送 controlnet 前查本地缓存，命中则把图片改成 cache_id 复用态。
+
+        返回 ``(persist_plan, effective_controlnet, hit_plan)``：
+        - ``persist_plan``：未命中且本次将发送图片字节的条目列表 ``[(index, image_hash, info_extracted), ...]``，
+          供响应后落库使用。
+        - ``effective_controlnet``：可能被改写过的 controlnet payload；调用方应该用它去构造请求。
+        - ``hit_plan``：命中本地缓存并被改写为 cache_id 复用态的条目 ``[(image_hash, info_extracted), ...]``，
+          供服务端 cache_id 已淘汰（§20.3.1 400 未命中）时按 key 清掉本地 stale 缓存。
+        """
+        if not isinstance(controlnet_payload, dict):
+            return [], controlnet_payload, []
+        raw_images = controlnet_payload.get("images")
+        if not isinstance(raw_images, list) or not raw_images:
+            return [], controlnet_payload, []
+
+        service = get_vibe_cache_service()
+        new_images: List[Dict[str, Any]] = []
+        persist_plan: List[Tuple[int, str, float]] = []
+        hit_plan: List[Tuple[str, float]] = []
+
+        for index, item in enumerate(raw_images):
+            if not isinstance(item, dict):
+                new_images.append(item)
+                continue
+            # 已经是 cache_id 复用态：原样透传，不走本地缓存
+            if item.get("cache_id"):
+                new_images.append(item)
+                continue
+
+            image_raw = item.get("image")
+            if not isinstance(image_raw, str) or not image_raw.strip():
+                new_images.append(item)
+                continue
+
+            image_hash = compute_image_hash(image_raw)
+            info_extracted = quantize_info_extracted(item.get("info_extracted"))
+            cached_id: Optional[str] = service.lookup(
+                image_hash=image_hash,
+                model_id=model_name,
+                info_extracted=info_extracted,
+            )
+            if cached_id:
+                replacement: Dict[str, Any] = {"cache_id": cached_id}
+                if item.get("strength") is not None:
+                    replacement["strength"] = item["strength"]
+                new_images.append(replacement)
+                hit_plan.append((image_hash, info_extracted))
+                continue
+
+            persist_plan.append((index, image_hash, info_extracted))
+            new_images.append(item)
+
+        # §20.3.2：1 anlas 流量附加费按"是否仍含字节态条目"整请求 flat 收取，
+        # 只有全量 cache_id 复用才省得掉，部分命中只能省命中那几张的编码成本
+        if hit_plan:
+            total = len(raw_images)
+            if not persist_plan:
+                logger.info(
+                    f"{self.log_prefix} (NewAPI) vibe cache 全量命中 {len(hit_plan)}/{total}："
+                    "本次跳过图片编码并省 1 anlas 流量附加费（文档 §20.3.2）"
+                )
+            else:
+                logger.info(
+                    f"{self.log_prefix} (NewAPI) vibe cache 部分命中 {len(hit_plan)}/{total}："
+                    "省去命中图的编码成本；仍含字节态条目，1 anlas 流量附加费按请求计仍会扣"
+                )
+
+        rewritten = dict(controlnet_payload)
+        rewritten["images"] = new_images
+        return persist_plan, rewritten, hit_plan
+
+    def _persist_vibe_cache(
+        self,
+        model_name: str,
+        persist_plan: List[Tuple[int, str, float]],
+    ) -> None:
+        """把响应里 vibe_cache_ids 注释按 index 落到本地缓存。"""
+        returned = list(self._last_response_vibe_cache_ids or [])
+        if not returned or not persist_plan:
+            return
+        by_index = {entry.get("index"): entry.get("cache_id") for entry in returned}
+        service = get_vibe_cache_service()
+        persisted = 0
+        for index, image_hash, info_extracted in persist_plan:
+            cache_id = by_index.get(index)
+            if not cache_id:
+                continue
+            ok = service.persist(
+                image_hash=image_hash,
+                model_id=model_name,
+                info_extracted=info_extracted,
+                cache_id=cache_id,
+            )
+            if ok:
+                persisted += 1
+        if persisted:
+            logger.info(
+                f"{self.log_prefix} (NewAPI) vibe cache 落库 {persisted} 条；"
+                "下次同图同 info_extracted 可走 cache_id 复用态省 1 anlas 流量附加费"
+            )
+
+    @staticmethod
+    def _looks_like_stale_vibe_cache_error(error_message: str) -> bool:
+        """启发式判断错误消息是否像 §20.3.1「cache_id 在服务端找不到」的 400。
+
+        文档没规定网关错误文案具体形态，这里用 ``cache_id`` 关键字 + 常见的「未命中 /
+        无效 / 过期 / 找不到」类词做模糊匹配；判错的代价仅是多清一次本地缓存，
+        相比放着 stale cache_id 反复 400 是更稳的回退。
+        """
+        if not error_message:
+            return False
+        lowered = error_message.lower()
+        if "cache_id" not in lowered and "cache id" not in lowered:
+            return False
+        stale_markers = (
+            "not found",
+            "invalid",
+            "expired",
+            "unknown",
+            "missing",
+            "找不到",
+            "未命中",
+            "无效",
+            "过期",
+            "不存在",
+        )
+        return any(marker in lowered for marker in stale_markers)
+
+    def _purge_vibe_cache_hits(
+        self,
+        model_name: str,
+        hit_plan: List[Tuple[str, float]],
+    ) -> int:
+        """按 (image_hash, model, info_extracted) 清掉本地命中过、但服务端已失效的条目。"""
+        if not hit_plan:
+            return 0
+        service = get_vibe_cache_service()
+        deleted = 0
+        for image_hash, info_extracted in hit_plan:
+            if service.delete(
+                image_hash=image_hash,
+                model_id=model_name,
+                info_extracted=info_extracted,
+            ):
+                deleted += 1
+        if deleted:
+            logger.warning(
+                f"{self.log_prefix} (NewAPI) 服务端 vibe cache_id 已失效，"
+                f"清掉本地 {deleted} 条 stale 映射；下次请求会重新编码并落库"
+            )
+        return deleted
+
     # ========== 主入口 ==========
 
     async def generate_image(
@@ -762,6 +933,9 @@ class NaiWebClient:
             character_references_payload: 文档 §20.4 角色参考列表（最多 1 张），仅 V4.5 系列模型生效；
                 非 V4.5 模型自动降级为单字符串路径并打 warning。
         """
+        # 重置上次响应抽出的 vibe cache 注释，避免上次的状态污染本次落库
+        self._last_response_vibe_cache_ids = []
+
         try:
             base_url = str(model_config.get("base_url") or "").rstrip("/")
             if not base_url:
@@ -777,13 +951,23 @@ class NaiWebClient:
             effective_char_refs = self._filter_character_references_for_model(
                 model_name, character_references_payload, log_prefix=self.log_prefix
             )
+            # vibe cache：在送 controlnet payload 前命中本地缓存就改写为 cache_id 复用态，
+            # 同时记下未命中条目的 (image_hash, info_extracted) 供响应后落库；
+            # hit_plan 用于服务端 cache_id 失效（§20.3.1 400）时清掉本地 stale 映射
+            (
+                vibe_persist_plan,
+                effective_controlnet,
+                vibe_hit_plan,
+            ) = self._apply_vibe_cache_to_controlnet(
+                controlnet_payload, model_name
+            )
             inner_params = self._build_inner_draw_params(
                 prompt,
                 model_config,
                 size,
                 characters=effective_characters,
                 i2i_payload=i2i_payload,
-                controlnet_payload=controlnet_payload,
+                controlnet_payload=effective_controlnet,
                 character_references_payload=effective_char_refs,
             )
             reject_reason = self._validate_inner_payload(model_name, inner_params)
@@ -827,7 +1011,23 @@ class NaiWebClient:
                 proxy_mode=proxy_mode,
                 request_timeout=request_timeout,
             )
-            return self._parse_response(response)
+            success, result = self._parse_response(response)
+            if success:
+                if vibe_persist_plan:
+                    self._persist_vibe_cache(model_name, vibe_persist_plan)
+                return success, result
+
+            # 失败兜底：§20.3.1 规定服务端 cache_id 未命中 → 400 不静默回退；
+            # 若本次确有命中态条目且错误形态像 cache_id 失效，就清掉对应本地缓存，
+            # 让用户重试时自然回到字节态重新编码并重新落库
+            if vibe_hit_plan and self._looks_like_stale_vibe_cache_error(result):
+                purged = self._purge_vibe_cache_hits(model_name, vibe_hit_plan)
+                if purged:
+                    return (
+                        False,
+                        f"{result}（已清掉 {purged} 条本地 stale vibe 缓存，请重试）",
+                    )
+            return success, result
 
         except requests.RequestException as exc:
             logger.error(f"{self.log_prefix} (NewAPI) 网络异常: {exc}")
@@ -1084,6 +1284,7 @@ class NaiWebClient:
 
         seeds = self._extract_seeds(content_text)
         vibe_cache_ids = self._extract_vibe_cache_ids(content_text)
+        self._last_response_vibe_cache_ids = list(vibe_cache_ids)
         usage_text = self._format_usage(data.get("usage"))
         info_parts: List[str] = []
         if seeds:
