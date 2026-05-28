@@ -71,6 +71,7 @@ from .core.services.named_reference_store import (
     max_selection_for_scope as _max_selection_for_scope,
 )
 from .core.utils.display_message_helper import build_action_image_display_message
+from .core.utils.help_renderer import HELP_FALLBACK_TEXT as _HELP_FALLBACK_TEXT
 from .core.utils.image_meta import (
     normalize_image_base64 as _normalize_image_for_payload,
     read_image_dimensions as _read_image_dimensions,
@@ -1114,6 +1115,27 @@ class NaiInvocation(ModelConfigMixin):
             image_base64,
             display_message=display_message,
         )
+
+    async def _send_help_image(self) -> bool:
+        """直接发送随插件打包的帮助图。
+
+        图片由开发者运行 ``python -m plugins.nai_draw_plugin.core.utils.help_renderer``
+        预渲染到 ``assets/help.png``，运行时不再启动 chromium、不依赖系统中文字体；
+        文件缺失或读取失败均返回 False，由调用方回退到纯文本帮助。
+        """
+        help_image_path = Path(__file__).resolve().parent / "assets" / "help.png"
+        if not help_image_path.is_file():
+            logger.warning(
+                "%s 帮助图缺失（%s），回退文字版", self.log_prefix, help_image_path
+            )
+            return False
+        try:
+            raw = help_image_path.read_bytes()
+        except OSError as exc:
+            logger.warning("%s 读取帮助图失败，回退文字: %r", self.log_prefix, exc)
+            return False
+        image_base64 = base64.b64encode(raw).decode("ascii")
+        return await self._send_base64_image_result(image_base64, "📖 NovelAI 画图插件帮助")
 
     async def _send_image_url_with_fallback(self, image_url: str, display_message: str) -> bool:
         """优先发送远程图片 URL，失败时回退为本地下载再发送 Base64。"""
@@ -2902,72 +2924,10 @@ class NaiInvocation(ModelConfigMixin):
             return False, "无法获取会话信息", True
 
         if action == "help":
-            help_text = """📖 NovelAI 图片生成插件命令帮助
-
-【生图命令】
-/nai <描述> - 使用自然语言生成图片
-  示例：/nai 画一张初音未来
-/nai 随机 - 随机生成一张 NSFW 图片
-/nai 随机自拍 - 随机生成一张 NSFW 自拍图片
-/nai0 <英文标签> - 直接使用英文标签生成图片
-  示例：/nai0 1girl, hatsune miku, smile
-💡 描述含「自拍/镜子/合照/手机拍」走自拍路径；
-   含「肖像/生活照/立绘/portrait」走肖像路径；
-   其它走普通画图。
-
-【图生图】（需先引用一张图，或同消息发图带命令）
-/nai i2i <描述> - 图生图（§20.1）：以参考图为底重绘
-  · 参考图宽高必须 64 整除，会自动以参考图尺寸出图
-  · 引用回复有些平台只给缩略图，建议直接同条消息附图
-
-【Vibe / 角色参考】（先把图存入图库，再用命令引用，跨重启保留）
-/nai vibe存 <名字> - 引用一张图，存入 vibe 图库
-/nai vibe图库 - 列出当前的 vibe 命名图（★ 标记选中项）
-/nai vibe删 <名字> - 删除一张 vibe 图
-/nai vibe选 <名字1> [<名字2>...] - 把本会话默认 vibe 设为 1~4 张
-/nai vibe @<名字1> [@<名字2>...] <描述> - 单次用指定 vibe 图（1~4 张，不动默认选定）
-/nai vibe <描述> - 用本会话默认 vibe 图生图（先 /nai vibe选）
-🔁 ref 同结构（仅 1 张）：/nai ref存 / ref图库 / ref删 / ref选 / ref @<名字> / ref <描述>
-   · vibe 走 §20.3，最多 4 张，全量 cache_id 命中可省 1 anlas
-   · ref 走 §20.4，仅 V4.5 系列模型支持，其它模型自动降级
-
-【模型 / 尺寸 / 画师】（所有人可用，会话级，重启回退默认）
-/nai set [代号] - 查看/切换模型
-  代号：3=V3, f3=Furry V3, 4c=V4 Curated, 4=V4 Full, 4.5c=V4.5 Curated, 4.5=V4.5 Full
-/nai size [代号] - 查看/切换尺寸
-  代号：竖/v、横/h、方/s
-/nai art [编号] - 查看/切换画师风格预设
-/nai models - 拉取 NewAPI 网关实时可用模型清单
-
-【自动撤回】（仅管理员）
-/nai on - 开启图片自动撤回
-/nai off - 关闭图片自动撤回
-
-【手动撤回】
-/nai 撤回 - 撤回最近一张本插件发送的图片
-
-【提示词显示】
-/nai pt on/off - 开关提示词显示
-
-【NSFW 过滤】（会话级）
-/nai nsfw - 查看当前状态
-/nai nsfw on/off - 开关 NSFW 过滤
-
-【图片反推】
-/nai 反推 - 回引图片或同消息发图，把图反推成 Danbooru tag
-  · PNG 原图（NAI/SD 元数据）→ 秒级精确还原 prompt
-  · 非原图 → 走 WD14 在线 Space 兜底（耗时 20~60s，只输出正向）
-
-【管理员功能】
-/nai st - 开启管理员模式
-/nai sp - 关闭管理员模式
-/nai ban <用户ID> - 拉黑指定用户
-/nai unban <用户ID> - 取消拉黑指定用户
-/nai banlist - 查看黑名单
-
-【其它】
-/nai help - 显示本帮助"""
-            await self.send_text(help_text)
+            if await self._send_help_image():
+                return True, "显示帮助信息", True
+            # 渲染失败：回退到纯文本（与图片同源结构化数据，避免双份维护）
+            await self.send_text(_HELP_FALLBACK_TEXT)
             return True, "显示帮助信息", True
 
         is_admin = session_state.is_admin_user(user_id, self.get_config)
