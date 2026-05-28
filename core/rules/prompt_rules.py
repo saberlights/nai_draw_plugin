@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 提示词生成规则 - 公共模块
-被 sdk_runtime（Action 路径）与 nai_draw_command（/nai 命令路径）共用
-基于 NovelAI 4/4.5 最新特性优化
+被 sdk_runtime 使用，基于 NovelAI 4/4.5 最新特性优化
 """
 
 # ==================== 共享规则块 ====================

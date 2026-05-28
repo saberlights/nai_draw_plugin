@@ -2,8 +2,8 @@
 """
 Tag 候选检索调度
 
-将 Action 路径与 /nai 命令路径共用的"按 retriever_config 选 online/local"
-逻辑收敛到这里，避免两侧实现漂移。
+按 retriever_config 选择 online/local 的逻辑收敛在这里，
+供 sdk_runtime 统一调用。
 """
 
 from typing import Any, Dict
