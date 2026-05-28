@@ -1375,7 +1375,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @HookHandler(
         "chat.command.before_execute",
         name="nai_draw_plugin_retag_command_message_cache",
-        description="在 /nai 反推 / /nai i2i / /nai ref 执行前缓存当前命令消息（保留 reply 信息）",
+        description="在需要引用图的命令（反推 / i2i / vibe存 / ref存）执行前缓存当前命令消息（保留 reply 信息）",
         order=HookOrder.EARLY,
     )
     async def handle_retag_command_before_execute(
@@ -1384,12 +1384,15 @@ class NaiPicPlugin(MaiBotPlugin):
         command_name: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """仅在需要引用图的命令触发前生效，其它命令直接放行。"""
+        """仅在需要引用图的命令触发前生效，其它命令直接放行。
+
+        /nai vibe 与 /nai ref 已迁移到命名图库，不再走引用图，所以从这个集合里拿掉了。"""
         del kwargs
         if command_name in {
             "nai_retag_command",
             "nai_i2i_command",
-            "nai_ref_command",
+            "nai_vibe_save_command",
+            "nai_ref_save_command",
         } and isinstance(message, dict):
             self._image_cache_service.remember_command_message(message)
         return {"action": "continue"}
@@ -1780,7 +1783,10 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_draw",
         description="使用自然语言描述生成图片",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|i2i\b|ref\b|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        # negative lookahead 排除所有 /nai 子命令；vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
+        # 所以用 ``(?:\b|[一-鿿])`` 覆盖空格后置和中文后缀两种情形，避免 ``vibe存`` 被
+        # 通用命令吞掉（vibe\b 在 latin→CJK 边界不成立）
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,
@@ -1893,7 +1899,10 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_i2i_command",
         description="图生图：/nai i2i <描述>（需引用一张图）",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+i2i\s+(?P<description>[\s\S]+)$",
+        # 宽松前缀：/nai i2i 总伴随"回复一张图"链路，各平台的 reply 前缀形态不一，
+        # 沿用 /nai 反推 / /nai 撤回 的 (?:.*?) 起手而不是严格的 (?:.*，说：\s*)?，
+        # 否则带 reply 前缀的消息匹不上、用户看到"没反应"
+        pattern=r"^(?:.*?)/nai\s+i2i\s+(?P<description>[\s\S]+)$",
     )
     async def handle_nai_i2i_command(
         self,
@@ -1915,8 +1924,9 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @Command(
         "nai_ref_command",
-        description="角色参考：/nai ref <描述>（需引用一张图，仅 V4.5 模型支持）",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+ref\s+(?P<description>[\s\S]+)$",
+        description="角色参考：/nai ref [@<名字>] <描述>（用图库里的角色参考图，仅 V4.5 模型）",
+        # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字> 单次覆盖，否则用 /nai ref选 的粘性选定
+        pattern=r"^(?:.*?)/nai\s+ref\s+(?:@(?P<at_name>\S+)\s+)?(?P<description>[\s\S]+)$",
     )
     async def handle_nai_ref_command(
         self,
@@ -1926,14 +1936,216 @@ class NaiPicPlugin(MaiBotPlugin):
         matched_groups: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai ref <描述>`：取引用图执行 NewAPI §20.4 character_references。"""
+        """处理 `/nai ref [@<名字>] <描述>`：从角色参考图库取图执行 NewAPI §20.4。"""
         del kwargs
-        return await self._run_image_to_image_command(
+        return await self._run_named_reference_draw_command(
             stream_id=stream_id,
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
-            mode="ref",
+            scope="ref",
+        )
+
+    @Command(
+        "nai_vibe_command",
+        description="Vibe Transfer：/nai vibe [@<名字>] <描述>（用图库里的 vibe 图）",
+        # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字> 单次覆盖，否则用 /nai vibe选 的粘性选定
+        pattern=r"^(?:.*?)/nai\s+vibe\s+(?:@(?P<at_name>\S+)\s+)?(?P<description>[\s\S]+)$",
+    )
+    async def handle_nai_vibe_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai vibe [@<名字>] <描述>`：从 vibe 图库取图执行 NewAPI §20.3。"""
+        del kwargs
+        return await self._run_named_reference_draw_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    # ── 命名图库：存 / 图库 / 删 / 选（vibe + ref 8 条对称命令） ──────────
+
+    @Command(
+        "nai_vibe_save_command",
+        description="把引用回复的图存入 vibe 图库：/nai vibe存 <名字>",
+        pattern=r"^(?:.*?)/nai\s+vibe存\s+(?P<name>\S+)\s*$",
+    )
+    async def handle_nai_vibe_save_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_save_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    @Command(
+        "nai_vibe_list_command",
+        description="列出 vibe 图库的所有命名图：/nai vibe图库",
+        pattern=r"^(?:.*?)/nai\s+vibe图库\s*$",
+    )
+    async def handle_nai_vibe_list_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_list_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    @Command(
+        "nai_vibe_delete_command",
+        description="从 vibe 图库删除一张命名图：/nai vibe删 <名字>",
+        pattern=r"^(?:.*?)/nai\s+vibe删\s+(?P<name>\S+)\s*$",
+    )
+    async def handle_nai_vibe_delete_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_delete_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    @Command(
+        "nai_vibe_select_command",
+        description="把本会话的默认 vibe 图设为某张命名图：/nai vibe选 <名字>",
+        pattern=r"^(?:.*?)/nai\s+vibe选\s+(?P<name>\S+)\s*$",
+    )
+    async def handle_nai_vibe_select_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_select_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="vibe",
+        )
+
+    @Command(
+        "nai_ref_save_command",
+        description="把引用回复的图存入角色参考图库：/nai ref存 <名字>",
+        pattern=r"^(?:.*?)/nai\s+ref存\s+(?P<name>\S+)\s*$",
+    )
+    async def handle_nai_ref_save_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_save_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="ref",
+        )
+
+    @Command(
+        "nai_ref_list_command",
+        description="列出角色参考图库的所有命名图：/nai ref图库",
+        pattern=r"^(?:.*?)/nai\s+ref图库\s*$",
+    )
+    async def handle_nai_ref_list_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_list_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="ref",
+        )
+
+    @Command(
+        "nai_ref_delete_command",
+        description="从角色参考图库删除一张命名图：/nai ref删 <名字>",
+        pattern=r"^(?:.*?)/nai\s+ref删\s+(?P<name>\S+)\s*$",
+    )
+    async def handle_nai_ref_delete_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_delete_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="ref",
+        )
+
+    @Command(
+        "nai_ref_select_command",
+        description="把本会话的默认角色参考图设为某张命名图：/nai ref选 <名字>",
+        pattern=r"^(?:.*?)/nai\s+ref选\s+(?P<name>\S+)\s*$",
+    )
+    async def handle_nai_ref_select_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        return await self._run_named_reference_select_command(
+            stream_id=stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+            scope="ref",
         )
 
     async def _run_image_to_image_command(
@@ -1945,7 +2157,7 @@ class NaiPicPlugin(MaiBotPlugin):
         matched_groups: dict[str, str] | None,
         mode: str,
     ) -> tuple[bool, str | None, bool]:
-        """/nai i2i / /nai ref 共享：先解析引用图，再背后投递图生图任务。"""
+        """/nai i2i 的引用图链路（ref 已迁移到命名图库，不再共享此路径）。"""
         description = str((matched_groups or {}).get("description", "") or "").strip()
         image_base64 = self._image_cache_service.resolve_image_base64(
             stream_id=stream_id,
@@ -1953,7 +2165,7 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         if not image_base64:
             await self.ctx.send.text(
-                "❌ 未找到参考图\n请引用回复一张图后再发送 /nai i2i / /nai ref，或在同一条消息内附图加命令",
+                "❌ 未找到参考图\n请引用回复一张图后再发送 /nai i2i，或在同一条消息内附图加命令",
                 stream_id,
                 storage_message=False,
             )
@@ -1976,6 +2188,132 @@ class NaiPicPlugin(MaiBotPlugin):
         ):
             return False, "", True
         return True, "已开始生成图片", True
+
+    # ── 命名图库 helper（vibe / ref 共用骨架，scope 决定走哪个库） ──────
+
+    async def _run_named_reference_draw_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai vibe / /nai ref 共用：从图库取图（@<名字> 或粘性选定），背后投递。"""
+        description = str((matched_groups or {}).get("description", "") or "").strip()
+        explicit_name = str((matched_groups or {}).get("at_name", "") or "").strip() or None
+
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        if not await invocation.ensure_generation_permission():
+            return False, "没有权限", True
+
+        if not await self._start_command_image_generation(
+            stream_id,
+            lambda: invocation.handle_named_reference_draw(
+                scope=scope,
+                description=description,
+                explicit_name=explicit_name,
+            ),
+        ):
+            return False, "", True
+        return True, "已开始生成图片", True
+
+    async def _run_named_reference_save_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai vibe存 / /nai ref存：取引用图存入对应命名图库。"""
+        name = str((matched_groups or {}).get("name", "") or "").strip()
+        image_base64 = self._image_cache_service.resolve_image_base64(
+            stream_id=stream_id,
+            user_id=user_id,
+        )
+        if not image_base64:
+            scope_cmd = "vibe存" if scope == "vibe" else "ref存"
+            await self.ctx.send.text(
+                f"❌ 未找到参考图\n请引用回复一张图后再发送 /nai {scope_cmd} <名字>，"
+                "或在同一条消息内附图加命令",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "未找到图片", True
+
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        return await invocation.handle_named_reference_save(
+            scope=scope, name=name, image_base64=image_base64
+        )
+
+    async def _run_named_reference_list_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai vibe图库 / /nai ref图库。"""
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        return await invocation.handle_named_reference_list(scope=scope)
+
+    async def _run_named_reference_delete_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai vibe删 / /nai ref删。"""
+        name = str((matched_groups or {}).get("name", "") or "").strip()
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        return await invocation.handle_named_reference_delete(scope=scope, name=name)
+
+    async def _run_named_reference_select_command(
+        self,
+        *,
+        stream_id: str,
+        group_id: str,
+        user_id: str,
+        matched_groups: dict[str, str] | None,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """/nai vibe选 / /nai ref选。"""
+        name = str((matched_groups or {}).get("name", "") or "").strip()
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        return await invocation.handle_named_reference_select(scope=scope, name=name)
 
     @Action(
         "nai_web_draw",

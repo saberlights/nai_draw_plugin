@@ -1,0 +1,173 @@
+# -*- coding: utf-8 -*-
+"""守护图生图命令（/nai i2i / ref / vibe）的 pattern 兼容 reply 前缀。
+
+这几条命令必然伴随"引用回复一张图"链路，各平台的 reply 前缀形态不一
+（CQ:reply / [回复 xxx] / 转述 xxx，说：），曾经因为 pattern 用了严格的
+``(?:.*，说：\\s*)?`` 起手导致带 reply 前缀的消息匹不上、用户看到"没反应"。
+
+本测试直接从 ``plugin.py`` 抠出命令注册时声明的 ``pattern=...`` 字面量，
+避免拉起整个 plugin module，只验证字符串本身的语义。
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Dict
+
+
+_PLUGIN_FILE = Path(__file__).resolve().parents[1] / "plugin.py"
+# 跨越多行 / 跨越 description 注释，但不能跨越下一个 @Command 装饰器，
+# 否则会把上一个命令的 name 跟下一个命令的 pattern 误配。
+# name 用 \w（含数字）匹配，否则 ``nai_i2i_command`` 里的 ``2`` 会卡住
+_COMMAND_BLOCK_RE = re.compile(
+    r'@Command\(\s*"(?P<name>nai_\w+)"'
+    r'(?:(?!@Command).)*?'
+    r'pattern=r"(?P<pattern>[^"]+)"',
+    re.DOTALL,
+)
+
+
+def _load_command_patterns() -> Dict[str, str]:
+    """从 plugin.py 抠出 ``@Command(name=..., pattern=...)`` 的字面量映射。"""
+    source = _PLUGIN_FILE.read_text(encoding="utf-8")
+    return {
+        m.group("name"): m.group("pattern")
+        for m in _COMMAND_BLOCK_RE.finditer(source)
+    }
+
+
+def _compile(pattern: str) -> re.Pattern[str]:
+    return re.compile(pattern)
+
+
+# ── 图生图族命令 pattern ─────────────────────────────────────────────────
+
+
+def test_i2i_ref_vibe_patterns_match_plain_invocation() -> None:
+    """无 reply 前缀时直接 /nai i2i / ref / vibe <描述> 必须能匹配。"""
+    patterns = _load_command_patterns()
+    for name, sample in [
+        ("nai_i2i_command", "/nai i2i 变成躺姿"),
+        ("nai_ref_command", "/nai ref 站在街道，看向镜头"),
+        ("nai_vibe_command", "/nai vibe 都市夜景，霓虹氛围"),
+    ]:
+        regex = _compile(patterns[name])
+        match = regex.match(sample)
+        assert match is not None, f"{name} 应匹配 {sample!r}"
+        assert match.group("description"), f"{name} 应能解析出 description"
+
+
+def test_i2i_ref_vibe_patterns_tolerate_quote_reply_prefix() -> None:
+    """各平台引用回复前缀（非 ``xxx，说：`` 形态）也必须能命中。
+
+    这是历史回归点：原 pattern 用 ``(?:.*，说：\\s*)?`` 严格起手时，下述任一前缀都会
+    让命令匹不上、用户看到"没反应"。
+    """
+    patterns = _load_command_patterns()
+    quote_prefixes = [
+        "[回复 alice 的消息: 来一张] ",
+        "[CQ:reply,id=12345] ",
+        "alice，说：",  # 老的 MaiBot 转述前缀仍需兼容
+    ]
+    for name, body in [
+        ("nai_i2i_command", "/nai i2i 改成森林背景"),
+        ("nai_ref_command", "/nai ref 红发少女"),
+        ("nai_vibe_command", "/nai vibe 赛博朋克氛围"),
+    ]:
+        regex = _compile(patterns[name])
+        for prefix in quote_prefixes:
+            message = f"{prefix}{body}"
+            match = regex.match(message)
+            assert match is not None, f"{name} 应匹配带前缀的 {message!r}"
+
+
+def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
+    """generic /nai pattern 的 negative lookahead 仍应排除 i2i / ref / vibe（含 CJK 子命令）。
+
+    保证 ``/nai i2i ...`` / ``/nai vibe存 ...`` 不会被通用 ``/nai <描述>`` 命令吞掉。
+    """
+    patterns = _load_command_patterns()
+    generic = _compile(patterns["nai_draw"])
+    skip_samples = [
+        "/nai i2i 任意描述",
+        "/nai ref 任意描述",
+        "/nai vibe 任意描述",
+        # CJK 子命令也必须被排除（latin→CJK 没有 \b，曾经的 vibe\b 在这里失效）
+        "/nai vibe存 角色A",
+        "/nai vibe图库",
+        "/nai vibe删 角色A",
+        "/nai vibe选 角色A",
+        "/nai ref存 角色A",
+        "/nai ref图库",
+        "/nai ref删 角色A",
+        "/nai ref选 角色A",
+    ]
+    for sample in skip_samples:
+        assert generic.match(sample) is None, f"通用 /nai 不应吞掉 {sample!r}"
+    # 但正常 /nai <描述> 仍需匹配
+    assert generic.match("/nai 画一张初音未来") is not None
+
+
+# ── 命名图库子命令 pattern ───────────────────────────────────────────────
+
+
+def test_named_reference_subcommands_match_with_chinese_name() -> None:
+    """8 条 (vibe|ref)(存|图库|删|选) 子命令应能匹中文 / 英文 / 下划线名字。"""
+    patterns = _load_command_patterns()
+    cases = [
+        ("nai_vibe_save_command", "/nai vibe存 角色A", "角色A"),
+        ("nai_vibe_save_command", "/nai vibe存 char_b", "char_b"),
+        ("nai_vibe_delete_command", "/nai vibe删 角色A", "角色A"),
+        ("nai_vibe_select_command", "/nai vibe选 角色A", "角色A"),
+        ("nai_ref_save_command", "/nai ref存 角色A", "角色A"),
+        ("nai_ref_delete_command", "/nai ref删 角色A", "角色A"),
+        ("nai_ref_select_command", "/nai ref选 角色A", "角色A"),
+    ]
+    for cmd_name, sample, expected_name in cases:
+        regex = _compile(patterns[cmd_name])
+        match = regex.match(sample)
+        assert match is not None, f"{cmd_name} 应匹配 {sample!r}"
+        assert match.group("name") == expected_name
+
+
+def test_named_reference_list_subcommand_matches_without_args() -> None:
+    """/nai vibe图库 / /nai ref图库 都是纯关键字命令，没有参数。"""
+    patterns = _load_command_patterns()
+    for cmd_name, sample in [
+        ("nai_vibe_list_command", "/nai vibe图库"),
+        ("nai_ref_list_command", "/nai ref图库"),
+    ]:
+        regex = _compile(patterns[cmd_name])
+        assert regex.match(sample) is not None, f"{cmd_name} 应匹配 {sample!r}"
+
+
+def test_vibe_ref_draw_patterns_capture_optional_at_name() -> None:
+    """/nai vibe @<名字> <描述> 时 at_name 应该被独立捕获；不带 @ 时 at_name 为空。"""
+    patterns = _load_command_patterns()
+    cases = [
+        ("nai_vibe_command", "/nai vibe @角色A 都市夜景", "角色A", "都市夜景"),
+        ("nai_vibe_command", "/nai vibe 都市夜景", None, "都市夜景"),
+        ("nai_ref_command", "/nai ref @角色A 站街道", "角色A", "站街道"),
+        ("nai_ref_command", "/nai ref 站街道", None, "站街道"),
+    ]
+    for cmd_name, sample, expected_at, expected_desc in cases:
+        regex = _compile(patterns[cmd_name])
+        match = regex.match(sample)
+        assert match is not None, f"{cmd_name} 应匹配 {sample!r}"
+        assert match.group("at_name") == expected_at
+        assert match.group("description") == expected_desc
+
+
+def test_subcommand_patterns_tolerate_quote_reply_prefix() -> None:
+    """vibe存 / ref存 也常带 reply 前缀（用户回复一张图后存图），同样要兼容。"""
+    patterns = _load_command_patterns()
+    prefixes = ["[回复 alice 的消息: 这张] ", "[CQ:reply,id=999] ", "alice，说："]
+    for cmd_name, body in [
+        ("nai_vibe_save_command", "/nai vibe存 角色A"),
+        ("nai_ref_save_command", "/nai ref存 角色A"),
+    ]:
+        regex = _compile(patterns[cmd_name])
+        for prefix in prefixes:
+            message = f"{prefix}{body}"
+            assert regex.match(message) is not None, f"{cmd_name} 应匹配 {message!r}"

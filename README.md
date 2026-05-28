@@ -4,11 +4,17 @@
 
 - `/nai` 自然语言生图（LLM 转 Danbooru tag）
 - `/nai0` 直接英文标签生图（跳过 LLM）
+- `/nai i2i` 图生图（引用回复一张图，§20.1）
+- `/nai vibe` / `/nai ref` 命名图库：把常用参考图存为命名条目，跨重启保留；vibe = §20.3 风格/氛围迁移，ref = §20.4 角色参考（仅 V4.5）
 - `/nai 反推` 图片反推 prompt（PNG 元数据 → WD14 在线 Space 兜底）
+- `/nai models` 拉取网关实时可用模型清单
 - Planner Action 主动出图、reply 后置自动跟图
 - 自拍模式（24 关键词、5 类型）、Tag 检索增强、NSFW 过滤、自动撤回、管理员模式
 
-仅文生图，不支持图生图。
+Vibe / 角色参考的命名图库按 `user_id` 隔离、文件系统存储（图片原始字节落盘可直接查看），
+本会话默认选定跨重启保留。Vibe Transfer 还自带本地 `cache_id` 复用：同图同 `info_extracted`
+重复请求会自动改写成 `cache_id` 复用态，省图片传输 + 编码计费，全量命中还能省 1 anlas 流量
+附加费（文档 §20.3.1 / §20.3.2）。
 
 ## 使用前提
 
@@ -70,9 +76,18 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai <描述>` | 自然语言生图（LLM 生成 prompt） |
 | `/nai 随机` / `/nai 随机自拍` | 随机 NSFW 场景 / 自拍 |
 | `/nai0 <标签>` | 直接英文标签生图（跳过 LLM） |
+| `/nai i2i <描述>` | 图生图（§20.1）：引用一张图，以它为底重绘；宽高须 64 整除 |
+| `/nai vibe存 <名字>` | 把引用回复的图存入 vibe 图库（跨重启保留） |
+| `/nai vibe图库` | 列出 vibe 图库（★ 标记本会话默认选定） |
+| `/nai vibe删 <名字>` | 从 vibe 图库删一张 |
+| `/nai vibe选 <名字>` | 把本会话默认 vibe 图设为这张 |
+| `/nai vibe @<名字> <描述>` | 单次用指定 vibe 图（不动默认选定） |
+| `/nai vibe <描述>` | 用本会话默认 vibe 图生图（§20.3） |
+| `/nai ref存 / ref图库 / ref删 / ref选 / ref @<名字> / ref <描述>` | 角色参考族，结构与 vibe 对称（§20.4，仅 V4.5 系列模型） |
 | `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
 | `/nai set [3/f3/4c/4/4.5c/4.5]` | 查看/切换模型 |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
+| `/nai models` | 拉取 NewAPI 网关实时可用模型清单 |
 | `/nai nsfw [on/off]` | 切换 NSFW 过滤（会话级） |
 | `/nai pt on/off` | 切换提示词显示 |
 | `/nai on/off` | 切换自动撤回 |
@@ -80,6 +95,18 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai help` | 帮助 |
 
 `set` / `size` / `nsfw` 都是**会话级**且**运行时临时**，重启后回退到配置默认值。
+
+**i2i** 走「引用回复一张图」链路（或同条消息附图）；插件按「命令携图 → 引用回引 → 流内最近图」优先级解析。
+
+**vibe / ref** 都走「**命名图库**」：先用 `/nai vibe存 <名字>` 引用一张图入库，再用
+`/nai vibe选 <名字>` 设定本会话默认图，之后 `/nai vibe <描述>` 直接用默认图；也可以
+`/nai vibe @<名字> <描述>` 单次指定。图库按 `user_id` 隔离（跨群可用、群间不互相看），
+默认每库 20 张上限。物理图片落在 `data/named_refs/users/<sha256>/(vibe|ref)/<名字>.<ext>`，
+可以用文件管理器直接看；选定状态落在 `data/named_refs/selection.json`，跨重启保留。
+
+`vibe` 的 `cache_id` 缓存落在 `data/vibe_cache.db`，同图同 info_extracted 重发会改写
+为 cache_id 复用态省图片编码 + 全量命中省 1 anlas 流量附加费；服务端 cache_id 被淘汰
+（§20.3.1 400）时自动清掉本地 stale 条目并提示用户重试。
 
 ## 配置
 
@@ -280,7 +307,10 @@ A: `[prompt_generator]` 可改 `model_name` / `temperature` / `max_tokens` / `pr
 A: 不会。`/nai set` 和 `/nai size` 是会话级且运行时临时，重启回退到 `config.toml` 默认值。
 
 **Q: 支持图生图吗？**
-A: 不支持。
+A: 支持。三种链路：
+- `/nai i2i <描述>` — §20.1 普通图生图，**引用回复一张图**（宽高须 64 整除，会自动按参考图尺寸出图）
+- `/nai vibe ...` — §20.3 Vibe Transfer（风格/氛围迁移），先 `/nai vibe存 <名字>` 入库，再用 `/nai vibe选 <名字>` 设默认或 `/nai vibe @<名字>` 单次指定
+- `/nai ref ...` — §20.4 角色参考（仅 V4.5 模型，自动降级），命令族结构与 vibe 对称（存/图库/删/选/@/裸命令）
 
 **Q: `/nai 反推` 经常超时怎么办？**
 A: 国内访问 HF Space 必须配代理 — 在 `[retag]` 里填 `wd14_proxy = "http://127.0.0.1:7890"`（或你的代理端口）。如果只想用 PNG 元数据反推（不依赖网络），把 `wd14_enabled = false` 关掉 WD14 兜底，非原图直接返回失败。
@@ -314,6 +344,23 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v1.9.0 (2026-05-28)
+- **Vibe / 角色参考改走命名图库**：先 `/nai vibe存 <名字>` 把图入库（按 `user_id` 隔离，跨群可用），再 `/nai vibe选 <名字>` 设当前会话默认图；之后 `/nai vibe <描述>` 直接用默认图，或 `/nai vibe @<名字> <描述>` 单次指定。ref 命令族结构对称。
+- 新命令：`/nai vibe存` / `/nai vibe图库` / `/nai vibe删` / `/nai vibe选` + ref 同名 8 条
+- 命名图库走文件系统（`data/named_refs/users/<sha256>/(vibe|ref)/<名字>.<ext>`，原始字节，文件管理器可直接打开），选定状态用 `data/named_refs/selection.json` 跨重启保留
+- 单库容量默认 20 张 / 用户；命名规则：1~32 字符，汉字 + 英文字母 + 数字 + 下划线（禁路径符与 `@`）
+- 修复 `/nai i2i` 在引用回复图为缩略图（dims 解不出 / <256）时静默走默认 size 触发上游 400，改为立即拒绝并指引用户改走"同消息附图"
+- 修复 `/nai i2i`、`/nai ref`、`/nai vibe` pattern 不兼容引用回复前缀的回归（之前严格的 `(?:.*，说：\s*)?` 起手让 CQ:reply 等前缀匹不上）
+
+### v1.8.0 (2026-05-28)
+- 接入 NewAPI 文档新版字段（§5 透传、`/v1/models`、`usage` 上报、`vibe_cache_ids` 解析）
+- `config.toml` 注释统一改为"作用 + 可填什么"两段式（整文件扫描幂等）
+- 新增图生图族命令：`/nai i2i`（§20.1）、`/nai ref`（§20.4，仅 V4.5）、`/nai vibe`（§20.3）；引用一张图或同消息发图触发
+- 新增 `/nai models`：拉取 NewAPI 网关实时可用模型清单
+- Vibe Transfer 本地 `cache_id` 复用：把 (图字节 hash, 模型, info_extracted) → cache_id 落盘到独立 SQLite，同图同 info_extracted 重发可走 cache_id 复用态省图片编码 + 1 anlas 流量附加费（全量命中才省附加费，§20.3.2）
+- 服务端 cache_id 失效（§20.3.1 400）自愈：错误形态匹配「cache_id 未命中」时自动清掉本次命中的本地 stale 条目并提示重试，避免反复 400
+- 修复 `/nai` 把消息里点名二次元角色误判为 bot 自拍的判定
 
 ### v1.7.0 (2026-05-23)
 - 新增 `/nai 反推`：回引或同发一张图 → 反推 Danbooru tag。两级链路：PNG 元数据（NAI Comment / SD WebUI parameters）秒级精确还原 → WD14 在线 Space 串行轮询兜底（前一个失败才打扰下一个，对 HF 三家友好）

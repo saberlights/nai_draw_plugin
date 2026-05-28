@@ -61,6 +61,14 @@ from .core.services.prompt_memory import render_previous_prompt_block
 from .core.services.session_state import session_state
 from .core.services.tag_candidate_resolver import resolve_tag_candidates
 from .core.services.user_blacklist import user_blacklist
+from .core.services.named_reference_store import (
+    CapacityExceededError as _NamedRefCapacityExceededError,
+    InvalidImageError as _NamedRefInvalidImageError,
+    InvalidNameError as _NamedRefInvalidNameError,
+    SCOPE_REF as _NAMED_SCOPE_REF,
+    SCOPE_VIBE as _NAMED_SCOPE_VIBE,
+    get_named_reference_store,
+)
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.image_meta import (
     normalize_image_base64 as _normalize_image_for_payload,
@@ -88,6 +96,15 @@ logger = get_logger("nai_draw_plugin")
 _DB_PATH = resolve_db_path(__file__)
 _RECENT_MANUAL_RECALL_IDS: dict[str, dict[str, float]] = {}
 _NAPCAT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "MaiBot-Napcat-Adapter" / "config.toml"
+
+
+def _scope_label(scope: str) -> str:
+    """把 ``vibe`` / ``ref`` 翻译成 user-facing 中文标签，供命名图库的提示文本使用。"""
+    if scope == _NAMED_SCOPE_VIBE:
+        return "Vibe"
+    if scope == _NAMED_SCOPE_REF:
+        return "角色参考"
+    return scope
 
 
 def _load_napcat_server_config() -> dict[str, Any] | None:
@@ -1895,13 +1912,275 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text(f"❌ 不支持的图生图模式：{mode!r}")
             return False, f"模式不支持: {mode}", True
 
+        return await self._run_image_pipeline(
+            description=description,
+            image_base64=image_base64,
+            mode=mode,
+            strength=strength,
+            fidelity=fidelity,
+            type_value=type_value,
+        )
+
+    async def handle_nai_vibe_draw(
+        self,
+        description: str,
+        *,
+        image_base64: str,
+        info_extracted: Optional[float] = None,
+        strength: Optional[float] = None,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai vibe`：单图 Vibe Transfer（文档 §20.3）。
+
+        命中本地 vibe cache 时自动改写为 cache_id 复用态，省 1 anlas 流量附加费。
+        """
+        return await self._run_image_pipeline(
+            description=description,
+            image_base64=image_base64,
+            mode="vibe",
+            info_extracted=info_extracted,
+            strength=strength,
+        )
+
+    # ====== 命名图库 (vibe / ref 共用骨架) ======
+
+    async def handle_named_reference_save(
+        self,
+        *,
+        scope: str,
+        name: str,
+        image_base64: str,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai (vibe|ref)存 <名字>`：把引用回复的图入库。
+
+        scope: ``vibe`` / ``ref``，决定图落到哪个图库。"""
+        if not await self.ensure_generation_permission():
+            return False, "没有权限", True
+
+        scope_label = _scope_label(scope)
+        normalized = _normalize_image_for_payload(image_base64)
+        if not normalized:
+            await self.send_text(f"❌ 未解析到图片，请引用回复一张图后再发送 /nai {scope}存 <名字>")
+            return False, "未找到图片", True
+
+        try:
+            image_bytes = base64.b64decode(normalized, validate=False)
+        except (ValueError, TypeError) as exc:
+            await self.send_text(f"❌ 参考图 base64 解码失败: {exc}")
+            return False, "图片解码失败", True
+
+        store = get_named_reference_store()
+        try:
+            ref = store.save(
+                scope=scope,
+                user_id=self.user_id,
+                name=name,
+                image_bytes=image_bytes,
+            )
+        except _NamedRefInvalidNameError as exc:
+            await self.send_text(f"❌ 名字不合规：{exc}")
+            return False, "名字不合规", True
+        except _NamedRefInvalidImageError as exc:
+            await self.send_text(f"❌ 图片不合规：{exc}")
+            return False, "图片不合规", True
+        except _NamedRefCapacityExceededError as exc:
+            await self.send_text(f"❌ {exc}")
+            return False, "图库已满", True
+
+        # 小图友好提示：协议层引用回复经常给 thumb，提示用户下次直接附图能存到原图
+        warn_suffix = ""
+        if ref.width < 256 or ref.height < 256:
+            warn_suffix = (
+                f"\n⚠️ 存入尺寸 {ref.width}x{ref.height} 偏小，疑似平台缩略图\n"
+                "下次想存高清原图请把图作为命令的同条消息附件发出（不要走引用回复）"
+            )
+        await self.send_text(
+            f"✅ 已入 {scope_label} 图库：{name}\n"
+            f"   格式 {ref.image_format.upper()}，{ref.width}x{ref.height}，{ref.byte_size / 1024:.1f}KB"
+            + warn_suffix
+        )
+        return True, "已入库", True
+
+    async def handle_named_reference_list(
+        self,
+        *,
+        scope: str,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai (vibe|ref)图库`：列出当前用户的命名图。"""
+        scope_label = _scope_label(scope)
+        store = get_named_reference_store()
+        entries = store.list(scope=scope, user_id=self.user_id)
+        if not entries:
+            await self.send_text(
+                f"📂 {scope_label} 图库还是空的\n"
+                f"先用 `/nai {scope}存 <名字>` 把引用回复的图入库吧"
+            )
+            return True, "空库", True
+
+        # 标出"当前选定"项，方便用户知道下一条 /nai (vibe|ref) <描述> 会用哪张
+        selected = store.get_selection(
+            scope=scope, user_id=self.user_id, stream_id=self.stream_id
+        )
+        lines = [f"📂 {scope_label} 图库（{len(entries)} 张）"]
+        for ref in entries:
+            marker = "★ " if ref.name == selected else "  "
+            lines.append(
+                f"{marker}{ref.name}（{ref.image_format.upper()} "
+                f"{ref.width}x{ref.height}，{ref.byte_size / 1024:.1f}KB）"
+            )
+        if selected:
+            lines.append(f"\n当前会话选定：{selected}（裸命令 /nai {scope} <描述> 会用这张）")
+        else:
+            lines.append(f"\n本会话未选定，可用 /nai {scope}选 <名字> 设置默认图")
+        await self.send_text("\n".join(lines))
+        return True, "已列出图库", True
+
+    async def handle_named_reference_delete(
+        self,
+        *,
+        scope: str,
+        name: str,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai (vibe|ref)删 <名字>`。"""
+        scope_label = _scope_label(scope)
+        store = get_named_reference_store()
+        try:
+            ok = store.delete(scope=scope, user_id=self.user_id, name=name)
+        except _NamedRefInvalidNameError as exc:
+            await self.send_text(f"❌ 名字不合规：{exc}")
+            return False, "名字不合规", True
+        if not ok:
+            await self.send_text(f"⚠️ {scope_label} 图库里没有 {name}")
+            return False, "未找到命名图", True
+        await self.send_text(f"🗑 已删除 {scope_label} 图库的 {name}")
+        return True, "已删除", True
+
+    async def handle_named_reference_select(
+        self,
+        *,
+        scope: str,
+        name: str,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai (vibe|ref)选 <名字>`：把当前会话的粘性选定指向某张图。"""
+        scope_label = _scope_label(scope)
+        store = get_named_reference_store()
+        try:
+            store.set_selection(
+                scope=scope,
+                user_id=self.user_id,
+                stream_id=self.stream_id,
+                name=name,
+            )
+        except _NamedRefInvalidNameError as exc:
+            await self.send_text(f"❌ 名字不合规：{exc}")
+            return False, "名字不合规", True
+        except KeyError:
+            await self.send_text(
+                f"❌ {scope_label} 图库里没有 {name}\n"
+                f"用 /nai {scope}图库 查看现有命名图"
+            )
+            return False, "未找到命名图", True
+        await self.send_text(
+            f"✅ 已把本会话的 {scope_label} 默认图设为 {name}\n"
+            f"之后 /nai {scope} <描述> 会用这张；想换图请重新 /nai {scope}选 <名字>"
+        )
+        return True, "已设置选定", True
+
+    async def handle_named_reference_draw(
+        self,
+        *,
+        scope: str,
+        description: str,
+        explicit_name: Optional[str],
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai vibe <描述>` 或 `/nai ref <描述>`（可选 @<名字> 单次覆盖）。
+
+        explicit_name 来自命令里的 ``@<名字>`` 单次指定；为空时回退到本会话的
+        粘性选定。两者都没有则报错并指引用户如何入库 / 选定。"""
+        scope_label = _scope_label(scope)
+        store = get_named_reference_store()
+
+        # 决定本次用哪张图：优先 @<名字> 单次覆盖 → 否则粘性选定
+        if explicit_name:
+            try:
+                image_bytes = store.get(
+                    scope=scope, user_id=self.user_id, name=explicit_name
+                )
+            except _NamedRefInvalidNameError as exc:
+                await self.send_text(f"❌ 名字不合规：{exc}")
+                return False, "名字不合规", True
+            if image_bytes is None:
+                await self.send_text(
+                    f"❌ {scope_label} 图库里没有 {explicit_name}\n"
+                    f"用 /nai {scope}图库 查看，或 /nai {scope}存 {explicit_name} 先入库"
+                )
+                return False, "未找到命名图", True
+            chosen_name = explicit_name
+        else:
+            chosen_name = store.get_selection(
+                scope=scope, user_id=self.user_id, stream_id=self.stream_id
+            )
+            if not chosen_name:
+                await self.send_text(
+                    f"❌ 还未在本会话选定 {scope_label} 图\n"
+                    f"先 /nai {scope}存 <名字> 入库，再 /nai {scope}选 <名字>；"
+                    f"或单次用 /nai {scope} @<名字> <描述>"
+                )
+                return False, "未选定命名图", True
+            image_bytes = store.get(
+                scope=scope, user_id=self.user_id, name=chosen_name
+            )
+            if image_bytes is None:
+                # 理论上 delete 时同步清掉选定就不该到这里，留作兜底
+                store.clear_selection(
+                    scope=scope, user_id=self.user_id, stream_id=self.stream_id
+                )
+                await self.send_text(
+                    f"❌ 选定的 {chosen_name} 已不在 {scope_label} 图库（可能已被删），"
+                    f"已自动清除选定；请 /nai {scope}选 <名字> 重新选择"
+                )
+                return False, "选定的图已不存在", True
+
+        image_base64 = base64.b64encode(image_bytes).decode("ascii")
+        logger.info(
+            "%s /nai %s 取命名图：name=%s, 字节=%.1fKB",
+            self.log_prefix,
+            scope,
+            chosen_name,
+            len(image_bytes) / 1024.0,
+        )
+
+        if scope == _NAMED_SCOPE_VIBE:
+            return await self.handle_nai_vibe_draw(
+                description, image_base64=image_base64
+            )
+        # ref 走 image_to_image_draw mode="ref"
+        return await self.handle_image_to_image_draw(
+            description, image_base64=image_base64, mode="ref"
+        )
+
+    async def _run_image_pipeline(
+        self,
+        *,
+        description: str,
+        image_base64: str,
+        mode: str,
+        strength: Optional[float] = None,
+        fidelity: Optional[float] = None,
+        type_value: Optional[str] = None,
+        info_extracted: Optional[float] = None,
+    ) -> tuple[bool, str | None, bool]:
+        """共享 i2i / ref / vibe 三条命令的"取参考图 → LLM → 发请求"主干。"""
         try:
             if not await self.ensure_generation_permission():
                 return False, "没有权限", True
 
             description = str(description or "").strip()
             if not description:
-                example = "/nai i2i 改成森林背景" if mode == "i2i" else "/nai ref 站在街道，看向镜头"
+                example = {
+                    "i2i": "/nai i2i 改成森林背景",
+                    "ref": "/nai ref 站在街道，看向镜头",
+                    "vibe": "/nai vibe 都市夜景，霓虹氛围",
+                }.get(mode, "/nai i2i 改成森林背景")
                 await self.send_text(f"请输入你想画的内容，例如：{example}")
                 return False, "未提供描述", True
 
@@ -1909,6 +2188,19 @@ class NaiInvocation(ModelConfigMixin):
             if not normalized_image:
                 await self.send_text("❌ 未能解析参考图，请引用回复一张图后再发命令")
                 return False, "未找到图片", True
+
+            # 临时 debug：把拿到的图实际尺寸 + 字节大小 log 出来，
+            # 用来诊断"原图 vs 协议 thumb"的来源问题；后续根因解决（bot 出图原图缓存）落地后可删
+            _probe_dims = _read_image_dimensions(normalized_image)
+            _probe_byte_len = (len(normalized_image) * 3) // 4
+            logger.info(
+                "%s /nai %s 取到参考图：dims=%s, 估算字节=%.1fKB (base64 长度=%d)",
+                self.log_prefix,
+                mode,
+                _probe_dims,
+                _probe_byte_len / 1024.0,
+                len(normalized_image),
+            )
 
             llm_result = await self._generate_prompt_with_llm(
                 description,
@@ -1940,24 +2232,40 @@ class NaiInvocation(ModelConfigMixin):
 
             image_size: Any = model_config.get("nai_size") or model_config.get("default_size", "")
             i2i_payload: Optional[dict[str, Any]] = None
+            controlnet_payload: Optional[dict[str, Any]] = None
             character_references_payload: Optional[list[dict[str, Any]]] = None
 
             if mode == "i2i":
                 dims = _read_image_dimensions(normalized_image)
-                if dims is not None:
-                    width, height = dims
-                    if width % 64 != 0 or height % 64 != 0:
-                        await self.send_text(
-                            f"❌ 参考图尺寸 {width}x{height} 不是 64 的倍数，"
-                            "NewAPI i2i 要求宽高必须 64 整除；请先裁/缩到合规尺寸再发"
-                        )
-                        return False, "尺寸不合规", True
-                    # 文档 §20.1：i2i.image 宽高与外层 size 必须相等，所以以图为准
-                    image_size = [width, height]
+                if dims is None:
+                    # 文档 §20.1 要求 image 宽高严格等于外层 size；解析不出尺寸就一定送不出合规请求，
+                    # 不能静默走默认 size 让上游打 400（曾经的 bug：image 188x188 被默认 size=832x1216
+                    # 配走，服务端报 REQUEST_VALIDATION_ERROR 用户一脸懵）
+                    await self.send_text(
+                        "❌ 无法解析参考图尺寸：可能是缩略图、损坏或不受支持的格式\n"
+                        "NewAPI i2i 要求图片宽高必须严格等于输出 size。请直接把原图作为命令的同条消息发出来\n"
+                        "（PNG/JPEG/WebP，不要回复引用，部分平台引用回复只会给低分辨率缩略图）"
+                    )
+                    return False, "图片尺寸解析失败", True
+                width, height = dims
+                if width % 64 != 0 or height % 64 != 0:
+                    await self.send_text(
+                        f"❌ 参考图尺寸 {width}x{height} 不是 64 的倍数，"
+                        "NewAPI i2i 要求宽高必须 64 整除；请先裁/缩到合规尺寸再发"
+                    )
+                    return False, "尺寸不合规", True
+                if width < 256 or height < 256:
+                    # 256 以下基本就是缩略图，硬送即使形式合规出图也是糊的
+                    await self.send_text(
+                        f"❌ 参考图尺寸 {width}x{height} 过小（< 256），疑似缩略图\n"
+                        "请直接把原图作为命令的同条消息发出来，避免走引用回复拿到缩略图"
+                    )
+                    return False, "参考图过小", True
+                image_size = [width, height]
                 i2i_payload = {"image": normalized_image}
                 if strength is not None:
                     i2i_payload["strength"] = strength
-            else:
+            elif mode == "ref":
                 ref_entry: dict[str, Any] = {"image": normalized_image}
                 if type_value:
                     ref_entry["type"] = type_value
@@ -1966,6 +2274,13 @@ class NaiInvocation(ModelConfigMixin):
                 if strength is not None:
                     ref_entry["strength"] = strength
                 character_references_payload = [ref_entry]
+            elif mode == "vibe":
+                vibe_entry: dict[str, Any] = {"image": normalized_image}
+                if info_extracted is not None:
+                    vibe_entry["info_extracted"] = info_extracted
+                if strength is not None:
+                    vibe_entry["strength"] = strength
+                controlnet_payload = {"images": [vibe_entry]}
 
             enable_debug = bool(self.get_config("components.enable_debug_info", False))
             if enable_debug:
@@ -1980,6 +2295,7 @@ class NaiInvocation(ModelConfigMixin):
                 size=image_size,
                 characters=request_characters,
                 i2i_payload=i2i_payload,
+                controlnet_payload=controlnet_payload,
                 character_references_payload=character_references_payload,
             )
 
@@ -2505,12 +2821,29 @@ class NaiInvocation(ModelConfigMixin):
    含「肖像/生活照/立绘/portrait」走肖像路径；
    其它走普通画图。
 
+【图生图】（需先引用一张图，或同消息发图带命令）
+/nai i2i <描述> - 图生图（§20.1）：以参考图为底重绘
+  · 参考图宽高必须 64 整除，会自动以参考图尺寸出图
+  · 引用回复有些平台只给缩略图，建议直接同条消息附图
+
+【Vibe / 角色参考】（先把图存入图库，再用命令引用，跨重启保留）
+/nai vibe存 <名字> - 引用一张图，存入 vibe 图库
+/nai vibe图库 - 列出当前的 vibe 命名图（★ 标记选中项）
+/nai vibe删 <名字> - 删除一张 vibe 图
+/nai vibe选 <名字> - 把本会话默认 vibe 图设为这张
+/nai vibe @<名字> <描述> - 单次用指定 vibe 图（不动默认选定）
+/nai vibe <描述> - 用本会话默认 vibe 图生图（先 /nai vibe选）
+🔁 ref 同结构：/nai ref存 / ref图库 / ref删 / ref选 / ref @<名字> / ref <描述>
+   · vibe 走 §20.3，全量 cache_id 命中可省 1 anlas
+   · ref 走 §20.4，仅 V4.5 系列模型支持，其它模型自动降级
+
 【模型 / 尺寸 / 画师】（所有人可用，会话级，重启回退默认）
 /nai set [代号] - 查看/切换模型
   代号：3=V3, f3=Furry V3, 4c=V4 Curated, 4=V4 Full, 4.5c=V4.5 Curated, 4.5=V4.5 Full
 /nai size [代号] - 查看/切换尺寸
   代号：竖/v、横/h、方/s
 /nai art [编号] - 查看/切换画师风格预设
+/nai models - 拉取 NewAPI 网关实时可用模型清单
 
 【自动撤回】（仅管理员）
 /nai on - 开启图片自动撤回
