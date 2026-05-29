@@ -37,9 +37,10 @@ class WD14Client:
     """WD14 Tagger 客户端 - 多 Space 轮询负载均衡"""
 
     # 实测 1~2MB 大图在 HF Space 上推理耗时 16~23s（含队列等待 + 推理 + 上传），
-    # 留 12s 余量到 35s；整体走完 3 个 Space 最坏 105s，给到 120s。
-    SAFE_COMMAND_TIMEOUT = 120.0
-    SAFE_SPACE_TIMEOUT_CAP = 35.0
+    # 但 PixAI-Tagger-v0.9-ONNX 等冷启动后首次跑常常远超 35s，把单 Space 上限抬到
+    # 120s 给冷启留余量；整体走完 3 个 Space 最坏 360s。
+    SAFE_COMMAND_TIMEOUT = 360.0
+    SAFE_SPACE_TIMEOUT_CAP = 120.0
 
     # 默认的 Space 列表（如果配置文件未提供）
     DEFAULT_SPACES = [

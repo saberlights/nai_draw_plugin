@@ -1001,8 +1001,8 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "wd14_request_timeout": ConfigField(
                 type=float,
-                default=35.0,
-                description="单个 Space 请求超时；单位秒，可填正数；1~2MB 大图实测需 16~23s，留点余量"
+                default=120.0,
+                description="单个 Space 请求超时；单位秒，可填正数；冷启动后首次跑常需 30~90s，留余量到 120s"
             ),
             "wd14_max_retries": ConfigField(
                 type=int,

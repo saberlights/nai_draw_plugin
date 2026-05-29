@@ -233,7 +233,7 @@ min_score = 0.6
 
 两级链路：
 1. **PNG 元数据**（NAI Comment JSON / SD WebUI `parameters`）— 原图秒级精确还原，画师串都齐
-2. **WD14 在线 Space**（仅当上一步未命中）— 三个 HF Space 串行轮询，前一个失败才打扰下一个，整体最坏 ~120s
+2. **WD14 在线 Space**（仅当上一步未命中）— 三个 HF Space 串行轮询，前一个失败才打扰下一个，整体最坏 ~360s
 
 ```toml
 [retag]
@@ -245,7 +245,7 @@ wd14_enabled = true               # 非原图时是否调 WD14；需 pip install
 wd14_model = "SmilingWolf/wd-eva02-large-tagger-v3"
 wd14_threshold = 0.35             # 通用 tag 置信度阈值（0~1）
 wd14_character_threshold = 0.8    # 角色 tag 置信度阈值
-wd14_request_timeout = 35.0       # 单个 Space 超时（实测大图需 16~23s）
+wd14_request_timeout = 120.0      # 单个 Space 超时（冷启动后首次跑常需 30~90s）
 wd14_max_retries = 1
 wd14_retry_delay = 0.5
 
