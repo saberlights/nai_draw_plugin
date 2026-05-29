@@ -65,6 +65,8 @@ from .core.services.named_reference_store import (
     CapacityExceededError as _NamedRefCapacityExceededError,
     InvalidImageError as _NamedRefInvalidImageError,
     InvalidNameError as _NamedRefInvalidNameError,
+    OWNER_GROUP as _NAMED_OWNER_GROUP,
+    OWNER_USER as _NAMED_OWNER_USER,
     SCOPE_REF as _NAMED_SCOPE_REF,
     SCOPE_VIBE as _NAMED_SCOPE_VIBE,
     get_named_reference_store,
@@ -619,6 +621,17 @@ class NaiInvocation(ModelConfigMixin):
     def _chat_type_text(self) -> str:
         """返回用户可读的聊天类型。"""
         return "群聊" if self.group_id else "私聊"
+
+    def _named_reference_owner(self) -> tuple[str, str]:
+        """命名图库（vibe / ref）的归属维度：群聊共享群图库，私聊按 user 隔离。
+
+        返回 ``(owner_kind, owner_id)``：群聊 ``("group", group_id)``，
+        私聊 ``("user", user_id)``。这样同一群聊里所有成员共用一份图库，
+        修复了"群里每个人各存各的图"的历史 bug。
+        """
+        if self.group_id:
+            return _NAMED_OWNER_GROUP, self.group_id
+        return _NAMED_OWNER_USER, self.user_id
 
     def _check_user_permission(self) -> bool:
         """检查当前用户是否有权限触发生图。"""
@@ -2031,10 +2044,12 @@ class NaiInvocation(ModelConfigMixin):
             return False, "图片解码失败", True
 
         store = get_named_reference_store()
+        owner_kind, owner_id = self._named_reference_owner()
         try:
             ref = store.save(
                 scope=scope,
-                user_id=self.user_id,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
                 name=name,
                 image_bytes=image_bytes,
             )
@@ -2067,10 +2082,11 @@ class NaiInvocation(ModelConfigMixin):
         *,
         scope: str,
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai (vibe|ref)图库`：列出当前用户的命名图。"""
+        """处理 `/nai (vibe|ref)图库`：列出当前归属（群聊→该群 / 私聊→个人）的命名图。"""
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
-        entries = store.list(scope=scope, user_id=self.user_id)
+        owner_kind, owner_id = self._named_reference_owner()
+        entries = store.list(scope=scope, owner_kind=owner_kind, owner_id=owner_id)
         if not entries:
             await self.send_text(
                 f"📂 {scope_label} 图库还是空的\n"
@@ -2080,7 +2096,10 @@ class NaiInvocation(ModelConfigMixin):
 
         # 标出"当前选定"项（list），方便用户知道下一条裸命令会用哪几张
         selected_list = store.get_selection(
-            scope=scope, user_id=self.user_id, stream_id=self.stream_id
+            scope=scope,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            stream_id=self.stream_id,
         )
         selected_set = set(selected_list)
         lines = [f"📂 {scope_label} 图库（{len(entries)} 张）"]
@@ -2116,8 +2135,9 @@ class NaiInvocation(ModelConfigMixin):
         """处理 `/nai (vibe|ref)删 <名字>`。"""
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
+        owner_kind, owner_id = self._named_reference_owner()
         try:
-            ok = store.delete(scope=scope, user_id=self.user_id, name=name)
+            ok = store.delete(scope=scope, owner_kind=owner_kind, owner_id=owner_id, name=name)
         except _NamedRefInvalidNameError as exc:
             await self.send_text(f"❌ 名字不合规：{exc}")
             return False, "名字不合规", True
@@ -2132,15 +2152,17 @@ class NaiInvocation(ModelConfigMixin):
         *,
         scope: str,
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai (vibe|ref)清空`：一键删除当前用户该 scope 的全部图 + 选定。
+        """处理 `/nai (vibe|ref)清空`：一键删除当前归属该 scope 的全部图 + 选定。
 
-        语义是"清空我的整个 {scope} 图库"，跨 stream 生效（store 层不区分 stream，按
-        user_id 隔离）。返回实际删除的张数，便于用户确认。
+        语义是"清空当前归属的整个 {scope} 图库"。群聊里归属是该群本身，会清空整个
+        群的共享图库；私聊里归属是 user_id，按个人隔离。跨 stream 生效（store 层不
+        区分 stream，按 owner 隔离）。返回实际删除的张数，便于用户确认。
         """
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
+        owner_kind, owner_id = self._named_reference_owner()
         try:
-            deleted = store.clear_all(scope=scope, user_id=self.user_id)
+            deleted = store.clear_all(scope=scope, owner_kind=owner_kind, owner_id=owner_id)
         except Exception as exc:
             logger.error(
                 "%s /nai %s清空 执行异常: %r", self.log_prefix, scope, exc, exc_info=True
@@ -2169,6 +2191,7 @@ class NaiInvocation(ModelConfigMixin):
         vibe 接受 1~4 张（§20.3），ref 接受 1 张（§20.4）。"""
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
+        owner_kind, owner_id = self._named_reference_owner()
         max_count = _max_selection_for_scope(scope)
         if not names:
             await self.send_text(f"❌ 请至少给一张名字：/nai {scope}选 <名字>")
@@ -2181,7 +2204,8 @@ class NaiInvocation(ModelConfigMixin):
         try:
             store.set_selection(
                 scope=scope,
-                user_id=self.user_id,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
                 stream_id=self.stream_id,
                 names=names,
             )
@@ -2223,6 +2247,7 @@ class NaiInvocation(ModelConfigMixin):
         """
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
+        owner_kind, owner_id = self._named_reference_owner()
         max_count = _max_selection_for_scope(scope)
 
         chosen_names: List[str] = []
@@ -2235,7 +2260,10 @@ class NaiInvocation(ModelConfigMixin):
             chosen_names = list(explicit_names)
         else:
             chosen_names = store.get_selection(
-                scope=scope, user_id=self.user_id, stream_id=self.stream_id
+                scope=scope,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                stream_id=self.stream_id,
             )
             if not chosen_names:
                 await self.send_text(
@@ -2250,7 +2278,10 @@ class NaiInvocation(ModelConfigMixin):
         for name in chosen_names:
             try:
                 image_bytes = store.get(
-                    scope=scope, user_id=self.user_id, name=name
+                    scope=scope,
+                    owner_kind=owner_kind,
+                    owner_id=owner_id,
+                    name=name,
                 )
             except _NamedRefInvalidNameError as exc:
                 await self.send_text(f"❌ 名字不合规：{exc}")
@@ -2259,7 +2290,10 @@ class NaiInvocation(ModelConfigMixin):
                 # 没在 @<名字> 指定中：可能粘性选定指向已删图，清掉选定
                 if not explicit_names:
                     store.clear_selection(
-                        scope=scope, user_id=self.user_id, stream_id=self.stream_id
+                        scope=scope,
+                        owner_kind=owner_kind,
+                        owner_id=owner_id,
+                        stream_id=self.stream_id,
                     )
                     await self.send_text(
                         f"❌ 选定列表里的 {name} 已不在 {scope_label} 图库（可能已被删），"

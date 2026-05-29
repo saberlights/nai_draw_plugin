@@ -5,15 +5,20 @@
 单文件 JSON 跨重启保留。这样图片能被文件管理器直接打开看，没有 base64 33%
 膨胀，也不引入额外 BLOB 类的数据库依赖。
 
-目录结构：
+归属维度（owner）：群聊按 ``group_id`` 分桶，所有群成员共享一份图库；私聊
+按 ``user_id`` 分桶，按个人隔离。"群聊里却按人分图"是历史误设，已修复。
+
+目录结构::
 
     <root>/
-      users/<user_dir>/vibe/<name>.<ext>
-      users/<user_dir>/ref/<name>.<ext>
+      groups/<owner_dir>/vibe/<name>.<ext>
+      groups/<owner_dir>/ref/<name>.<ext>
+      users/<owner_dir>/vibe/<name>.<ext>
+      users/<owner_dir>/ref/<name>.<ext>
       selection.json
 
-其中 ``<user_dir>`` 用 user_id 的 sha256 前缀；用户 id 里可能带冒号 / 反斜杠
-等不同平台的不可控字符，hash 一遍最稳，跨平台都安全。selection.json 的写入
+其中 ``<owner_dir>`` 用 owner_id 的 sha256 前缀；id 里可能带冒号 / 反斜杠等
+不同平台的不可控字符，hash 一遍最稳，跨平台都安全。selection.json 的写入
 走"写临时文件 → 原子 rename"避免半写入污染。
 """
 
@@ -35,6 +40,8 @@ __all__ = [
     "NamedReferenceStore",
     "SCOPE_VIBE",
     "SCOPE_REF",
+    "OWNER_GROUP",
+    "OWNER_USER",
     "MAX_NAME_LENGTH",
     "max_selection_for_scope",
     "InvalidNameError",
@@ -46,6 +53,19 @@ __all__ = [
 SCOPE_VIBE = "vibe"
 SCOPE_REF = "ref"
 _VALID_SCOPES = frozenset({SCOPE_VIBE, SCOPE_REF})
+
+# 归属维度：群聊共享一份图库，私聊按个人。owner_kind 仅限这两个值。
+OWNER_GROUP = "group"
+OWNER_USER = "user"
+_VALID_OWNER_KINDS = frozenset({OWNER_GROUP, OWNER_USER})
+
+# selection.json 里区分 owner_kind 的 bucket key；加 ``@`` 前缀避开任何
+# hash 出来的 owner_dir_name（hex 16 位，不会含 ``@``），从而能跟旧格式
+# （``{scope: {user_dir: {...}}}``）共存且无冲突。
+_OWNER_BUCKET_KEYS: Dict[str, str] = {
+    OWNER_GROUP: "@group",
+    OWNER_USER: "@user",
+}
 
 # §20.3 controlnet.images 最多 4 张；§20.4 character_references 最多 1 张
 _MAX_SELECTION_PER_SCOPE: Dict[str, int] = {
@@ -63,7 +83,7 @@ def max_selection_for_scope(scope: str) -> int:
 MAX_NAME_LENGTH = 32
 _VALID_NAME_PATTERN = re.compile(r"^[一-鿿a-zA-Z0-9_]{1,32}$")
 
-# 默认每个 (user_id, scope) 下最多 20 张，跟 image_cache_per_stream 同量级
+# 默认每个 (owner, scope) 下最多 20 张，跟 image_cache_per_stream 同量级
 _DEFAULT_MAX_PER_SCOPE = 20
 
 
@@ -94,8 +114,11 @@ class NamedReference(NamedTuple):
 class NamedReferenceStore:
     """vibe / ref 的命名图库。
 
-    所有公共方法都按 ``(scope, user_id, ...)`` 索引；线程安全（asyncio 单线程
-    场景实际上不会并发，但 selection.json 的读写要原子）。
+    所有公共方法都按 ``(scope, owner_kind, owner_id, ...)`` 索引；线程安全
+    （asyncio 单线程场景实际上不会并发，但 selection.json 的读写要原子）。
+
+    ``owner_kind`` 取 ``OWNER_GROUP`` / ``OWNER_USER``：群聊用群 id 分桶让
+    所有群员共用一份图库，私聊用 user_id 分桶按人隔离。
     """
 
     def __init__(
@@ -106,9 +129,11 @@ class NamedReferenceStore:
     ) -> None:
         self._root = Path(root)
         self._max_per_scope = max(1, int(max_per_scope))
+        self._groups_root = self._root / "groups"
         self._users_root = self._root / "users"
         self._selection_path = self._root / "selection.json"
         self._lock = threading.Lock()
+        self._groups_root.mkdir(parents=True, exist_ok=True)
         self._users_root.mkdir(parents=True, exist_ok=True)
 
     # ── 公共：图本身 ───────────────────────────────────────────────────────
@@ -117,7 +142,8 @@ class NamedReferenceStore:
         self,
         *,
         scope: str,
-        user_id: str,
+        owner_kind: str,
+        owner_id: str,
         name: str,
         image_bytes: bytes,
     ) -> NamedReference:
@@ -129,6 +155,7 @@ class NamedReferenceStore:
             CapacityExceededError: 新增（不是覆盖）会超过单库上限
         """
         self._validate_scope(scope)
+        self._validate_owner(owner_kind, owner_id)
         self._validate_name(name)
         image_format = self._detect_format(image_bytes)
         if image_format is None:
@@ -140,7 +167,7 @@ class NamedReferenceStore:
             raise InvalidImageError("image_bytes 格式可识别但宽高解析失败，可能已损坏")
 
         with self._lock:
-            scope_dir = self._scope_dir(scope, user_id)
+            scope_dir = self._scope_dir(scope, owner_kind, owner_id)
             scope_dir.mkdir(parents=True, exist_ok=True)
             existing = self._list_files(scope_dir)
             target_stem = name
@@ -174,10 +201,17 @@ class NamedReferenceStore:
             path=final_path,
         )
 
-    def list(self, *, scope: str, user_id: str) -> List[NamedReference]:
-        """列出 (scope, user_id) 下所有命名图，按名字字典序。"""
+    def list(
+        self,
+        *,
+        scope: str,
+        owner_kind: str,
+        owner_id: str,
+    ) -> List[NamedReference]:
+        """列出 (scope, owner) 下所有命名图，按名字字典序。"""
         self._validate_scope(scope)
-        scope_dir = self._scope_dir(scope, user_id)
+        self._validate_owner(owner_kind, owner_id)
+        scope_dir = self._scope_dir(scope, owner_kind, owner_id)
         if not scope_dir.exists():
             return []
         entries: List[NamedReference] = []
@@ -187,11 +221,19 @@ class NamedReferenceStore:
                 entries.append(ref)
         return entries
 
-    def get(self, *, scope: str, user_id: str, name: str) -> Optional[bytes]:
+    def get(
+        self,
+        *,
+        scope: str,
+        owner_kind: str,
+        owner_id: str,
+        name: str,
+    ) -> Optional[bytes]:
         """读图字节。不存在返回 None；名字非法直接抛。"""
         self._validate_scope(scope)
+        self._validate_owner(owner_kind, owner_id)
         self._validate_name(name)
-        scope_dir = self._scope_dir(scope, user_id)
+        scope_dir = self._scope_dir(scope, owner_kind, owner_id)
         if not scope_dir.exists():
             return None
         for path in self._list_files(scope_dir):
@@ -202,11 +244,19 @@ class NamedReferenceStore:
                     return None
         return None
 
-    def delete(self, *, scope: str, user_id: str, name: str) -> bool:
+    def delete(
+        self,
+        *,
+        scope: str,
+        owner_kind: str,
+        owner_id: str,
+        name: str,
+    ) -> bool:
         """删一张；删了返回 True，没找到返回 False。"""
         self._validate_scope(scope)
+        self._validate_owner(owner_kind, owner_id)
         self._validate_name(name)
-        scope_dir = self._scope_dir(scope, user_id)
+        scope_dir = self._scope_dir(scope, owner_kind, owner_id)
         if not scope_dir.exists():
             return False
         deleted = False
@@ -222,15 +272,25 @@ class NamedReferenceStore:
             if deleted:
                 self._mutate_selection(
                     lambda data: self._drop_selection_for_name(
-                        data, scope=scope, user_id=user_id, name=name
+                        data,
+                        scope=scope,
+                        owner_kind=owner_kind,
+                        owner_id=owner_id,
+                        name=name,
                     )
                 )
         return deleted
 
-    def clear_all(self, *, scope: str, user_id: str) -> int:
-        """删 (scope, user_id) 下的所有图 + 清掉该 (scope, user_id) 在所有 stream 上的选定。
+    def clear_all(
+        self,
+        *,
+        scope: str,
+        owner_kind: str,
+        owner_id: str,
+    ) -> int:
+        """删 (scope, owner) 下的所有图 + 清掉该 (scope, owner) 在所有 stream 上的选定。
 
-        语义是"一键清空当前用户在该图库的状态"，专给 /nai vibe清空 / /nai ref清空 用。
+        语义是"一键清空当前归属在该图库的状态"，专给 /nai vibe清空 / /nai ref清空 用。
         删除按 best-effort 推进：单张 unlink 失败不会回滚已成功的删除（文件系统级原子性靠
         rename/unlink 自身保证；多张删一半失败时下次调用可继续清剩下的）。
 
@@ -238,7 +298,8 @@ class NamedReferenceStore:
             实际删除的图片张数；目录不存在或图库本来就空时返回 0。
         """
         self._validate_scope(scope)
-        scope_dir = self._scope_dir(scope, user_id)
+        self._validate_owner(owner_kind, owner_id)
+        scope_dir = self._scope_dir(scope, owner_kind, owner_id)
         deleted = 0
         with self._lock:
             if scope_dir.exists():
@@ -248,10 +309,13 @@ class NamedReferenceStore:
                         deleted += 1
                     except OSError:
                         continue
-            # 整体清掉该 (scope, user) 在所有 stream 上的选定，跟 delete 的语义对齐
+            # 整体清掉该 (scope, owner) 在所有 stream 上的选定，跟 delete 的语义对齐
             self._mutate_selection(
-                lambda data: self._drop_all_selections_for_user(
-                    data, scope=scope, user_id=user_id
+                lambda data: self._drop_all_selections_for_owner(
+                    data,
+                    scope=scope,
+                    owner_kind=owner_kind,
+                    owner_id=owner_id,
                 )
             )
         return deleted
@@ -262,11 +326,12 @@ class NamedReferenceStore:
         self,
         *,
         scope: str,
-        user_id: str,
+        owner_kind: str,
+        owner_id: str,
         stream_id: str,
         names: List[str],
     ) -> None:
-        """把 (scope, user_id, stream_id) 的粘性选定指向 names 列表。
+        """把 (scope, owner, stream_id) 的粘性选定指向 names 列表。
 
         ``vibe`` 接受 1~4 张（§20.3 controlnet.images 最多 4 张），
         ``ref`` 仅接受 1 张（§20.4 character_references 最多 1 张）。
@@ -277,6 +342,7 @@ class NamedReferenceStore:
             ValueError: names 数量超出 scope 允许的上限 / 为空 / stream_id 为空
         """
         self._validate_scope(scope)
+        self._validate_owner(owner_kind, owner_id)
         if not stream_id:
             raise ValueError("stream_id 不能为空")
         if not isinstance(names, (list, tuple)) or not names:
@@ -290,16 +356,18 @@ class NamedReferenceStore:
         normalized: List[str] = []
         for n in names:
             self._validate_name(n)
-            if self.get(scope=scope, user_id=user_id, name=n) is None:
+            if self.get(scope=scope, owner_kind=owner_kind, owner_id=owner_id, name=n) is None:
                 raise KeyError(f"{scope} 图库里没有命名图 {n!r}")
             normalized.append(n)
-        user_dir_name = self._user_dir_name(user_id)
+        owner_dir_name = self._owner_dir_name(owner_id)
+        owner_bucket_key = _OWNER_BUCKET_KEYS[owner_kind]
         with self._lock:
             self._mutate_selection(
                 lambda data: self._set_selection_entry(
                     data,
                     scope=scope,
-                    user_dir_name=user_dir_name,
+                    owner_bucket_key=owner_bucket_key,
+                    owner_dir_name=owner_dir_name,
                     stream_id=stream_id,
                     names=normalized,
                 )
@@ -309,25 +377,43 @@ class NamedReferenceStore:
         self,
         *,
         scope: str,
-        user_id: str,
+        owner_kind: str,
+        owner_id: str,
         stream_id: str,
     ) -> List[str]:
-        """读 (scope, user_id, stream_id) 的粘性选定列表；没选过返回空列表。
+        """读 (scope, owner, stream_id) 的粘性选定列表；没选过返回空列表。
 
-        兼容旧版 selection.json 里的单字符串形态：读到 str 时自动升级为 [str]。
+        兼容两类历史格式：
+        1. 旧版顶层 ``{scope: {user_dir: {stream: ...}}}``（没有 owner_kind 层），
+           视为 ``OWNER_USER`` 桶。
+        2. 同 stream 下的 value 为单 string 形态（更早的单图选定），自动升级为
+           ``[string]``。
         """
         self._validate_scope(scope)
+        self._validate_owner(owner_kind, owner_id)
         if not stream_id:
             return []
         data = self._read_selection()
-        user_dir_name = self._user_dir_name(user_id)
+        owner_dir_name = self._owner_dir_name(owner_id)
+        owner_bucket_key = _OWNER_BUCKET_KEYS[owner_kind]
         scope_data = data.get(scope)
         if not isinstance(scope_data, dict):
             return []
-        user_data = scope_data.get(user_dir_name)
-        if not isinstance(user_data, dict):
+        # 优先读新格式 (@user / @group 桶)
+        owner_bucket = scope_data.get(owner_bucket_key)
+        owner_data: Optional[Dict] = None
+        if isinstance(owner_bucket, dict):
+            candidate = owner_bucket.get(owner_dir_name)
+            if isinstance(candidate, dict):
+                owner_data = candidate
+        # 回退：仅 OWNER_USER 才能读旧版扁平结构（旧数据本就是按 user 存的）
+        if owner_data is None and owner_kind == OWNER_USER:
+            legacy = scope_data.get(owner_dir_name)
+            if isinstance(legacy, dict):
+                owner_data = legacy
+        if owner_data is None:
             return []
-        value = user_data.get(stream_id)
+        value = owner_data.get(stream_id)
         # 旧格式：单 string；新格式：list[str]
         if isinstance(value, str):
             return [value] if value else []
@@ -339,39 +425,54 @@ class NamedReferenceStore:
         self,
         *,
         scope: str,
-        user_id: str,
+        owner_kind: str,
+        owner_id: str,
         stream_id: str,
     ) -> None:
-        """清掉 (scope, user_id, stream_id) 的选定；没选过也安全。"""
+        """清掉 (scope, owner, stream_id) 的选定；没选过也安全。"""
         self._validate_scope(scope)
+        self._validate_owner(owner_kind, owner_id)
         if not stream_id:
             return
-        user_dir_name = self._user_dir_name(user_id)
+        owner_dir_name = self._owner_dir_name(owner_id)
+        owner_bucket_key = _OWNER_BUCKET_KEYS[owner_kind]
         with self._lock:
             self._mutate_selection(
                 lambda data: self._clear_selection_entry(
                     data,
                     scope=scope,
-                    user_dir_name=user_dir_name,
+                    owner_bucket_key=owner_bucket_key,
+                    owner_dir_name=owner_dir_name,
                     stream_id=stream_id,
+                    legacy_user_fallback=(owner_kind == OWNER_USER),
                 )
             )
 
     # ── 内部辅助：路径 / 校验 ──────────────────────────────────────────────
 
-    def _scope_dir(self, scope: str, user_id: str) -> Path:
-        return self._users_root / self._user_dir_name(user_id) / scope
+    def _scope_dir(self, scope: str, owner_kind: str, owner_id: str) -> Path:
+        root = self._groups_root if owner_kind == OWNER_GROUP else self._users_root
+        return root / self._owner_dir_name(owner_id) / scope
 
     @staticmethod
-    def _user_dir_name(user_id: str) -> str:
-        """user_id 跨平台带不可控字符（冒号、@、空格等），hash 后取前 16 位最稳。"""
-        digest = hashlib.sha256(str(user_id or "").encode("utf-8")).hexdigest()
+    def _owner_dir_name(owner_id: str) -> str:
+        """owner_id 跨平台带不可控字符（冒号、@、空格等），hash 后取前 16 位最稳。"""
+        digest = hashlib.sha256(str(owner_id or "").encode("utf-8")).hexdigest()
         return digest[:16]
 
     @staticmethod
     def _validate_scope(scope: str) -> None:
         if scope not in _VALID_SCOPES:
             raise ValueError(f"scope 必须是 {sorted(_VALID_SCOPES)} 之一，收到 {scope!r}")
+
+    @staticmethod
+    def _validate_owner(owner_kind: str, owner_id: str) -> None:
+        if owner_kind not in _VALID_OWNER_KINDS:
+            raise ValueError(
+                f"owner_kind 必须是 {sorted(_VALID_OWNER_KINDS)} 之一，收到 {owner_kind!r}"
+            )
+        if not isinstance(owner_id, str) or not owner_id:
+            raise ValueError(f"owner_id 不能为空，收到 {owner_id!r}")
 
     @staticmethod
     def _validate_name(name: str) -> None:
@@ -485,7 +586,8 @@ class NamedReferenceStore:
         data: Dict,
         *,
         scope: str,
-        user_dir_name: str,
+        owner_bucket_key: str,
+        owner_dir_name: str,
         stream_id: str,
         names: List[str],
     ) -> None:
@@ -493,29 +595,46 @@ class NamedReferenceStore:
         if not isinstance(scope_bucket, dict):
             scope_bucket = {}
             data[scope] = scope_bucket
-        user_bucket = scope_bucket.setdefault(user_dir_name, {})
-        if not isinstance(user_bucket, dict):
-            user_bucket = {}
-            scope_bucket[user_dir_name] = user_bucket
-        user_bucket[stream_id] = list(names)
+        owner_bucket = scope_bucket.setdefault(owner_bucket_key, {})
+        if not isinstance(owner_bucket, dict):
+            owner_bucket = {}
+            scope_bucket[owner_bucket_key] = owner_bucket
+        owner_data = owner_bucket.setdefault(owner_dir_name, {})
+        if not isinstance(owner_data, dict):
+            owner_data = {}
+            owner_bucket[owner_dir_name] = owner_data
+        owner_data[stream_id] = list(names)
 
     @staticmethod
     def _clear_selection_entry(
         data: Dict,
         *,
         scope: str,
-        user_dir_name: str,
+        owner_bucket_key: str,
+        owner_dir_name: str,
         stream_id: str,
+        legacy_user_fallback: bool,
     ) -> None:
         scope_bucket = data.get(scope)
         if not isinstance(scope_bucket, dict):
             return
-        user_bucket = scope_bucket.get(user_dir_name)
-        if not isinstance(user_bucket, dict):
-            return
-        user_bucket.pop(stream_id, None)
-        if not user_bucket:
-            scope_bucket.pop(user_dir_name, None)
+        # 新格式
+        owner_bucket = scope_bucket.get(owner_bucket_key)
+        if isinstance(owner_bucket, dict):
+            owner_data = owner_bucket.get(owner_dir_name)
+            if isinstance(owner_data, dict):
+                owner_data.pop(stream_id, None)
+                if not owner_data:
+                    owner_bucket.pop(owner_dir_name, None)
+            if not owner_bucket:
+                scope_bucket.pop(owner_bucket_key, None)
+        # 兼容旧格式：仅当当前是 user 归属时才动旧扁平结构
+        if legacy_user_fallback:
+            legacy = scope_bucket.get(owner_dir_name)
+            if isinstance(legacy, dict):
+                legacy.pop(stream_id, None)
+                if not legacy:
+                    scope_bucket.pop(owner_dir_name, None)
         if not scope_bucket:
             data.pop(scope, None)
 
@@ -524,53 +643,79 @@ class NamedReferenceStore:
         data: Dict,
         *,
         scope: str,
-        user_id: str,
+        owner_kind: str,
+        owner_id: str,
         name: str,
     ) -> None:
         """图被删时，把所有指向它的粘性选定也一起清掉。
 
         新版选定是 list，所以这里要从每个 stream 的列表里把 name 剔掉；
         剔完为空再删 stream key。兼容旧 string 格式（直接整条删）。"""
-        user_dir_name = self._user_dir_name(user_id)
+        owner_dir_name = self._owner_dir_name(owner_id)
+        owner_bucket_key = _OWNER_BUCKET_KEYS[owner_kind]
         scope_bucket = data.get(scope)
         if not isinstance(scope_bucket, dict):
             return
-        user_bucket = scope_bucket.get(user_dir_name)
-        if not isinstance(user_bucket, dict):
-            return
-        for stream_id in list(user_bucket.keys()):
-            value = user_bucket.get(stream_id)
-            if isinstance(value, str):
-                # 旧 string 格式：仅在等于待删名时整条干掉
-                if value == name:
-                    user_bucket.pop(stream_id, None)
-            elif isinstance(value, list):
-                new_list = [v for v in value if v != name]
-                if not new_list:
-                    user_bucket.pop(stream_id, None)
+
+        def _strip_from_owner_data(owner_data: Dict) -> None:
+            for stream_id in list(owner_data.keys()):
+                value = owner_data.get(stream_id)
+                if isinstance(value, str):
+                    # 旧 string 格式：仅在等于待删名时整条干掉
+                    if value == name:
+                        owner_data.pop(stream_id, None)
+                elif isinstance(value, list):
+                    new_list = [v for v in value if v != name]
+                    if not new_list:
+                        owner_data.pop(stream_id, None)
+                    else:
+                        owner_data[stream_id] = new_list
                 else:
-                    user_bucket[stream_id] = new_list
-            else:
-                # 异常格式直接清掉
-                user_bucket.pop(stream_id, None)
-        if not user_bucket:
-            scope_bucket.pop(user_dir_name, None)
+                    # 异常格式直接清掉
+                    owner_data.pop(stream_id, None)
+
+        # 新格式
+        owner_bucket = scope_bucket.get(owner_bucket_key)
+        if isinstance(owner_bucket, dict):
+            owner_data = owner_bucket.get(owner_dir_name)
+            if isinstance(owner_data, dict):
+                _strip_from_owner_data(owner_data)
+                if not owner_data:
+                    owner_bucket.pop(owner_dir_name, None)
+            if not owner_bucket:
+                scope_bucket.pop(owner_bucket_key, None)
+        # 兼容旧扁平格式（user 归属才会有）
+        if owner_kind == OWNER_USER:
+            legacy = scope_bucket.get(owner_dir_name)
+            if isinstance(legacy, dict):
+                _strip_from_owner_data(legacy)
+                if not legacy:
+                    scope_bucket.pop(owner_dir_name, None)
         if not scope_bucket:
             data.pop(scope, None)
 
-    def _drop_all_selections_for_user(
+    def _drop_all_selections_for_owner(
         self,
         data: Dict,
         *,
         scope: str,
-        user_id: str,
+        owner_kind: str,
+        owner_id: str,
     ) -> None:
-        """清空该 (scope, user_id) 在所有 stream 上的选定，配合 clear_all 用。"""
-        user_dir_name = self._user_dir_name(user_id)
+        """清空该 (scope, owner) 在所有 stream 上的选定，配合 clear_all 用。"""
+        owner_dir_name = self._owner_dir_name(owner_id)
+        owner_bucket_key = _OWNER_BUCKET_KEYS[owner_kind]
         scope_bucket = data.get(scope)
         if not isinstance(scope_bucket, dict):
             return
-        scope_bucket.pop(user_dir_name, None)
+        owner_bucket = scope_bucket.get(owner_bucket_key)
+        if isinstance(owner_bucket, dict):
+            owner_bucket.pop(owner_dir_name, None)
+            if not owner_bucket:
+                scope_bucket.pop(owner_bucket_key, None)
+        # 兼容旧扁平格式
+        if owner_kind == OWNER_USER:
+            scope_bucket.pop(owner_dir_name, None)
         if not scope_bucket:
             data.pop(scope, None)
 
