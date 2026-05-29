@@ -4,6 +4,8 @@
 被 sdk_runtime 使用，基于 NovelAI 4/4.5 最新特性优化
 """
 
+from .constants import QUALITY_TAGS_FORBIDDEN, SFW_FORBIDDEN_ALL
+
 # ==================== 共享规则块 ====================
 # 以下规则块在 SFW/NSFW 双版本中共用，保持单点维护避免漂移
 
@@ -314,11 +316,11 @@ _QUALITY_PRINCIPLES = """
 """.strip()
 
 
-_FORBIDDEN_COMMON = """
+_FORBIDDEN_COMMON = f"""
 <forbidden_common>
 ## 通用禁止
 
-- 禁止添加质量词（`masterpiece`、`best quality` 等由系统自动添加）
+- 禁止添加质量词（{', '.join(f'`{tag}`' for tag in QUALITY_TAGS_FORBIDDEN[:3])} 等由系统自动添加）
 - 禁止添加画师 tag（`artist:xxx` 由系统自动添加）
 - 禁止添加反向 tag（由系统配置管理，你只输出正向）
 - 禁止解释、前缀、后缀，只输出提示词本身
@@ -368,13 +370,12 @@ char2:girl, beside girl, {ram (re zero)}, gentle smile, mutual#hug, looking at a
 
 # ==================== SFW 专用规则块 ====================
 
-_SFW_RESTRICTION = """
+_SFW_RESTRICTION = f"""
 <sfw_safety>
 ## SFW 模式限制
 
 【硬性禁用 tag】
-- 性器/裸露：nsfw, nude, naked, sex, penis, pussy, vagina, nipples, anus, penetration, cum, ejaculation, fellatio, cunnilingus, paizuri, footjob, handjob, masturbation, orgasm, topless, bottomless
-- 擦边/性暗示：cleavage, suggestive, seductive, bikini, lingerie, swimsuit, panties, thong, underwear, cameltoe, see-through
+- 性器/裸露：{', '.join(SFW_FORBIDDEN_ALL[:10])}...（共 {len(SFW_FORBIDDEN_ALL)} 个禁用词）
 
 【场景安全化】
 - 用户请求色情/暴露/擦边 → 改写为日常、安全、全年龄版本

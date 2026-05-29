@@ -11,91 +11,22 @@
 """
 
 import re
-from typing import Tuple, List
+from typing import List, Tuple
 
-
-# ==================== Action Guard 关键词 ====================
-# 这些关键词只参与"用户原话强度分级"，不再做白名单拦截。
-# 命中 → 算用户显式请求，节流走 explicit 档；不命中 → 算 bot 主动发图，节流走 proactive 档。
-
-# 用户原话明确要求看图/画图/发图/自拍/肖像/追图。命中即视为显式请求。
-EXPLICIT_IMAGE_REQUEST_KEYWORDS = [
-    # 直接画图/出图请求
-    "画图", "画一", "画个", "画张", "生成图", "出图", "出一张", "发图", "配图",
-    "来一张", "来张", "来一个", "来个", "整张", "整一张", "整一个", "整个",
-    "给我画", "给我来", "给我发", "给我看", "给我整", "帮我画", "帮我生成",
-    "再来一张", "再来个", "另一张", "再画一张", "再发一张", "重新画", "重新发",
-    # 自拍/肖像/照片
-    "自拍", "selfie", "自拍照", "镜子", "镜拍", "镜中", "前置", "前摄", "合照", "合影",
-    "拍给我看", "拍一张", "拍张", "肖像", "portrait", "立绘", "证件照", "生活照",
-    "头像照", "candid",
-    # 想看 bot 本人
-    "看看你", "看你", "想看你", "发你", "发张你的", "你长什么样", "你的照片",
-    "你的样子", "你今天穿了什么", "你今天的样子", "你穿什么", "看看黑丝", "看看白丝",
-    "你的腿", "你的脚", "你的鞋", "你的脸", "你的全身",
-    # 追图/换装
-    "换个角度", "换个姿势", "换个背景", "换个场景", "再拍", "同一套", "这套", "这身",
-]
-
-# 用户原话明确不要图/不要画。命中直接拦截（防止 Planner 偶发误调用）。
-# 拆两档：
-#   strong - 明显拒绝出图的指令，命中即永久拦截（无时效），无视消息距今多久。
-#   weak   - "用文字"这种弱化偏好，stale 后不再生效；仅在用户上一条很近时才阻止。
-NEGATIVE_IMAGE_INTENT_KEYWORDS_STRONG = [
-    "不要画", "不用画", "别画", "别画图", "不画了",
-    "不要图", "不用图", "别发图", "不要发图", "别配图", "不用配图",
-    "别给我画", "别给我发", "不要给我画", "不要给我发",
-    "不用给我画", "不用给我发",
-]
-
-NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK = [
-    "文字就行", "文字回复就行", "文字说就行", "用文字",
-]
-
-# 兼容旧引用：合并视图，仅供仍按"硬拦截"语义读取的旧代码使用。
-NEGATIVE_IMAGE_INTENT_KEYWORDS = NEGATIVE_IMAGE_INTENT_KEYWORDS_STRONG + NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK
-
-
-# ==================== 触发关键词 ====================
-
-# 自拍触发关键词：用户明确要自拍构图
-SELFIE_TRIGGER_KEYWORDS = [
-    # 直接自拍
-    "自拍", "selfie", "self-shot", "自己拍", "给自己拍", "自拍照",
-    # 镜子相关
-    "镜子", "mirror", "照镜子", "镜中", "镜面", "浴室镜", "全身镜", "穿衣镜",
-    # 手机拍照
-    "手机拍", "前置", "前置摄像头", "front camera", "举手机",
-    # 合照自拍
-    "合照", "合影", "一起拍", "group selfie",
-]
-
-# 肖像触发关键词：用户想要 bot 本人的照片，但**不要自拍**
-PORTRAIT_TRIGGER_KEYWORDS = [
-    "肖像", "肖像照", "肖像画", "portrait",
-    "头像", "头像照",
-    "生活照", "证件照", "立绘",
-    "candid",
-]
-
-
-# 「想看 bot 本人」表达：不是显式自拍/肖像词，但语义指向 bot 自己的身体/外形/穿搭。
-# 用来覆盖 SELFIE/PORTRAIT 关键词漏掉的隐式 self-image 请求。
-_BOT_SELF_REFERENCE_KEYWORDS = [
-    "看看你", "看你", "想看你", "发你", "发张你的",
-    "你长什么样", "你的照片", "你的样子", "你今天穿了什么", "你今天的样子",
-    "你穿什么", "你的脸", "你的全身",
-    "看看黑丝", "看看白丝", "你的腿", "你的脚", "你的鞋",
-    "拍给我看",
-]
-
-
-# selfie 后处理（注入 bot 默认外貌、删冲突发色/瞳色 tag）的触发关键词集。
-# 由 SELFIE_TRIGGER + PORTRAIT_TRIGGER + 隐式想看 bot 本人 三类合并而成。
-BOT_SELF_IMAGE_INTENT_KEYWORDS = (
-    SELFIE_TRIGGER_KEYWORDS
-    + PORTRAIT_TRIGGER_KEYWORDS
-    + _BOT_SELF_REFERENCE_KEYWORDS
+from .constants import (
+    BOT_SELF_IMAGE_INTENT_KEYWORDS,
+    BOT_SELF_REFERENCE_KEYWORDS,
+    EXPLICIT_IMAGE_REQUEST_KEYWORDS,
+    EYE_COLOR_KEYWORDS,
+    EYE_SPECIAL_TAGS,
+    HAIR_RELATED_KEYWORDS,
+    NEGATIVE_IMAGE_INTENT_KEYWORDS,
+    NEGATIVE_IMAGE_INTENT_KEYWORDS_STRONG,
+    NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK,
+    PORTRAIT_OUTPUT_TAGS,
+    PORTRAIT_TRIGGER_KEYWORDS,
+    SELFIE_OUTPUT_TAGS,
+    SELFIE_TRIGGER_KEYWORDS,
 )
 
 
@@ -283,7 +214,7 @@ def detect_bot_self_image_from_output(prompt: str) -> bool:
 def detect_portrait_from_output(prompt: str) -> bool:
     """从 LLM 生成的提示词中检测是否含肖像标签。"""
     prompt_lower = prompt.lower()
-    return any(tag in prompt_lower for tag in _PORTRAIT_OUTPUT_TAGS)
+    return any(tag in prompt_lower for tag in PORTRAIT_OUTPUT_TAGS)
 
 
 def get_selfie_hint() -> str:
@@ -344,26 +275,14 @@ def merge_selfie_prompt(generated_prompt: str, selfie_prompt_add: str) -> str:
 
     def is_hair_related(tag: str) -> bool:
         core = normalize_tag(tag)
-        hair_keywords = [
-            " hair", "haired", "twintails", "twin tails", "ponytail", "side ponytail",
-            "braid", "pigtails", "bun", "bob cut", "hime cut", "bangs", "forelock",
-            "ahoge", "side lock", "side locks", "hairclip", "hair clip", "barrette",
-            "hair ornament", "hair ribbon", "hair bow", "hairband", "headband",
-            "scrunchie", "wavy ends", "loose hair strands", "pixie cut", "cropped hair",
-            "short bob", "bob haircut", "shoulder-length hair", "chin-length hair",
-        ]
-        return any(keyword in core for keyword in hair_keywords)
+        return any(keyword in core for keyword in HAIR_RELATED_KEYWORDS)
 
     def is_eye_related(tag: str) -> bool:
         core = normalize_tag(tag)
-        eye_colors = {
-            "black", "brown", "blue", "red", "green", "purple", "orange",
-            "gray", "grey", "golden", "yellow", "pink", "aqua", "cyan",
-        }
-        if core in {"eyelashes", "long eyelashes", "heterochromia"}:
+        if core in EYE_SPECIAL_TAGS:
             return True
         match = re.search(r"\b([a-z]+)\s+eyes\b", core)
-        if match and match.group(1) in eye_colors:
+        if match and match.group(1) in EYE_COLOR_KEYWORDS:
             return True
         return bool(re.search(r"\b[a-z]+-eyed\b", core))
 
