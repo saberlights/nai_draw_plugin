@@ -2423,16 +2423,44 @@ class NaiInvocation(ModelConfigMixin):
                 generated_prompt = normalize_prompt_order(generated_prompt)
                 structured_payload = self._normalize_structured_order(structured_payload)
 
+            # vibe 与 /nai 文字命令对齐：用户文本里点名要 bot 自拍 / 肖像时注入 bot 外貌
+            # 与 selfie_prompt_add。raw_prompt（/nai0 vibe）路径用户已显式给 tags，跳过；
+            # ref / i2i 不注入——会把指定参考图洗成 bot 外貌（见 _run_image_pipeline 主路径
+            # `is_selfie=False` 历史注释）。
+            is_selfie = (
+                mode == "vibe"
+                and raw_prompt is None
+                and detect_bot_self_image_intent(description)
+            )
+            selfie_base_prompt = generated_prompt
+            if is_selfie:
+                generated_prompt = self._process_selfie_prompt(
+                    generated_prompt,
+                    description,
+                    include_selfie_prompt_add=True,
+                    log_changes=True,
+                )
+                # 自拍场景目前一律按单字符串路径处理（_process_selfie_prompt 只作用于字符串）
+                structured_payload = None
+
             generated_prompt = self._sanitize_prompt_for_sfw_mode(generated_prompt)
             structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
 
             if self._is_prompt_show_enabled():
-                await self.send_text(
-                    f"📝 提示词:\n{self._sanitize_prompt_for_sfw_mode(generated_prompt)}",
-                    storage_message=False,
-                )
+                show_prompt = generated_prompt
+                header = "📝 提示词:"
+                if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
+                    show_prompt = self._process_selfie_prompt(
+                        selfie_base_prompt,
+                        description,
+                        include_selfie_prompt_add=False,
+                        log_changes=False,
+                    )
+                    header = "📝 提示词(已隐藏自拍补充):"
+                show_prompt = self._sanitize_prompt_for_sfw_mode(show_prompt)
+                await self.send_text(f"{header}\n{show_prompt}", storage_message=False)
 
-            model_config = self._get_model_config(is_selfie=False)
+            model_config = self._get_model_config(is_selfie=is_selfie)
             if not model_config or not model_config.get("base_url"):
                 await self.send_text("NovelAI 配置错误，请检查配置文件")
                 return False, "配置错误", True
