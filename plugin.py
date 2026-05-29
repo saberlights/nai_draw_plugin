@@ -2314,6 +2314,9 @@ class NaiPicPlugin(MaiBotPlugin):
             user_id=user_id,
             matched_groups=matched_groups,
         )
+        # 先过管理员鉴权，避免非管理员看到"收到，正在生成图片"再被拒绝的误导
+        if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
+            return False, "没有管理员权限", True
         if not await invocation.ensure_generation_permission():
             return False, "没有权限", True
 
@@ -2339,6 +2342,16 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """/nai vibe存 / /nai ref存：取引用图存入对应命名图库。"""
         name = str((matched_groups or {}).get("name", "") or "").strip()
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        # 先过管理员鉴权再做图片查找，避免非管理员收到"未找到参考图"误导提示
+        if not await invocation._ensure_named_reference_admin(scope=scope, action="save"):
+            return False, "没有管理员权限", True
+
         image_base64 = self._image_cache_service.resolve_image_base64(
             stream_id=stream_id,
             user_id=user_id,
@@ -2353,12 +2366,6 @@ class NaiPicPlugin(MaiBotPlugin):
             )
             return False, "未找到图片", True
 
-        invocation = await self._create_invocation(
-            stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            matched_groups=matched_groups,
-        )
         return await invocation.handle_named_reference_save(
             scope=scope, name=name, image_base64=image_base64
         )
@@ -2468,6 +2475,9 @@ class NaiPicPlugin(MaiBotPlugin):
             user_id=user_id,
             matched_groups=matched_groups,
         )
+        # 先过管理员鉴权，避免非管理员看到"收到，正在生成图片"再被拒绝的误导
+        if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
+            return False, "没有管理员权限", True
         if not await invocation.ensure_generation_permission():
             return False, "没有权限", True
 

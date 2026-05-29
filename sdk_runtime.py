@@ -2018,6 +2018,30 @@ class NaiInvocation(ModelConfigMixin):
 
     # ====== 命名图库 (vibe / ref 共用骨架) ======
 
+    async def _ensure_named_reference_admin(self, *, scope: str, action: str) -> bool:
+        """命名图库命令的管理员鉴权（与 /nai nsfw 同套 ``is_admin_user`` 判定）。
+
+        ``scope=="ref"`` 时全部 action 仅限管理员；``scope=="vibe"`` 时仅 ``draw``
+        放开给普通用户，其余（save / select / list / delete / clear）仅限管理员。
+        返回 True 放行；返回 False 表示已对用户发送拒绝提示，调用方应立即结束命令。
+        """
+        if scope == "ref":
+            scope_label = "角色参考"
+        elif scope == "vibe" and action != "draw":
+            scope_label = "Vibe"
+        else:
+            return True
+
+        _, _, user_id = self._get_chat_identity()
+        if session_state.is_admin_user(user_id, self.get_config):
+            return True
+
+        await self.send_text(
+            f"❌ 只有管理员可以使用 {scope_label} 图库相关命令",
+            storage_message=False,
+        )
+        return False
+
     async def handle_named_reference_save(
         self,
         *,
@@ -2028,6 +2052,8 @@ class NaiInvocation(ModelConfigMixin):
         """处理 `/nai (vibe|ref)存 <名字>`：把引用回复的图入库。
 
         scope: ``vibe`` / ``ref``，决定图落到哪个图库。"""
+        if not await self._ensure_named_reference_admin(scope=scope, action="save"):
+            return False, "没有管理员权限", True
         if not await self.ensure_generation_permission():
             return False, "没有权限", True
 
@@ -2083,6 +2109,8 @@ class NaiInvocation(ModelConfigMixin):
         scope: str,
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai (vibe|ref)图库`：列出当前归属（群聊→该群 / 私聊→个人）的命名图。"""
+        if not await self._ensure_named_reference_admin(scope=scope, action="list"):
+            return False, "没有管理员权限", True
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
         owner_kind, owner_id = self._named_reference_owner()
@@ -2133,6 +2161,8 @@ class NaiInvocation(ModelConfigMixin):
         name: str,
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai (vibe|ref)删 <名字>`。"""
+        if not await self._ensure_named_reference_admin(scope=scope, action="delete"):
+            return False, "没有管理员权限", True
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
         owner_kind, owner_id = self._named_reference_owner()
@@ -2158,6 +2188,8 @@ class NaiInvocation(ModelConfigMixin):
         群的共享图库；私聊里归属是 user_id，按个人隔离。跨 stream 生效（store 层不
         区分 stream，按 owner 隔离）。返回实际删除的张数，便于用户确认。
         """
+        if not await self._ensure_named_reference_admin(scope=scope, action="clear"):
+            return False, "没有管理员权限", True
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
         owner_kind, owner_id = self._named_reference_owner()
@@ -2189,6 +2221,8 @@ class NaiInvocation(ModelConfigMixin):
         """处理 `/nai (vibe|ref)选 <名字> [<名字>...]`：把当前会话的粘性选定指向若干张图。
 
         vibe 接受 1~4 张（§20.3），ref 接受 1 张（§20.4）。"""
+        if not await self._ensure_named_reference_admin(scope=scope, action="select"):
+            return False, "没有管理员权限", True
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
         owner_kind, owner_id = self._named_reference_owner()
@@ -2245,6 +2279,8 @@ class NaiInvocation(ModelConfigMixin):
         raw_prompt 不为 None 时跳过 LLM 翻译，直接用作 prompt（``/nai0`` 路径）；
         description 仍作为请求文本沿用 sanity 检查（空时报错）。
         """
+        if not await self._ensure_named_reference_admin(scope=scope, action="draw"):
+            return False, "没有管理员权限", True
         scope_label = _scope_label(scope)
         store = get_named_reference_store()
         owner_kind, owner_id = self._named_reference_owner()
