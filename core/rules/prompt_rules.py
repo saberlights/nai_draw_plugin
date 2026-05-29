@@ -292,32 +292,32 @@ _EXAMPLES_BASE = """
 
 ### 例 1：已知角色（不补外貌）
 输入：画初音未来
-输出：solo, 1girl, {hatsune miku (vocaloid)}, standing, looking at viewer, gentle smile, soft lighting
+输出：solo, 1girl, 1.05::hatsune miku (vocaloid)::, standing, looking at viewer, gentle smile, white dress, bare shoulders, long sleeves, outdoors, garden, cherry blossoms, soft lighting, depth of field
 （不要再补 long hair / twintails / blue hair / blue eyes，模型已知）
 
 ### 例 2：原创人物（要补外貌）
 输入：画一个女孩在雨中哭泣
-输出：solo, 1girl, long black hair, brown eyes, school uniform, crying, tears, wet clothes, rain, cloudy sky, backlighting
+输出：solo, 1girl, long black hair, brown eyes, school uniform, white shirt, blue skirt, crying, tears, sad expression, wet clothes, wet hair, rain, puddles, cloudy sky, grey atmosphere, backlighting
 
 ### 例 3：动态场景（视角前置 + 动作加权）
 输入：画 saber 挥剑
-输出：solo, 1girl, from below, dynamic angle, {saber (fate)}, excalibur, 1.2::sword swing::, motion blur, dramatic lighting
+输出：solo, 1girl, from below, dynamic angle, 1.05::saber (fate)::, excalibur, 1.2::sword swing::, motion blur, blue energy, armor, determined expression, dramatic lighting, wind
 
 ### 例 4：多人对等互动（用 mutual#）
 输入：画蕾姆和拉姆两姐妹拥抱
 输出:
-2girls, sisters, indoor, soft lighting,
-char1:girl, in foreground, {rem (re zero)}, gentle smile, mutual#hug, looking at another,
-char2:girl, beside girl, {ram (re zero)}, gentle smile, mutual#hug, looking at another,
+2girls, sisters, indoor, bedroom, soft lighting, warm atmosphere,
+char1:girl, in foreground, 1.05::rem (re zero)::, gentle smile, closed eyes, mutual#hug, looking at another,
+char2:girl, beside girl, 1.05::ram (re zero)::, gentle smile, closed eyes, mutual#hug, looking at another,
 
 ### 例 5：自拍（不补外貌，重点在镜头/动作）
 输入：自拍
-输出：solo, 1girl, selfie, close-up, female pov, looking at viewer, smile, peace sign, natural light, indoor
+输出：solo, 1girl, close-up, female pov, selfie, looking at viewer, smile, peace sign, casual clothes, white t-shirt, natural light, indoor, bedroom, soft focus
 
 ### 例 6：连续性（延续上一轮）
 上一轮：solo, 1girl, school uniform, black thighhighs, classroom, afternoon
 输入：换个姿势
-输出：solo, 1girl, school uniform, black thighhighs, classroom, afternoon, sitting on desk, looking at viewer
+输出：solo, 1girl, school uniform, black thighhighs, classroom, afternoon, sitting on desk, looking at viewer, playful smile, legs crossed
 </examples>
 """.strip()
 
@@ -360,21 +360,21 @@ _NSFW_EXTRA_EXAMPLES = """
 
 ### 例 N1：单人 NSFW
 输入：画一个女孩躺在床上自慰
-输出：nsfw, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, dim lighting
+输出：nsfw, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, white sheets, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, heavy breathing, dim lighting, bedroom
 
 ### 例 N2：多人 NSFW（source/target 主被动配对）
 输入：男生从背后压住女生
 输出:
-indoor, dim lighting, sweat, lewd sounds, nsfw,
-char1:girl, in foreground, messy hair, half-closed eyes, drooling, blush, naked, target#groped, target#fingered, bent over, back arched,
-char2:boy, behind girl, source#groping, source#fingering, pulling hair, biting neck,
+nsfw, 1boy 1girl, indoor, dim lighting, sweat, heavy breathing,
+char1:girl, in foreground, long black hair, messy hair, half-closed eyes, drooling, blush, naked, target#groped, target#fingered, bent over, back arched, trembling,
+char2:boy, behind girl, short hair, source#groping, source#fingering, pulling hair, biting neck, aggressive,
 
 ### 例 N3：百合强迫（互动 tag 规范模板）
 输入：画两个女孩，一个被另一个强吻并摸胸摸裙底，被强吻的不情愿
 输出:
-2girls, nsfw, yuri, indoor, lewd sounds, dim lighting,
-char1:girl, in foreground, {hatsune miku (vocaloid)}, scowl, uncomfortable, blush, target#kissed, target#groped, hand under skirt, struggling,
-char2:girl, beside girl, {luo tianyi (vocaloid)}, closed eyes, blush, source#kissing, source#groping, source#touching under skirt, pulling hair,
+nsfw, 2girls, yuri, indoor, dim lighting, heavy breathing,
+char1:girl, in foreground, 1.05::hatsune miku (vocaloid)::, scowl, uncomfortable, blush, tears, target#kissed, target#groped, hand under skirt, struggling, school uniform,
+char2:girl, beside girl, 1.05::luo tianyi (vocaloid)::, closed eyes, blush, lustful, source#kissing, source#groping, source#touching under skirt, pulling hair, school uniform,
 
 判定要点：
 - 被动方全部 `target#` + 过去分词；主动方全部 `source#` + 现在分词
