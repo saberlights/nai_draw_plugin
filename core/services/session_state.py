@@ -17,6 +17,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from src.common.logger import get_logger
 
+from .nsfw_state_store import nsfw_state_store
+
 logger = get_logger("nai_draw_plugin")
 
 
@@ -394,16 +396,24 @@ class SessionStateManager:
         chat_id: str,
         get_config: Callable
     ) -> bool:
-        """检查是否启用NSFW过滤"""
+        """检查是否启用NSFW过滤。
+
+        优先级：持久化 store（含跨重启状态） > 进程内显式 set（本次启动） > 配置默认。
+        store 命中即返回，让重启后的实例继续沿用上次会话的开关。
+        """
+        persisted = nsfw_state_store.get(platform, chat_id)
+        if persisted is not None:
+            return persisted
         key = self._make_key(platform, chat_id)
         if key in self._nsfw_filter:
             return self._nsfw_filter[key]
         return get_config("nsfw_filter.enabled", False)
 
     def set_nsfw_filter_enabled(self, platform: str, chat_id: str, enabled: bool):
-        """设置NSFW过滤"""
+        """设置NSFW过滤并落盘，跨重启保留。"""
         key = self._make_key(platform, chat_id)
         self._nsfw_filter[key] = enabled
+        nsfw_state_store.set(platform, chat_id, enabled)
         logger.info(f"[nai_pic] 会话 {key} NSFW过滤已{'开启' if enabled else '关闭'}")
 
     # ==================== 提示词显示 ====================
@@ -476,13 +486,13 @@ class SessionStateManager:
             "artist_index": self._selected_artists.get(key),
             "size": self._selected_sizes.get(key),
             "recall": self._recall_enabled.get(key),
-            "nsfw_filter": self._nsfw_filter.get(key),
+            "nsfw_filter": nsfw_state_store.get(platform, chat_id),
             "prompt_show": self._prompt_show.get(key),
             "character_reference_type": self._character_reference_type.get(key),
         }
 
     def clear_session_state(self, platform: str, chat_id: str):
-        """清除指定会话的所有状态"""
+        """清除指定会话的所有状态（含 NSFW 持久化条目）。"""
         key = self._make_key(platform, chat_id)
         self._admin_mode.pop(key, None)
         self._selected_models.pop(key, None)
@@ -490,6 +500,7 @@ class SessionStateManager:
         self._selected_sizes.pop(key, None)
         self._recall_enabled.pop(key, None)
         self._nsfw_filter.pop(key, None)
+        nsfw_state_store.clear(platform, chat_id)
         self._prompt_show.pop(key, None)
         self._character_reference_type.pop(key, None)
         logger.info(f"[nai_pic] 会话 {key} 状态已清除")

@@ -373,6 +373,7 @@ Rabbit
 ## 更新日志
 
 ### v1.10.0 (2026-05-30)
+- **`/nai nsfw` 状态持久化**：把每个 (platform, chat_id) 的开关落盘到 `data/nsfw_state.json`，重启插件后会话级开关自动恢复；优先级 store > 进程内内存 > `nsfw_filter.enabled` 配置默认。`/nai st`/`clear_session_state` 仍会同步清掉持久化条目，语义没变。
 - **图生图三段可调参数**：新增 `[i2i]` / `[vibe]` / `[character_reference]` 三段配置，把 NewAPI §20.1（`strength` / `noise`）、§20.3（`info_extracted` / 每图 `reference_strength` / 整体 `overall_strength`）、§20.4（`type` / `fidelity` / `strength`）完整开放给用户；默认值与 API 默认对齐，不动也能跑。`_run_image_pipeline` 改为从 config 读取并兜底夹到合法区间，原本完全没透传的 `i2i.noise` 与 `controlnet.strength` 也补上。
 - **新增 `/nai ref类型 <character|style|both>`**：会话级粘性切换 `character_references[i].type`，命令优先于配置默认；`both` 是 `character&style` 的友好别名（仅管理员）。
 - **权限收紧**：`/nai ref` 全族（含 `/nai0 ref`）、`/nai vibe` 的 `存 / 选 / 图库 / 删 / 清空` 全部改为仅管理员；vibe 仅 `draw`（`/nai vibe <描述>` / `/nai0 vibe`）对普通用户开放。鉴权与 `/nai nsfw` 同套 `is_admin_user` 判定。
