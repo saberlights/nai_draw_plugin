@@ -19,7 +19,9 @@ class HelpSection:
     title: str
     items: Tuple[Tuple[str, str], ...]
     hint: str = ""  # 分类下方的额外说明（可多行，用 \n 分隔）
-    accent: str = "#ffd56b"  # 分类标题颜色
+    accent: str = "#ffd56b"  # 分类标题颜色 / 卡片描边渐变主色
+    icon: str = "✦"  # 标题左侧装饰 emoji / 字符
+    accent2: str = ""  # 渐变副色；留空时由 CSS 自动派生（同色加深）
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,9 @@ HELP_DOC: HelpDoc = HelpDoc(
     sections=(
         HelpSection(
             title="生图",
+            icon="★",
+            accent="#ffd56b",
+            accent2="#ff8e72",
             items=(
                 ("/nai <描述>", "自然语言生成（中文即可）"),
                 ("/nai 随机", "随机生成一张 NSFW 图片"),
@@ -51,6 +56,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="图生图 i2i（§20.1）",
+            icon="◆",
+            accent="#7ee0ff",
+            accent2="#4aa9ff",
             items=(
                 ("/nai i2i <描述>", "以参考图为底重绘"),
             ),
@@ -61,6 +69,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="Vibe Transfer（§20.3）",
+            icon="●",
+            accent="#c8a8ff",
+            accent2="#7a5cff",
             items=(
                 ("/nai vibe存 <名字>", "引用一张图存入 vibe 图库（仅管理员）"),
                 ("/nai vibe图库", "列出 vibe 命名图（★ 为选中，仅管理员）"),
@@ -77,6 +88,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="角色参考 Ref（§20.4）",
+            icon="◎",
+            accent="#ff9ed5",
+            accent2="#ff5fa8",
             items=(
                 ("/nai ref存 <名字>", "存入 ref 图库（仅管理员）"),
                 ("/nai ref图库", "列出 ref 命名图（仅管理员）"),
@@ -94,6 +108,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="模型 / 尺寸 / 画师",
+            icon="■",
+            accent="#7eeab2",
+            accent2="#3bd17f",
             items=(
                 ("/nai set [代号]", "查看 / 切换模型"),
                 ("/nai size [代号]", "查看 / 切换尺寸：竖/v、横/h、方/s"),
@@ -107,6 +124,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="撤回 / 反推",
+            icon="↻",
+            accent="#ffb37a",
+            accent2="#ff7a3d",
             items=(
                 ("/nai on", "开启图片自动撤回（仅管理员）"),
                 ("/nai off", "关闭图片自动撤回（仅管理员）"),
@@ -119,6 +139,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="提示词 / NSFW",
+            icon="◇",
+            accent="#9bc4f5",
+            accent2="#5b8def",
             items=(
                 ("/nai pt on/off", "开关 prompt 回显"),
                 ("/nai nsfw", "查看 NSFW 过滤状态"),
@@ -127,6 +150,9 @@ HELP_DOC: HelpDoc = HelpDoc(
         ),
         HelpSection(
             title="管理员",
+            icon="▲",
+            accent="#ff7ad5",
+            accent2="#c93dad",
             items=(
                 ("/nai st", "开启管理员模式"),
                 ("/nai sp", "关闭管理员模式"),
@@ -135,7 +161,6 @@ HELP_DOC: HelpDoc = HelpDoc(
                 ("/nai banlist", "查看黑名单"),
                 ("/nai help", "显示本帮助"),
             ),
-            accent="#f08ec0",
         ),
     ),
     footer=(
@@ -160,9 +185,19 @@ def _render_section(section: HelpSection) -> str:
     if section.hint:
         hint_lines = "<br/>".join(escape(line) for line in section.hint.split("\n"))
         hint_html = f'<p class="hint">{hint_lines}</p>'
+    accent2 = section.accent2 or section.accent
+    icon_html = (
+        f'<span class="icon" aria-hidden="true">{escape(section.icon)}</span>'
+        if section.icon
+        else ""
+    )
+    card_style = (
+        f"--accent:{escape(section.accent)};"
+        f"--accent2:{escape(accent2)};"
+    )
     return (
-        '<section class="card">'
-        f'<h2 style="--accent:{escape(section.accent)}">{escape(section.title)}</h2>'
+        f'<section class="card" style="{card_style}">'
+        f'<h2>{icon_html}<span class="title-text">{escape(section.title)}</span></h2>'
         f'<ul>{"".join(rows)}</ul>'
         f"{hint_html}"
         "</section>"
@@ -185,69 +220,157 @@ def build_help_html(doc: HelpDoc = HELP_DOC) -> str:
 <style>
   * {{ box-sizing: border-box; }}
   html, body {{ margin: 0; padding: 0; }}
+  /* 整体走深色 + 多色高光辉光的"霓虹/赛博"基调 */
   body {{
     font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC",
-                 "Source Han Sans SC", "Hiragino Sans GB",
+                 "Source Han Sans SC", "Hiragino Sans GB", "Segoe UI Emoji",
+                 "Apple Color Emoji", "Noto Color Emoji",
                  "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", sans-serif;
-    background: linear-gradient(160deg, #1a1d27 0%, #232636 60%, #1f2230 100%);
-    color: #e6e8ee;
-    padding: 28px 32px 24px;
+    background:
+      radial-gradient(900px 540px at 12% -8%, rgba(255, 142, 192, 0.32), transparent 60%),
+      radial-gradient(820px 620px at 92% 4%, rgba(126, 200, 255, 0.30), transparent 62%),
+      radial-gradient(700px 700px at 50% 110%, rgba(167, 139, 250, 0.32), transparent 68%),
+      linear-gradient(160deg, #15172a 0%, #1a1d33 50%, #181a2c 100%);
+    color: #ecedf5;
+    padding: 30px 34px 26px;
     width: 980px;
+    position: relative;
+    overflow: hidden;
   }}
-  header {{ margin-bottom: 22px; }}
+  /* 网格底纹 + 整页柔光 */
+  body::before {{
+    content: ""; position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 28px 28px, 28px 28px;
+    pointer-events: none;
+    mask-image: radial-gradient(900px 720px at 50% 30%, #000 30%, transparent 80%);
+    -webkit-mask-image: radial-gradient(900px 720px at 50% 30%, #000 30%, transparent 80%);
+  }}
+  header {{
+    margin-bottom: 22px; position: relative; z-index: 1;
+    padding: 6px 4px 14px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }}
   header h1 {{
-    font-size: 28px; margin: 0 0 6px;
-    background: linear-gradient(90deg, #ffd56b 0%, #f08ec0 100%);
+    font-size: 38px; margin: 0 0 8px;
+    background: linear-gradient(95deg, #ffd56b 0%, #ff8eb3 35%, #c39bff 65%, #7ee0ff 100%);
     -webkit-background-clip: text; background-clip: text; color: transparent;
-    font-weight: 700; letter-spacing: 0.5px;
+    font-weight: 800; letter-spacing: 0.8px;
+    text-shadow: 0 0 24px rgba(195, 155, 255, 0.25);
+    filter: drop-shadow(0 2px 14px rgba(255, 142, 192, 0.18));
   }}
-  header p {{ margin: 0; font-size: 14px; color: #8a90a3; letter-spacing: 0.6px; }}
-  /* 列式 masonry：浏览器自动平衡两列高度，避免 2-col grid 行高被最高卡片拉齐留白 */
+  header h1::after {{
+    content: " ★"; font-size: 30px; vertical-align: 2px;
+    -webkit-text-fill-color: initial;
+    color: #ff8eb3;
+    text-shadow: 0 0 14px rgba(255, 142, 179, 0.65);
+  }}
+  header p {{
+    margin: 0; font-size: 13.5px; color: #b6bbd2; letter-spacing: 1.2px;
+    text-transform: uppercase; font-weight: 500;
+  }}
+  header p::before {{ content: "◇ "; color: #ffd56b; }}
+  header p::after {{ content: " ◇"; color: #7ee0ff; }}
+  /* 列式 masonry：浏览器自动平衡两列高度 */
   .grid {{
-    column-count: 2; column-gap: 16px;
+    column-count: 2; column-gap: 18px;
+    position: relative; z-index: 1;
   }}
+  /* 卡片：玻璃质感 + accent 渐变描边 + 内发光 */
   .card {{
-    background: rgba(42, 46, 58, 0.92);
-    border: 1px solid rgba(255, 255, 255, 0.05);
-    border-radius: 12px;
-    padding: 14px 16px 12px;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
-    margin: 0 0 14px;
+    position: relative;
+    background:
+      linear-gradient(180deg, rgba(48, 52, 76, 0.92), rgba(38, 42, 62, 0.92));
+    border-radius: 14px;
+    padding: 16px 18px 14px;
+    margin: 0 0 16px;
     display: block;
     break-inside: avoid;
     -webkit-column-break-inside: avoid;
     page-break-inside: avoid;
+    box-shadow:
+      0 10px 28px rgba(0, 0, 0, 0.38),
+      0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+    overflow: hidden;
+  }}
+  /* 渐变描边：用 border-image + ::before 实现彩色外发光 */
+  .card::before {{
+    content: ""; position: absolute; inset: 0;
+    border-radius: inherit;
+    padding: 1.5px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor; mask-composite: exclude;
+    pointer-events: none;
+    opacity: 0.85;
+  }}
+  /* 卡片顶部高光小弧线 */
+  .card::after {{
+    content: ""; position: absolute; top: 0; left: 14px; right: 14px; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    opacity: 0.7;
   }}
   .card h2 {{
-    margin: 0 0 8px; font-size: 16px; font-weight: 600;
+    margin: 0 0 10px; font-size: 17px; font-weight: 700;
     color: var(--accent, #ffd56b);
-    letter-spacing: 0.4px;
+    letter-spacing: 0.5px;
+    display: flex; align-items: center; gap: 8px;
+    text-shadow: 0 0 14px color-mix(in srgb, var(--accent) 55%, transparent);
+  }}
+  .card h2 .icon {{
+    font-size: 18px; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 8px;
+    background: linear-gradient(135deg,
+      color-mix(in srgb, var(--accent) 25%, transparent),
+      color-mix(in srgb, var(--accent2) 25%, transparent));
+    border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+    box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 35%, transparent);
+  }}
+  .card h2 .title-text {{
+    background: linear-gradient(95deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }}
   .card ul {{ list-style: none; padding: 0; margin: 0; }}
   .card li {{
     display: flex; align-items: baseline; gap: 10px;
-    padding: 3px 0; line-height: 1.45;
+    padding: 4px 0; line-height: 1.5;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.04);
   }}
+  .card li:last-child {{ border-bottom: 0; }}
   .cmd {{
     font-family: "JetBrains Mono", "Cascadia Code", "Fira Code",
                  "SF Mono", Consolas, monospace;
-    font-size: 12.5px; color: #7ee0ff;
-    background: rgba(126, 224, 255, 0.08);
-    padding: 1px 7px; border-radius: 5px; white-space: nowrap;
+    font-size: 12.5px;
+    color: color-mix(in srgb, var(--accent) 85%, #ffffff);
+    background: linear-gradient(135deg,
+      color-mix(in srgb, var(--accent) 14%, transparent),
+      color-mix(in srgb, var(--accent2) 10%, transparent));
+    padding: 2px 9px; border-radius: 6px; white-space: nowrap;
     flex-shrink: 0;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+    box-shadow:
+      0 0 8px color-mix(in srgb, var(--accent) 22%, transparent),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.03);
   }}
-  .desc {{ font-size: 13px; color: #c5c8d1; }}
+  .desc {{ font-size: 13px; color: #d5d8e6; }}
   .hint {{
-    margin: 8px 0 0; padding: 7px 10px;
-    font-size: 12px; color: #99a0b2; line-height: 1.55;
-    background: rgba(126, 224, 255, 0.05);
-    border-left: 2px solid rgba(126, 224, 255, 0.35);
-    border-radius: 4px;
+    margin: 10px 0 0; padding: 8px 12px;
+    font-size: 12px; color: #c8cce0; line-height: 1.6;
+    background: linear-gradient(135deg,
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      color-mix(in srgb, var(--accent2) 6%, transparent));
+    border-left: 2px solid var(--accent);
+    border-radius: 6px;
   }}
   footer {{
-    margin-top: 18px; padding-top: 12px;
-    border-top: 1px dashed rgba(255, 255, 255, 0.08);
-    font-size: 12px; color: #7a8094; line-height: 1.6;
+    position: relative; z-index: 1;
+    margin-top: 22px; padding: 12px 14px 4px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 12px; color: #aab0c6; line-height: 1.7;
+    text-align: center; letter-spacing: 0.4px;
   }}
 </style>
 </head>
