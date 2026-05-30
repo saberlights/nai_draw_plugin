@@ -1336,9 +1336,12 @@ class NaiInvocation(ModelConfigMixin):
             return False, "发送失败", True
 
         if not send_ok:
-            discard_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
-            await self.send_text("图片发送失败")
-            return False, "发送失败", True
+            logger.warning(
+                "%s 图片发送返回失败，可能是适配器超时（图片可能仍在后台发送中）",
+                self.log_prefix,
+            )
+            # NapCat 适配器在处理大图片时可能超时（30s），但图片会在后台继续发送
+            # 保留 pending 记录以支持后续撤回，假定发送成功继续后续流程
 
         if track_as_auto_draw:
             session_state.set_last_auto_draw_sent_at(self.stream_id, self._last_send_timestamp)
@@ -2505,7 +2508,7 @@ class NaiInvocation(ModelConfigMixin):
             generated_prompt = self._sanitize_prompt_for_sfw_mode(generated_prompt)
             structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
 
-            if self._is_prompt_show_enabled():
+            if raw_prompt is None and self._is_prompt_show_enabled():
                 show_prompt = generated_prompt
                 header = "📝 提示词:"
                 if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
