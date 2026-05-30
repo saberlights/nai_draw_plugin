@@ -2367,6 +2367,29 @@ class NaiInvocation(ModelConfigMixin):
             raw_prompt=raw_prompt,
         )
 
+    def _read_clamped_float_config(
+        self,
+        path: str,
+        default: float,
+        lo: float,
+        hi: float,
+    ) -> float:
+        """读取 float 配置并夹到 ``[lo, hi]``；非法值回退默认。
+
+        i2i / vibe / ref 几个 NewAPI §20.x 参数（strength / noise / fidelity /
+        info_extracted / overall_strength）都需要范围保护，避免用户写飞值后让
+        服务端打 400。
+        """
+        try:
+            value = float(self.get_config(path, default))
+        except (TypeError, ValueError):
+            return float(default)
+        if value < lo:
+            return float(lo)
+        if value > hi:
+            return float(hi)
+        return value
+
     async def _run_image_pipeline(
         self,
         *,
@@ -2534,30 +2557,75 @@ class NaiInvocation(ModelConfigMixin):
                     )
                     return False, "参考图过小", True
                 image_size = [width, height]
-                i2i_payload = {"image": normalized_image}
-                if strength is not None:
-                    i2i_payload["strength"] = strength
+                # §20.1：strength / noise 都从 config 读取，命令调用方未显式覆盖时用 config 默认
+                effective_strength = (
+                    strength
+                    if strength is not None
+                    else self._read_clamped_float_config("i2i.strength", 0.7, 0.01, 0.99)
+                )
+                effective_noise = self._read_clamped_float_config("i2i.noise", 0.0, 0.0, 0.99)
+                i2i_payload = {
+                    "image": normalized_image,
+                    "strength": effective_strength,
+                    "noise": effective_noise,
+                }
             elif mode == "ref":
                 normalized_image = normalized_images[0]
-                ref_entry: dict[str, Any] = {"image": normalized_image}
-                if type_value:
-                    ref_entry["type"] = type_value
-                if fidelity is not None:
-                    ref_entry["fidelity"] = fidelity
-                if strength is not None:
-                    ref_entry["strength"] = strength
+                # §20.4：type / fidelity / strength 三项都走 config 默认，调用方可覆盖；
+                # type 还支持本会话的运行时切换（/nai ref类型 ...）
+                ref_platform, ref_chat_id, _ = self._get_chat_identity()
+                explicit_type = (type_value or "").strip()
+                effective_type = (
+                    explicit_type
+                    if explicit_type
+                    else session_state.get_character_reference_type(
+                        ref_platform, ref_chat_id, self.get_config
+                    )
+                )
+                effective_fidelity = (
+                    fidelity
+                    if fidelity is not None
+                    else self._read_clamped_float_config("character_reference.fidelity", 1.0, 0.0, 1.0)
+                )
+                effective_strength = (
+                    strength
+                    if strength is not None
+                    else self._read_clamped_float_config("character_reference.strength", 1.0, 0.0, 1.0)
+                )
+                ref_entry: dict[str, Any] = {
+                    "image": normalized_image,
+                    "type": effective_type,
+                    "fidelity": effective_fidelity,
+                    "strength": effective_strength,
+                }
                 character_references_payload = [ref_entry]
             elif mode == "vibe":
-                # §20.3：controlnet.images[] 最多 4 张，逐张组装 image+info_extracted+strength
+                # §20.3：controlnet.images[] 最多 4 张，逐张组装 image+info_extracted+strength；
+                # 顶层 controlnet.strength 走 [vibe].overall_strength
+                effective_info = (
+                    info_extracted
+                    if info_extracted is not None
+                    else self._read_clamped_float_config("vibe.info_extracted", 0.7, 0.01, 1.0)
+                )
+                effective_per_img_strength = (
+                    strength
+                    if strength is not None
+                    else self._read_clamped_float_config("vibe.reference_strength", 0.6, 0.01, 1.0)
+                )
+                effective_overall_strength = self._read_clamped_float_config(
+                    "vibe.overall_strength", 1.0, 0.0, 1.0
+                )
                 vibe_entries: List[Dict[str, Any]] = []
                 for n_img in normalized_images:
-                    entry: Dict[str, Any] = {"image": n_img}
-                    if info_extracted is not None:
-                        entry["info_extracted"] = info_extracted
-                    if strength is not None:
-                        entry["strength"] = strength
-                    vibe_entries.append(entry)
-                controlnet_payload = {"images": vibe_entries}
+                    vibe_entries.append({
+                        "image": n_img,
+                        "info_extracted": effective_info,
+                        "strength": effective_per_img_strength,
+                    })
+                controlnet_payload = {
+                    "images": vibe_entries,
+                    "strength": effective_overall_strength,
+                }
 
             enable_debug = bool(self.get_config("components.enable_debug_info", False))
             if enable_debug:
@@ -3365,6 +3433,57 @@ class NaiInvocation(ModelConfigMixin):
         state_text = "开启" if enabled else "关闭"
         await self.send_text(f"✅ 已在{self._chat_type_text()}中{state_text} NSFW 内容过滤", storage_message=False)
         return True, f"NSFW 过滤已{state_text}", True
+
+    async def handle_ref_type_command(self, value: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai ref类型 <character|style|both>`：切换本会话 §20.4 type。
+
+        管理员鉴权与 /nai ref 其它子命令一致（ref 全部仅限管理员）；
+        ``both`` 是 ``character&style`` 的输入别名，归一后入 session_state。
+        无参数时打印当前态与用法。
+        """
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+
+        if not session_state.is_admin_user(user_id, self.get_config):
+            await self.send_text("❌ 只有管理员可以切换角色参考类型", storage_message=False)
+            return False, "没有管理员权限", True
+
+        current = session_state.get_character_reference_type(
+            platform, chat_id, self.get_config
+        )
+
+        if not value:
+            await self.send_text(
+                f"当前角色参考类型: {current}\n\n"
+                "使用方法:\n"
+                "/nai ref类型 character - 仅提取角色\n"
+                "/nai ref类型 style - 仅提取风格\n"
+                "/nai ref类型 both - 角色 + 风格（character&style）",
+                storage_message=False,
+            )
+            return True, "显示角色参考类型", True
+
+        alias = value.strip().lower()
+        normalized = "character&style" if alias == "both" else alias
+        try:
+            session_state.set_character_reference_type(platform, chat_id, normalized)
+        except ValueError as exc:
+            await self.send_text(
+                f"❌ {exc}\n可填：character / style / both（=character&style）",
+                storage_message=False,
+            )
+            return False, "类型不合规", True
+
+        await self.send_text(
+            f"✅ 已把本会话的角色参考类型切换为：{normalized}",
+            storage_message=False,
+        )
+        return True, "已切换角色参考类型", True
 
     async def handle_prompt_show_command(self, action: str) -> tuple[bool, str | None, bool]:
         """处理 `/nai pt on|off`。"""

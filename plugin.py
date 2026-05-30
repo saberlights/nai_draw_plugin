@@ -267,6 +267,9 @@ class NaiPicPlugin(MaiBotPlugin):
         "admin",
         "tag_retriever",
         "retag",
+        "i2i",
+        "vibe",
+        "character_reference",
         "custom_prompt",
         "model_nai4_5",
         "model_nai4",
@@ -288,6 +291,14 @@ class NaiPicPlugin(MaiBotPlugin):
             "PNG 元数据可命中 → 直接读 prompt；不可命中 → 用 WD14 在线 Space 兜底（需安装 gradio_client）。\n"
             "只输出正向 prompt，不返回负面。"
         ),
+        "i2i": (
+            "========== 图生图参数（/nai i2i / vibe / ref） ==========\n"
+            "三段对应 NewAPI 文档 §20.1 / §20.3 / §20.4；不需要个性化时全部保留默认即可。\n"
+            "\n"
+            "----- i2i 图生图（§20.1） -----"
+        ),
+        "vibe": "----- Vibe Transfer（§20.3） -----",
+        "character_reference": "----- 角色参考 / Character Reference（§20.4，仅 V4.5 系列） -----",
         "custom_prompt": (
             "========== 自定义系统提示词 ==========\n"
             "这段通常不需要频繁修改；保留在文件末尾，避免影响日常配置体验。"
@@ -326,7 +337,7 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.6.0",
+                default="1.7.0",
                 description="插件配置版本号；由插件自行维护，请勿手动修改"
             ),
             "enabled": ConfigField(
@@ -1039,6 +1050,52 @@ class NaiPicPlugin(MaiBotPlugin):
                     },
                 ],
                 description="可并发轮询的 HF Space 列表；填 [{name, type, api}] 数组；name 是 HF Space 全名，type 决定 payload 结构，api 是 Space 入口"
+            ),
+        },
+        "i2i": {
+            "strength": ConfigField(
+                type=float,
+                default=0.7,
+                description="i2i 变换强度；可填 0.01~0.99 的浮点数；越小越像原图，缺省 0.7（NewAPI §20.1）"
+            ),
+            "noise": ConfigField(
+                type=float,
+                default=0.0,
+                description="i2i 注入噪声量；可填 0.0~0.99 的浮点数；缺省 0.0（NewAPI §20.1）"
+            ),
+        },
+        "vibe": {
+            "info_extracted": ConfigField(
+                type=float,
+                default=0.7,
+                description="每张 vibe 图的信息提取量；可填 0.01~1.0 的浮点数；缺省 0.7（NewAPI §20.3）"
+            ),
+            "reference_strength": ConfigField(
+                type=float,
+                default=0.6,
+                description="每张 vibe 图的单独参考强度；可填 0.01~1.0 的浮点数；缺省 0.6（NewAPI §20.3）"
+            ),
+            "overall_strength": ConfigField(
+                type=float,
+                default=1.0,
+                description="ControlNet 整体强度叠加系数；可填 0.0~1.0 的浮点数；缺省 1.0（NewAPI §20.3）"
+            ),
+        },
+        "character_reference": {
+            "type": ConfigField(
+                type=str,
+                default="character&style",
+                description="角色参考提取目标；可填 character / style / character&style；缺省 character&style（NewAPI §20.4）"
+            ),
+            "fidelity": ConfigField(
+                type=float,
+                default=1.0,
+                description="角色参考保真度（次要强度）；可填 0.0~1.0 的浮点数；缺省 1.0（NewAPI §20.4）"
+            ),
+            "strength": ConfigField(
+                type=float,
+                default=1.0,
+                description="角色参考主参考强度；可填 0.0~1.0 的浮点数；缺省 1.0（NewAPI §20.4）"
             ),
         },
     }
@@ -2245,6 +2302,30 @@ class NaiPicPlugin(MaiBotPlugin):
             matched_groups=matched_groups,
             scope="ref",
         )
+
+    @Command(
+        "nai_ref_type_command",
+        description="切换本会话角色参考类型：/nai ref类型 <character|style|both>",
+        # 无参时打印当前态；both 是 character&style 的友好别名
+        pattern=r"^(?:.*?)/nai\s+ref类型(?:\s+(?P<value>\S+))?\s*$",
+    )
+    async def handle_nai_ref_type_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        del kwargs
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        value = str((matched_groups or {}).get("value", "") or "").strip()
+        return await invocation.handle_ref_type_command(value)
 
     async def _run_image_to_image_command(
         self,

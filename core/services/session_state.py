@@ -65,6 +65,10 @@ class SessionStateManager:
         # 提示词显示：{chat_key: bool}
         self._prompt_show: Dict[str, bool] = {}
 
+        # 角色参考提取目标：{chat_key: "character" / "style" / "character&style"}
+        # 缺省回退 character_reference.type 配置；仅 /nai ref 路径生效
+        self._character_reference_type: Dict[str, str] = {}
+
         # 上一轮 LLM 生成的正向提示词（用于 action 生图上下文继承）
         # key 使用 chat_stream.stream_id（BaseAction.chat_id），天然实现”全群共享”
         # value = (prompt, request, timestamp)
@@ -427,6 +431,39 @@ class SessionStateManager:
         self._prompt_show[key] = enabled
         logger.info(f"[nai_pic] 会话 {key} 提示词显示已{'开启' if enabled else '关闭'}")
 
+    # ==================== 角色参考提取目标（/nai ref） ====================
+
+    # NewAPI §20.4 character_references[i].type 取值；前端命令值（包括 ``both`` 别名）
+    # 在 plugin 层归一后再透到 store
+    _ALLOWED_CHARACTER_REFERENCE_TYPES = ("character", "style", "character&style")
+
+    def get_character_reference_type(
+        self,
+        platform: str,
+        chat_id: str,
+        get_config: Callable,
+    ) -> str:
+        """读取本会话的 character_references.type，缺省回退 config / API 默认。"""
+        key = self._make_key(platform, chat_id)
+        if key in self._character_reference_type:
+            return self._character_reference_type[key]
+        raw = str(get_config("character_reference.type", "character&style") or "").strip()
+        if raw not in self._ALLOWED_CHARACTER_REFERENCE_TYPES:
+            return "character&style"
+        return raw
+
+    def set_character_reference_type(self, platform: str, chat_id: str, type_value: str) -> None:
+        """设置本会话的 character_references.type；非法值 raises ValueError。"""
+        normalized = (type_value or "").strip()
+        if normalized not in self._ALLOWED_CHARACTER_REFERENCE_TYPES:
+            raise ValueError(
+                f"无效的 character_references.type：{type_value!r}；只允许 "
+                f"{self._ALLOWED_CHARACTER_REFERENCE_TYPES}"
+            )
+        key = self._make_key(platform, chat_id)
+        self._character_reference_type[key] = normalized
+        logger.info(f"[nai_pic] 会话 {key} 角色参考类型已切换: {normalized}")
+
     # ==================== 调试/管理 ====================
 
     def get_session_state_summary(self, platform: str, chat_id: str) -> Dict[str, Any]:
@@ -441,6 +478,7 @@ class SessionStateManager:
             "recall": self._recall_enabled.get(key),
             "nsfw_filter": self._nsfw_filter.get(key),
             "prompt_show": self._prompt_show.get(key),
+            "character_reference_type": self._character_reference_type.get(key),
         }
 
     def clear_session_state(self, platform: str, chat_id: str):
@@ -453,6 +491,7 @@ class SessionStateManager:
         self._recall_enabled.pop(key, None)
         self._nsfw_filter.pop(key, None)
         self._prompt_show.pop(key, None)
+        self._character_reference_type.pop(key, None)
         logger.info(f"[nai_pic] 会话 {key} 状态已清除")
 
     # ==================== 上一轮提示词（Action 专用） ====================

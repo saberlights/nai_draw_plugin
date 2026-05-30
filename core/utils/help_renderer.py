@@ -50,32 +50,46 @@ HELP_DOC: HelpDoc = HelpDoc(
             ),
         ),
         HelpSection(
-            title="图生图 i2i",
+            title="图生图 i2i（§20.1）",
             items=(
-                ("/nai i2i <描述>", "以参考图为底重绘（§20.1）"),
+                ("/nai i2i <描述>", "以参考图为底重绘"),
             ),
             hint=(
-                "需先引用一张图或同消息发图。参考图宽高必须 64 整除，"
-                "出图沿用参考图尺寸；引用回复部分平台只给缩略图，建议直接附图。"
+                "需先引用一张图或同消息发图；宽高须 64 整除，出图沿用参考图尺寸。\n"
+                "可调参数（config.toml）：[i2i] strength / noise"
             ),
         ),
         HelpSection(
-            title="Vibe / 角色参考",
+            title="Vibe Transfer（§20.3）",
             items=(
-                ("/nai vibe存 <名字>", "引用一张图存入 vibe 图库"),
-                ("/nai vibe图库", "列出当前 vibe 命名图（★ 为选中）"),
-                ("/nai vibe删 <名字>", "删除一张 vibe 图"),
-                ("/nai vibe清空", "清空 vibe 图库并重置选定"),
-                ("/nai vibe选 <名字...>", "把默认 vibe 设为 1~4 张"),
-                ("/nai vibe @<名字...> <描述>", "单次覆盖默认选定（1~4 张）"),
-                ("/nai vibe <描述>", "用默认 vibe 出图（§20.3）"),
-                ("/nai0 vibe [@<名字...>] <英文 tags>", "同上但直发英文，不过 LLM"),
+                ("/nai vibe存 <名字>", "引用一张图存入 vibe 图库（仅管理员）"),
+                ("/nai vibe图库", "列出 vibe 命名图（★ 为选中，仅管理员）"),
+                ("/nai vibe删 <名字>", "删除一张 vibe 图（仅管理员）"),
+                ("/nai vibe清空", "清空 vibe 图库并重置选定（仅管理员）"),
+                ("/nai vibe选 <名字...>", "把默认 vibe 设为 1~4 张（仅管理员）"),
+                ("/nai vibe [@<名字...>] <描述>", "用默认 / 单次指定 vibe 出图"),
+                ("/nai0 vibe [@<名字...>] <英文>", "同上但直发英文，不过 LLM"),
             ),
             hint=(
-                "ref 同结构（仅 1 张）：ref存 / ref图库 / ref删 / ref清空 / ref选 / "
-                "ref @<名字> / ref <描述>，也有 /nai0 ref。\n"
-                "vibe 走 §20.3，最多 4 张，全量 cache_id 命中可省 1 anlas；"
-                "ref 走 §20.4，仅 V4.5 系列支持，其它模型自动降级。"
+                "最多 4 张；全量 cache_id 命中可省 1 anlas。\n"
+                "可调参数：[vibe] info_extracted / reference_strength / overall_strength"
+            ),
+        ),
+        HelpSection(
+            title="角色参考 Ref（§20.4）",
+            items=(
+                ("/nai ref存 <名字>", "存入 ref 图库（仅管理员）"),
+                ("/nai ref图库", "列出 ref 命名图（仅管理员）"),
+                ("/nai ref删 <名字>", "删除一张 ref 图（仅管理员）"),
+                ("/nai ref清空", "清空 ref 图库（仅管理员）"),
+                ("/nai ref选 <名字>", "设定默认 ref 图（仅管理员）"),
+                ("/nai ref [@<名字>] <描述>", "用默认 / 单次指定 ref 出图（仅管理员）"),
+                ("/nai ref类型 character|style|both", "切换提取目标（仅管理员，会话级）"),
+                ("/nai0 ref [@<名字>] <英文>", "同上但直发英文，不过 LLM"),
+            ),
+            hint=(
+                "仅 V4.5 系列模型支持，其它模型自动降级；固定 1 张。\n"
+                "可调参数：[character_reference] type / fidelity / strength"
             ),
         ),
         HelpSection(
@@ -92,11 +106,15 @@ HELP_DOC: HelpDoc = HelpDoc(
             ),
         ),
         HelpSection(
-            title="撤回",
+            title="撤回 / 反推",
             items=(
                 ("/nai on", "开启图片自动撤回（仅管理员）"),
                 ("/nai off", "关闭图片自动撤回（仅管理员）"),
                 ("/nai 撤回", "撤回最近一张本插件发送的图片"),
+                ("/nai 反推", "把引用图反推成 Danbooru tag"),
+            ),
+            hint=(
+                "反推：PNG 原图秒级精确还原；非原图走 WD14 在线 Space 兜底（30~120s 仅正向）。"
             ),
         ),
         HelpSection(
@@ -104,17 +122,7 @@ HELP_DOC: HelpDoc = HelpDoc(
             items=(
                 ("/nai pt on/off", "开关 prompt 回显"),
                 ("/nai nsfw", "查看 NSFW 过滤状态"),
-                ("/nai nsfw on/off", "开关 NSFW 过滤（会话级）"),
-            ),
-        ),
-        HelpSection(
-            title="反推",
-            items=(
-                ("/nai 反推", "把引用图反推成 Danbooru tag"),
-            ),
-            hint=(
-                "PNG 原图（NAI/SD 元数据）秒级精确还原；"
-                "非原图走 WD14 在线 Space 兜底（20~60s，只输出正向）。"
+                ("/nai nsfw on/off", "开关 NSFW 过滤（仅管理员，会话级）"),
             ),
         ),
         HelpSection(
@@ -194,8 +202,9 @@ def build_help_html(doc: HelpDoc = HELP_DOC) -> str:
     font-weight: 700; letter-spacing: 0.5px;
   }}
   header p {{ margin: 0; font-size: 14px; color: #8a90a3; letter-spacing: 0.6px; }}
+  /* 列式 masonry：浏览器自动平衡两列高度，避免 2-col grid 行高被最高卡片拉齐留白 */
   .grid {{
-    display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px 16px;
+    column-count: 2; column-gap: 16px;
   }}
   .card {{
     background: rgba(42, 46, 58, 0.92);
@@ -203,6 +212,11 @@ def build_help_html(doc: HelpDoc = HELP_DOC) -> str:
     border-radius: 12px;
     padding: 14px 16px 12px;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.25);
+    margin: 0 0 14px;
+    display: block;
+    break-inside: avoid;
+    -webkit-column-break-inside: avoid;
+    page-break-inside: avoid;
   }}
   .card h2 {{
     margin: 0 0 8px; font-size: 16px; font-weight: 600;

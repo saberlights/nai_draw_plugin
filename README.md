@@ -77,22 +77,23 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai 随机` / `/nai 随机自拍` | 随机 NSFW 场景 / 自拍 |
 | `/nai0 <标签>` | 直接英文标签生图（跳过 LLM） |
 | `/nai i2i <描述>` | 图生图（§20.1）：引用一张图，以它为底重绘；宽高须 64 整除 |
-| `/nai vibe存 <名字>` | 把引用回复的图存入 vibe 图库（跨重启保留） |
-| `/nai vibe图库` | 列出 vibe 图库（★ 标记本会话默认选定） |
-| `/nai vibe删 <名字>` | 从 vibe 图库删一张 |
-| `/nai vibe清空` | 一键清空 vibe 图库 + 重置本会话选定（不可逆） |
-| `/nai vibe选 <名字1> [<名字2>...]` | 把本会话默认 vibe 设为 1~4 张（§20.3 `controlnet.images` 最多 4 张） |
+| `/nai vibe存 <名字>` | 把引用回复的图存入 vibe 图库（跨重启保留，**仅管理员**） |
+| `/nai vibe图库` | 列出 vibe 图库（★ 标记本会话默认选定，**仅管理员**） |
+| `/nai vibe删 <名字>` | 从 vibe 图库删一张（**仅管理员**） |
+| `/nai vibe清空` | 一键清空 vibe 图库 + 重置本会话选定（不可逆，**仅管理员**） |
+| `/nai vibe选 <名字1> [<名字2>...]` | 把本会话默认 vibe 设为 1~4 张（§20.3 `controlnet.images` 最多 4 张，**仅管理员**） |
 | `/nai vibe @<名字1> [@<名字2>...] <描述>` | 单次用指定 vibe 图（1~4 张，不动默认选定） |
 | `/nai vibe <描述>` | 用本会话默认 vibe 图生图（§20.3） |
 | `/nai0 vibe [@<名字...>] <英文 tags>` | 同 `/nai vibe` 但直接发英文 tags，**不过 LLM** |
-| `/nai ref存 / ref图库 / ref删 / ref清空 / ref选 / ref @<名字> / ref <描述>` 与 `/nai0 ref ...` | 角色参考族，结构与 vibe 对称但**仅 1 张**（§20.4 `character_references`，仅 V4.5 系列模型） |
+| `/nai ref存 / ref图库 / ref删 / ref清空 / ref选 / ref @<名字> / ref <描述>` 与 `/nai0 ref ...` | 角色参考族，结构与 vibe 对称但**仅 1 张**（§20.4 `character_references`，仅 V4.5 系列模型，**整族仅管理员可用**） |
+| `/nai ref类型 <character\|style\|both>` | 切换本会话 §20.4 提取目标（仅管理员，会话级）；`both` = `character&style` |
 | `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
 | `/nai set [3/f3/4c/4/4.5c/4.5]` | 查看/切换模型 |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
 | `/nai models` | 拉取 NewAPI 网关实时可用模型清单 |
-| `/nai nsfw [on/off]` | 切换 NSFW 过滤（会话级） |
+| `/nai nsfw [on/off]` | 切换 NSFW 过滤（会话级，仅管理员） |
 | `/nai pt on/off` | 切换提示词显示 |
-| `/nai on/off` | 切换自动撤回 |
+| `/nai on/off` | 切换自动撤回（仅管理员） |
 | `/nai st/sp` | 开/关管理员模式（仅管理员） |
 | `/nai help` | 帮助 |
 
@@ -121,6 +122,7 @@ default_model = "nai-diffusion-4-5-full"
 [action_guard] / [auto_draw_on_reply]                    # 出图触发保护 + reply 跟图
 [random_scene] / [tag_retriever]                         # 随机场景 / Tag 检索
 [retag]                                                  # 图片反推（PNG 元数据 + WD14 兜底）
+[i2i] / [vibe] / [character_reference]                   # 图生图各模式可调参数（§20.1/§20.3/§20.4）
 [components] / [prompt_show] / [nsfw_filter]
 [auto_recall] / [admin] / [custom_prompt]
 [model_nai4_5] / [model_nai4] / [model_nai3]             # 各版本独立参数 + artist_presets
@@ -262,6 +264,28 @@ type = "pixai"
 api = "/predict_image"
 ```
 
+### 图生图参数（i2i / vibe / 角色参考）
+
+三段对应 NewAPI 文档 §20.1 / §20.3 / §20.4；默认值就是 API 默认，不动也能跑：
+
+```toml
+[i2i]
+strength = 0.7        # 0.01~0.99，越小越像原图
+noise    = 0.0        # 0.0~0.99，注入噪声量
+
+[vibe]
+info_extracted     = 0.7   # 每张 vibe 图的 info_extracted（0.01~1.0）
+reference_strength = 0.6   # 每张 vibe 图的单独 strength（0.01~1.0）
+overall_strength   = 1.0   # ControlNet 整体强度叠加（0.0~1.0）
+
+[character_reference]
+type     = "character&style"  # character / style / character&style
+fidelity = 1.0                # 0.0~1.0，保真度（次要强度）
+strength = 1.0                # 0.0~1.0，主参考强度
+```
+
+> `[character_reference].type` 可以在会话里运行时切换：`/nai ref类型 character|style|both`（仅管理员）；命令切换的值优先于配置默认。
+
 ### 分版本模型配置
 
 `[model_nai4_5]` / `[model_nai4]` / `[model_nai3]` 三段独立，结构相同。`[model_nai4]` / `[model_nai3]` 字段描述统一为"作用同 `model_nai4_5.xxx`"。每段都可独立配 `artist_presets`：
@@ -347,6 +371,14 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v1.10.0 (2026-05-30)
+- **图生图三段可调参数**：新增 `[i2i]` / `[vibe]` / `[character_reference]` 三段配置，把 NewAPI §20.1（`strength` / `noise`）、§20.3（`info_extracted` / 每图 `reference_strength` / 整体 `overall_strength`）、§20.4（`type` / `fidelity` / `strength`）完整开放给用户；默认值与 API 默认对齐，不动也能跑。`_run_image_pipeline` 改为从 config 读取并兜底夹到合法区间，原本完全没透传的 `i2i.noise` 与 `controlnet.strength` 也补上。
+- **新增 `/nai ref类型 <character|style|both>`**：会话级粘性切换 `character_references[i].type`，命令优先于配置默认；`both` 是 `character&style` 的友好别名（仅管理员）。
+- **权限收紧**：`/nai ref` 全族（含 `/nai0 ref`）、`/nai vibe` 的 `存 / 选 / 图库 / 删 / 清空` 全部改为仅管理员；vibe 仅 `draw`（`/nai vibe <描述>` / `/nai0 vibe`）对普通用户开放。鉴权与 `/nai nsfw` 同套 `is_admin_user` 判定。
+- **WD14 单 Space 超时上限抬到 120s**：原先 `SAFE_SPACE_TIMEOUT_CAP = 35.0` 会把 config 写的 60s 砍回 35s 导致 PixAI-Tagger ONNX 冷启动直接超时；上限调到 120s，整体 deadline 抬到 360s。`wd14_request_timeout` 默认值同步到 120。
+- **`/nai help` 卡片改 column 流式布局**：从 2-col grid 换成 column-fill masonry，自动平衡两列高度去掉短卡片下面的死空白；新增「图生图 i2i §20.1」「Vibe Transfer §20.3」「角色参考 Ref §20.4」三张独立卡片，各自附"可调参数 = ..."提示行。
+- 修复 `/nai vibe`（vibe 模式）识别 bot 自拍意图并注入 bot 外貌 + `selfie_prompt_add`：仅当 `description` 命中"自拍/肖像"关键词时触发，`raw_prompt`（`/nai0 vibe`）与 ref / i2i 路径保持不注入以免洗掉参考图。`prompt_show.hide_selfie_prompt_add` 命中时显示提示词时隐藏自拍补充。
 
 ### v1.9.0 (2026-05-28)
 - **Vibe / 角色参考改走命名图库**：先 `/nai vibe存 <名字>` 把图入库（按 `user_id` 隔离，跨群可用），再 `/nai vibe选 <名字1> [<名字2>...]` 设当前会话默认图；之后 `/nai vibe <描述>` 直接用默认图，或 `/nai vibe @<名字1> [@<名字2>...] <描述>` 单次指定。ref 命令族结构对称（仅 1 张）。
