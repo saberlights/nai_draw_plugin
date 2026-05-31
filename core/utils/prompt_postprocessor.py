@@ -203,17 +203,13 @@ def _strip_wrappers(tag: str) -> str:
 
 
 def remove_selfie_appearance_tags(prompt: str) -> str:
-    """
-    去掉自拍里常见的“随机外貌标签”（发色/发型/瞳色）。
+    “””
+    去掉自拍里常见的”随机外貌标签”（发色/发型/瞳色）。
 
     只移除明确的外貌 tag，尽量不伤及配饰（如 hair ribbon / hair ornament）。
-    """
+    支持 NAI4/4.5 高级权重语法（weight::tag::）。
+    “””
     if not prompt or not prompt.strip():
-        return prompt
-
-    # 如果包含 NAI4/4.5 高级权重语法，字符串级按逗号拆分有概率破坏语法，直接跳过
-    # （想要在这种情况下也过滤，需要让 LLM 输出数组结构再做安全过滤）
-    if "::" in prompt:
         return prompt
 
     hair_colors = {
@@ -252,7 +248,7 @@ def remove_selfie_appearance_tags(prompt: str) -> str:
         if "hair" in core and any(x in core for x in ("ribbon", "ornament", "clip", "pin", "bow", "band", "flower")):
             return False
 
-        # 发色：xxx hair / xxx-haired
+        # 发色：xxx hair / xxx-haired（如 black hair, blue hair）
         m = re.match(r"^([a-z]+)\s+hair$", core)
         if m and m.group(1) in hair_colors:
             return True
@@ -261,6 +257,11 @@ def remove_selfie_appearance_tags(prompt: str) -> str:
 
         # 发型/长度：long hair / very long hair / short hair / medium hair
         if re.match(r"^(?:very )?(?:long|short|medium)\s+hair$", core):
+            return True
+
+        # 长度+发色组合：long brown hair / very long black hair / short blonde hair
+        m_combo = re.match(r"^(?:very )?(long|short|medium)\s+([a-z]+)\s+hair$", core)
+        if m_combo and m_combo.group(2) in hair_colors:
             return True
 
         # 常见发型词

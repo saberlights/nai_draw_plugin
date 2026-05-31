@@ -1378,12 +1378,14 @@ class NaiInvocation(ModelConfigMixin):
         user_specified = user_mentions_appearance(raw_request)
         original_description = description
 
+        # auto 模式：先移除 LLM 随机外貌，再合并 selfie_prompt_add（允许配置的固定外貌）
         if policy == "auto" and not user_specified:
             description = remove_selfie_appearance_tags(description)
 
         if include_selfie_prompt_add and selfie_prompt_add:
             description = merge_selfie_prompt(description, selfie_prompt_add)
 
+        # never 模式：合并 selfie_prompt_add 后再移除所有外貌（包括配置中的固定外貌）
         if policy == "never" and not user_specified:
             description = remove_selfie_appearance_tags(description)
 
@@ -1916,6 +1918,7 @@ class NaiInvocation(ModelConfigMixin):
                 show_prompt = generated_prompt
                 header = "📝 提示词:"
                 if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
+                    # 重新处理以隐藏 selfie_prompt_add，但仍需应用外貌过滤
                     show_prompt = self._process_selfie_prompt(
                         selfie_base_prompt,
                         description,
@@ -1923,6 +1926,9 @@ class NaiInvocation(ModelConfigMixin):
                         log_changes=False,
                     )
                     header = "📝 提示词(已隐藏自拍补充):"
+                elif is_selfie:
+                    # 即使不隐藏 selfie_prompt_add，显示的也应该是过滤后的版本
+                    show_prompt = generated_prompt
                 show_prompt = self._sanitize_prompt_for_sfw_mode(show_prompt)
                 await self.send_text(f"{header}\n{show_prompt}", storage_message=False)
 
