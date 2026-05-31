@@ -51,7 +51,7 @@ HELP_DOC: HelpDoc = HelpDoc(
             ),
             hint=(
                 "描述含「自拍/镜子/合照/手机拍」走自拍路径；"
-                "含「肖像/生活照/立绘/portrait」走肖像路径；其它走普通画图。"
+                "含「肖像/生活照/portrait」走肖像路径；其它走普通画图。"
             ),
         ),
         HelpSection(
