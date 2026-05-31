@@ -38,11 +38,11 @@ SELFIE_HINT_FOR_LLM = """
 
 | 意图 | 触发线索 | 输出特征 |
 |------|----------|----------|
-| **肖像/生活照（portrait）** | 用户输入含：肖像 / 头像照 / portrait / 生活照 / 立绘 / 证件照 / candid | 必含 `portrait photo` 或 `candid photo` 作为肖像意图标记；framing tag（`upper body` / `full body`）独立选择并紧邻其前。**绝对禁止**写矛盾合体 `full body portrait` / `upper body portrait`（NAI 把 portrait 与 full body/upper body 视为同类对立 framing tag，叠加会让构图回退到中间档）；**绝对禁止** `selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` |
-| **自拍（selfie）** | 用户输入含：自拍 / selfie / 镜子 / 前置 / 合照 / 拍给我看 / 看你的 / 给我看 / 你穿X / 你的X / 看看X（X 是穿搭/部位） | 必含 `selfie` 或 `mirror selfie` 或 `group selfie`，并按下方"自拍类型"选择对应必须标签 |
+| **肖像/生活照（portrait）** | 用户输入含：肖像 / portrait / 肖像照 | 必含 `portrait photo` 或 `candid photo` 作为肖像意图标记；framing tag（`upper body` / `full body`）独立选择并紧邻其前。**绝对禁止**写矛盾合体 `full body portrait` / `upper body portrait`（NAI 把 portrait 与 full body/upper body 视为同类对立 framing tag，叠加会让构图回退到中间档）；**绝对禁止** `selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` |
+| **自拍（selfie）** | 用户输入含：自拍 / selfie / 自拍照 | 必含 `selfie` 或 `mirror selfie` 或 `group selfie`，并按下方"自拍类型"选择对应必须标签 |
 | **普通画图（normal）** | 用户明确要"画一个 X"，与 bot 本人无关 | 按场景生成普通 tag，不加 selfie/portrait 类标签；可补 `solo, 1girl/1boy` |
 
-**【最高优先级】** 用户输入只要含肖像类关键词（肖像/头像照/portrait/生活照/证件照/candid），**强制走肖像路径**，禁止输出任何 `selfie` 系标签，即使下方"自拍意图"也匹配。
+**【最高优先级】** 用户输入只要含肖像类关键词（肖像/portrait/肖像照），**强制走肖像路径**，禁止输出任何 `selfie` 系标签，即使下方"自拍意图"也匹配。
 
 **【画指定角色优先级 > 肖像/自拍】** 用户输入含具体二次元角色名（如"初音未来"/"蕾姆"/"芙兰朵露"）或前缀 `画指定角色`，**强制走普通画图路径**，本轮主体是角色而非 bot：
 - 禁止输出任何 `selfie` / `mirror selfie` / `group selfie` / `portrait photo` / `candid photo` / `upper body portrait` / `full body portrait` 等"bot 出镜"语义 framing
@@ -98,8 +98,8 @@ SELFIE_HINT_FOR_LLM = """
 - 上一轮是**普通画图**（无自拍/肖像标签）→ 本轮默认仍是普通画图，不强加 selfie/portrait 类标签
 
 **只有以下情况才允许切换类型**：
-- 用户本轮明确要求自拍：含"自拍/selfie/镜子/前置/合照"等关键词 → 切到自拍路径
-- 用户本轮明确要求肖像：含"肖像/portrait/生活照"等关键词 → 切到肖像路径
+- 用户本轮明确要求自拍：含"自拍/selfie"等关键词 → 切到自拍路径
+- 用户本轮明确要求肖像：含"肖像/portrait"等关键词 → 切到肖像路径
 - 用户本轮明确要求"换成普通画图/画一个X"→ 切到普通画图
 
 切换类型时，仍延续场景、服装、光线、时间氛围等可继承元素，仅改拍摄方式/构图。

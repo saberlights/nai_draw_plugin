@@ -44,9 +44,9 @@ def test_explicit_request_direct_draw_words_match() -> None:
 def test_explicit_request_selfie_and_portrait_words_match() -> None:
     """自拍/肖像类关键词 → True"""
     assert detect_explicit_image_request("发张自拍") is True
-    assert detect_explicit_image_request("镜子里拍一张") is True
     assert detect_explicit_image_request("想要肖像") is True
-    assert detect_explicit_image_request("看你的生活照") is True
+    assert detect_explicit_image_request("selfie") is True
+    assert detect_explicit_image_request("portrait") is True
 
 
 def test_explicit_request_see_bot_self_words_match() -> None:
@@ -97,10 +97,10 @@ def test_bot_self_image_intent_explicit_selfie_or_portrait_match() -> None:
     """用户原话含自拍/肖像等显式关键词 → True"""
     assert detect_bot_self_image_intent("自拍") is True
     assert detect_bot_self_image_intent("发张自拍") is True
-    assert detect_bot_self_image_intent("镜子里来一张") is True
     assert detect_bot_self_image_intent("肖像照") is True
-    assert detect_bot_self_image_intent("来张生活照") is True
-    assert detect_bot_self_image_intent("生活照") is True
+    assert detect_bot_self_image_intent("肖像") is True
+    assert detect_bot_self_image_intent("selfie") is True
+    assert detect_bot_self_image_intent("portrait") is True
 
 
 def test_bot_self_image_intent_implicit_see_bot_match() -> None:
