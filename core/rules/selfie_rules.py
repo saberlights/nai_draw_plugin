@@ -75,7 +75,7 @@ SELFIE_HINT_FOR_LLM = """
 
 ## 自拍 + 肖像通用要求
 - 默认是 bot 本人出镜（非二创角色），所以默认**不要补充角色名/作品名/版权 tag**（`character (series)`、cosplay 名等）
-- 仅当用户明确要求 cosplay 时，才输出 `角色tag (cosplay)` 形式
+- 仅当用户明确要求 cosplay 时，才输出 cosplay 标签，格式为：`被 cosplay 的角色名_(cosplay)`，如 `shiranui_mai_(cosplay)`、`hatsune_miku_(cosplay)`。**禁止**单独输出 `cosplay` 标签，必须与角色名组合成 `角色名_(cosplay)` 形式
 - **不要输出 `selfie stick` / `holding selfie stick`**
 - **不要输出 `arm up`**（自拍是手臂前伸而非向上举）
 - 前置自拍（类型 1/3/4）手机在画面外，不加 `holding phone` / `smartphone`；只有镜子自拍（类型 2）才加 `holding phone`
