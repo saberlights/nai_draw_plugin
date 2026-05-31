@@ -203,12 +203,12 @@ def _strip_wrappers(tag: str) -> str:
 
 
 def remove_selfie_appearance_tags(prompt: str) -> str:
-    “””
+    """
     去掉自拍里常见的”随机外貌标签”（发色/发型/瞳色）。
 
     只移除明确的外貌 tag，尽量不伤及配饰（如 hair ribbon / hair ornament）。
     支持 NAI4/4.5 高级权重语法（weight::tag::）。
-    “””
+    """
     if not prompt or not prompt.strip():
         return prompt
 
