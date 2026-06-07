@@ -1339,7 +1339,8 @@ class NaiPicPlugin(MaiBotPlugin):
         if not sent or not isinstance(message, dict):
             return None
 
-        remember_sent_plugin_image_message(message, NAI_PIC_IMAGE_DISPLAY_MARKER)
+        if remember_sent_plugin_image_message(message, NAI_PIC_IMAGE_DISPLAY_MARKER):
+            self._image_cache_service.cache_inbound_message(message)
         return None
 
     @HookHandler(
