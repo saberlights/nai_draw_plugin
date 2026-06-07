@@ -115,6 +115,14 @@ def test_default_config_excludes_hidden_wd14_spaces() -> None:
     assert default["retag"]["enabled"] is True
 
 
+def test_default_config_directs_nai_without_removing_wd14_proxy() -> None:
+    plugin = NaiPicPlugin()
+    default = plugin.get_default_config()
+
+    assert default["model"]["nai_proxy_mode"] == "direct"
+    assert "wd14_proxy" in default["retag"]
+
+
 def test_rendered_config_places_retag_between_tag_retriever_and_custom_prompt() -> None:
     text = _render_default_config_text()
     idx_tag = text.find("\n[tag_retriever]")

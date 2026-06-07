@@ -6,6 +6,8 @@ import sys
 import types
 from pathlib import Path
 
+import requests
+
 MAIBOT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(MAIBOT_ROOT))
 
@@ -390,6 +392,94 @@ def _make_response(status_code: int, json_body: object | None = None, text: str 
 def _make_client_stub() -> NaiWebClient:
     """绕过 __init__ 的 Session 创建，只测纯解析逻辑。"""
     return NaiWebClient.__new__(NaiWebClient)
+
+
+class _RecordingSession:
+    def __init__(self, *, response: object | None = None, exc: Exception | None = None) -> None:
+        self.response = response or _SessionResponse()
+        self.exc = exc
+        self.post_calls: list[dict[str, object]] = []
+
+    def post(self, **kwargs):
+        self.post_calls.append(dict(kwargs))
+        if self.exc is not None:
+            raise self.exc
+        return self.response
+
+
+class _SessionResponse:
+    status_code = 200
+    headers: dict[str, str] = {}
+    url = "https://example.com/v1/chat/completions"
+
+
+def _make_proxy_client_stub() -> NaiWebClient:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    return client
+
+
+def test_resolve_proxy_mode_defaults_to_direct() -> None:
+    assert NaiWebClient._resolve_proxy_mode({}) == "direct"
+
+
+def test_send_request_auto_uses_direct_session_before_env_proxy() -> None:
+    client = _make_proxy_client_stub()
+    direct_response = _SessionResponse()
+    client.direct_session = _RecordingSession(response=direct_response)
+    client.session = _RecordingSession()
+
+    response = client._send_request(
+        "https://example.com/v1/chat/completions",
+        {"model": "nai-diffusion-4-5-full"},
+        {"Authorization": "Bearer token"},
+        "auto",
+        12.0,
+    )
+
+    assert response is direct_response
+    assert len(client.direct_session.post_calls) == 1
+    assert client.session.post_calls == []
+
+
+def test_send_request_auto_falls_back_to_env_proxy_when_direct_transport_fails() -> None:
+    client = _make_proxy_client_stub()
+    env_response = _SessionResponse()
+    client.direct_session = _RecordingSession(
+        exc=requests.exceptions.ConnectionError("direct network unavailable")
+    )
+    client.session = _RecordingSession(response=env_response)
+
+    response = client._send_request(
+        "https://example.com/v1/chat/completions",
+        {"model": "nai-diffusion-4-5-full"},
+        {"Authorization": "Bearer token"},
+        "auto",
+        12.0,
+    )
+
+    assert response is env_response
+    assert len(client.direct_session.post_calls) == 1
+    assert len(client.session.post_calls) == 1
+
+
+def test_send_request_inherit_still_uses_environment_proxy_session() -> None:
+    client = _make_proxy_client_stub()
+    env_response = _SessionResponse()
+    client.direct_session = _RecordingSession()
+    client.session = _RecordingSession(response=env_response)
+
+    response = client._send_request(
+        "https://example.com/v1/chat/completions",
+        {"model": "nai-diffusion-4-5-full"},
+        {"Authorization": "Bearer token"},
+        "inherit",
+        12.0,
+    )
+
+    assert response is env_response
+    assert client.direct_session.post_calls == []
+    assert len(client.session.post_calls) == 1
 
 
 def test_parse_models_response_extracts_ids_in_order() -> None:

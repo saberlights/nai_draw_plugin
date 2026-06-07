@@ -28,7 +28,9 @@ def _make_spaces(n: int) -> list[Dict[str, Any]]:
 
 
 def _build_client(spaces: list[Dict[str, Any]]) -> WD14Client:
-    return WD14Client(spaces_config=spaces, max_retries=1, retry_delay=0.01)
+    client = WD14Client(spaces_config=spaces, max_retries=1, retry_delay=0.01)
+    client._gradio_available = True
+    return client
 
 
 def test_serial_polling_stops_at_first_success() -> None:

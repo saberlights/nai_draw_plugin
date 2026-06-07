@@ -82,7 +82,6 @@ class NaiWebClient:
         self.log_prefix = action_instance.log_prefix
         self.session: requests.Session = self._create_session(trust_env=True)
         self.direct_session: requests.Session = self._create_session(trust_env=False)
-        self._auto_proxy_direct_only = False
         # 上一次 _parse_response 提取出的 vibe cache 注释（文档 §20.3.1）；
         # generate_image 在 controlnet 路径里读取该字段做缓存落库
         self._last_response_vibe_cache_ids: List[Dict[str, Any]] = []
@@ -108,8 +107,8 @@ class NaiWebClient:
 
     @staticmethod
     def _resolve_proxy_mode(model_config: Dict[str, Any]) -> str:
-        value = model_config.get("nai_proxy_mode") or model_config.get("proxy_mode") or "auto"
-        return str(value).strip().lower() or "auto"
+        value = model_config.get("nai_proxy_mode") or model_config.get("proxy_mode") or "direct"
+        return str(value).strip().lower() or "direct"
 
     @classmethod
     def _resolve_request_timeout(cls, model_config: Dict[str, Any]) -> float:
@@ -1088,18 +1087,13 @@ class NaiWebClient:
             return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
         if proxy_mode == "inherit":
             return self.session.get(url=url, headers=headers, timeout=request_timeout)
-        if self._auto_proxy_direct_only:
-            return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
         try:
-            return self.session.get(url=url, headers=headers, timeout=request_timeout)
-        except requests.RequestException as exc:
-            if not self._is_proxy_related_exception(exc):
-                raise
-            self._auto_proxy_direct_only = True
-            logger.warning(
-                f"{self.log_prefix} (NewAPI) 代理连接失败，自动回退直连: {exc}"
-            )
             return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
+        except requests.RequestException as exc:
+            logger.warning(
+                f"{self.log_prefix} (NewAPI) 直连失败，自动改用环境代理: {exc}"
+            )
+            return self.session.get(url=url, headers=headers, timeout=request_timeout)
 
     def _parse_models_response(self, response: requests.Response) -> Tuple[bool, List[str] | str]:
         """解析 /v1/models 响应；返回字符串数组或失败原因。"""
@@ -1191,19 +1185,14 @@ class NaiWebClient:
             return self._request_with_session(False, url, body, headers, request_timeout)
         if proxy_mode == "inherit":
             return self._request_with_session(True, url, body, headers, request_timeout)
-        if self._auto_proxy_direct_only:
-            return self._request_with_session(False, url, body, headers, request_timeout)
 
         try:
-            return self._request_with_session(True, url, body, headers, request_timeout)
-        except requests.RequestException as exc:
-            if not self._is_proxy_related_exception(exc):
-                raise
-            self._auto_proxy_direct_only = True
-            logger.warning(
-                f"{self.log_prefix} (NewAPI) 代理连接失败，自动回退直连: {exc}"
-            )
             return self._request_with_session(False, url, body, headers, request_timeout)
+        except requests.RequestException as exc:
+            logger.warning(
+                f"{self.log_prefix} (NewAPI) 直连失败，自动改用环境代理: {exc}"
+            )
+            return self._request_with_session(True, url, body, headers, request_timeout)
 
     def _request_with_session(
         self,

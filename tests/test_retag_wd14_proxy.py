@@ -48,7 +48,7 @@ def test_proxy_passed_into_httpx_kwargs() -> None:
         spaces_config=[{"name": "demo/space", "type": "danbooru_v4", "api": "/_fn_submit"}],
         proxy="http://127.0.0.1:7890",
     )
-    with patch.object(wd14_module, "Client", _StubGradioClient), patch.object(
+    with patch.object(wd14_module, "Client", _StubGradioClient, create=True), patch.object(
         wd14_module, "GRADIO_AVAILABLE", True
     ):
         result = client._get_or_create_client("demo/space")
@@ -62,7 +62,7 @@ def test_empty_proxy_does_not_pollute_httpx_kwargs() -> None:
     """没配 proxy 时 httpx_kwargs 不应包含 proxy 键，避免覆盖 httpx 默认行为。"""
     _reset_stub()
     client = WD14Client(spaces_config=[{"name": "x/y", "type": "pixai", "api": "/predict_image"}])
-    with patch.object(wd14_module, "Client", _StubGradioClient), patch.object(
+    with patch.object(wd14_module, "Client", _StubGradioClient, create=True), patch.object(
         wd14_module, "GRADIO_AVAILABLE", True
     ):
         client._get_or_create_client("x/y")
@@ -88,7 +88,7 @@ def test_proxy_fallback_when_httpx_rejects_proxy_kwarg() -> None:
         spaces_config=[{"name": "demo/space", "type": "danbooru_v4", "api": "/_fn_submit"}],
         proxy="http://127.0.0.1:7890",
     )
-    with patch.object(wd14_module, "Client", _StubGradioClient), patch.object(
+    with patch.object(wd14_module, "Client", _StubGradioClient, create=True), patch.object(
         wd14_module, "GRADIO_AVAILABLE", True
     ):
         result = client._get_or_create_client("demo/space")

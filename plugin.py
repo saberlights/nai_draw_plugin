@@ -20,6 +20,7 @@ from .core.rules.reply_auto_draw import (
     compose_description_from_reply,
     score_reply_for_auto_draw,
 )
+from .core.reply_command_text import normalize_reply_command_text
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -388,8 +389,8 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "nai_proxy_mode": ConfigField(
                 type=str,
-                default="auto",
-                description="代理模式；可填 auto / inherit / direct：auto=先继承环境代理，失败回退直连；inherit=始终继承；direct=始终直连"
+                default="direct",
+                description="代理模式；可填 direct / inherit / auto：direct=始终直连；inherit=始终继承环境代理；auto=先直连，网络失败再继承环境代理"
             ),
             "nai_max_tokens": ConfigField(
                 type=int,
@@ -1432,6 +1433,31 @@ class NaiPicPlugin(MaiBotPlugin):
         return {"action": "continue"}
 
     @HookHandler(
+        "chat.receive.after_process",
+        name="nai_draw_plugin_normalize_reply_command_text",
+        description="避免引用回复里的历史 /nai 命令被 MaiBot 后处理文本再次触发",
+        order=HookOrder.EARLY,
+    )
+    async def handle_reply_command_text_after_process(
+        self,
+        message: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """在命令匹配前把 reply 引用内容从本次命令文本里剥离。"""
+        if not isinstance(message, dict):
+            return {"action": "continue"}
+
+        normalized_text = normalize_reply_command_text(message)
+        if normalized_text is None:
+            return {"action": "continue"}
+
+        updated_message = dict(message)
+        updated_message["processed_plain_text"] = normalized_text
+        updated_kwargs = dict(kwargs)
+        updated_kwargs["message"] = updated_message
+        return {"action": "continue", "modified_kwargs": updated_kwargs}
+
+    @HookHandler(
         "chat.command.before_execute",
         name="nai_draw_plugin_retag_command_message_cache",
         description="在需要引用图的命令（反推 / i2i / vibe存 / ref存）执行前缓存当前命令消息（保留 reply 信息）",
@@ -1801,7 +1827,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_manual_recall_command",
         description="手动撤回图片：/nai 撤回",
-        pattern=r"^(?:.*?)(?:/nai\s+撤回)(?:\s+.*)?$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+撤回(?:\s+.*)?$",
     )
     async def handle_nai_manual_recall_command(
         self,
@@ -1824,7 +1850,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_retag_command",
         description="图片反推：/nai 反推（PNG 元数据 → WD14 兜底，只输出正向 prompt）",
-        pattern=r"^(?:.*?)(?:/nai\s+反推)(?:\s+.*)?$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+反推(?:\s+.*)?$",
     )
     async def handle_nai_retag_command(
         self,
@@ -1845,7 +1871,7 @@ class NaiPicPlugin(MaiBotPlugin):
         # negative lookahead 排除所有 /nai 子命令；vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
         # 所以用 ``(?:\b|[一-鿿])`` 覆盖空格后置和中文后缀两种情形，避免 ``vibe存`` 被
         # 通用命令吞掉（vibe\b 在 latin→CJK 边界不成立）
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|artgen\b|artr$|artfix\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,
@@ -2006,10 +2032,8 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_i2i_command",
         description="图生图：/nai i2i <描述>（需引用一张图）",
-        # 宽松前缀：/nai i2i 总伴随"回复一张图"链路，各平台的 reply 前缀形态不一，
-        # 沿用 /nai 反推 / /nai 撤回 的 (?:.*?) 起手而不是严格的 (?:.*，说：\s*)?，
-        # 否则带 reply 前缀的消息匹不上、用户看到"没反应"
-        pattern=r"^(?:.*?)/nai\s+i2i\s+(?P<description>[\s\S]+)$",
+        # 只跳过完整的引用/图片等方括号组件或旧转述前缀；不能从引用内容里扫描历史 /nai。
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+i2i\s+(?P<description>[\s\S]+)$",
     )
     async def handle_nai_i2i_command(
         self,
@@ -2034,7 +2058,7 @@ class NaiPicPlugin(MaiBotPlugin):
         description="角色参考：/nai ref [@<名字>] <描述>（用图库里的角色参考图，仅 V4.5 模型）",
         # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字>... 单次覆盖，否则用 /nai ref选 的粘性选定
         # ref 最多 1 张：pattern 允许多个 @<名字> 透传，store 层做硬上限校验给统一错误提示
-        pattern=r"^(?:.*?)/nai\s+ref\s+(?P<at_names>(?:@\S+\s+)*)(?P<description>[\s\S]+)$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref\s+(?P<at_names>(?:@\S+\s+)*)(?P<description>[\s\S]+)$",
     )
     async def handle_nai_ref_command(
         self,
@@ -2060,7 +2084,7 @@ class NaiPicPlugin(MaiBotPlugin):
         # 宽松前缀，同 nai_i2i_command 注释；可选 @<名字>... 单次覆盖，否则用 /nai vibe选 的粘性选定
         # at_names 用 (?:@\S+\s+)* 整体捕获 0~N 个 @ 前缀，命令层 re.findall 拆解；
         # vibe 最多 4 张走 store 层硬限制，超 4 走统一错误提示
-        pattern=r"^(?:.*?)/nai\s+vibe\s+(?P<at_names>(?:@\S+\s+)*)(?P<description>[\s\S]+)$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+vibe\s+(?P<at_names>(?:@\S+\s+)*)(?P<description>[\s\S]+)$",
     )
     async def handle_nai_vibe_command(
         self,
@@ -2085,7 +2109,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_vibe_save_command",
         description="把引用回复的图存入 vibe 图库：/nai vibe存 <名字>",
-        pattern=r"^(?:.*?)/nai\s+vibe存\s+(?P<name>\S+)\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+vibe存\s+(?P<name>\S+)\s*$",
     )
     async def handle_nai_vibe_save_command(
         self,
@@ -2107,7 +2131,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_vibe_list_command",
         description="列出 vibe 图库的所有命名图：/nai vibe图库",
-        pattern=r"^(?:.*?)/nai\s+vibe图库\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+vibe图库\s*$",
     )
     async def handle_nai_vibe_list_command(
         self,
@@ -2129,7 +2153,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_vibe_delete_command",
         description="从 vibe 图库删除一张命名图：/nai vibe删 <名字>",
-        pattern=r"^(?:.*?)/nai\s+vibe删\s+(?P<name>\S+)\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+vibe删\s+(?P<name>\S+)\s*$",
     )
     async def handle_nai_vibe_delete_command(
         self,
@@ -2152,7 +2176,7 @@ class NaiPicPlugin(MaiBotPlugin):
         "nai_vibe_select_command",
         description="把本会话的默认 vibe 图设为 1~4 张命名图：/nai vibe选 <名字1> [<名字2>...]",
         # 1 ~ N 个名字，空格分隔；store 层会做 vibe ≤ 4 的硬限制
-        pattern=r"^(?:.*?)/nai\s+vibe选\s+(?P<names>\S+(?:\s+\S+)*)\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+vibe选\s+(?P<names>\S+(?:\s+\S+)*)\s*$",
     )
     async def handle_nai_vibe_select_command(
         self,
@@ -2174,7 +2198,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_vibe_clear_command",
         description="一键清空 vibe 图库（当前用户）：/nai vibe清空",
-        pattern=r"^(?:.*?)/nai\s+vibe清空\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+vibe清空\s*$",
     )
     async def handle_nai_vibe_clear_command(
         self,
@@ -2196,7 +2220,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_ref_save_command",
         description="把引用回复的图存入角色参考图库：/nai ref存 <名字>",
-        pattern=r"^(?:.*?)/nai\s+ref存\s+(?P<name>\S+)\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref存\s+(?P<name>\S+)\s*$",
     )
     async def handle_nai_ref_save_command(
         self,
@@ -2218,7 +2242,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_ref_list_command",
         description="列出角色参考图库的所有命名图：/nai ref图库",
-        pattern=r"^(?:.*?)/nai\s+ref图库\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref图库\s*$",
     )
     async def handle_nai_ref_list_command(
         self,
@@ -2240,7 +2264,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_ref_delete_command",
         description="从角色参考图库删除一张命名图：/nai ref删 <名字>",
-        pattern=r"^(?:.*?)/nai\s+ref删\s+(?P<name>\S+)\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref删\s+(?P<name>\S+)\s*$",
     )
     async def handle_nai_ref_delete_command(
         self,
@@ -2263,7 +2287,7 @@ class NaiPicPlugin(MaiBotPlugin):
         "nai_ref_select_command",
         description="把本会话的默认角色参考图设为某张命名图：/nai ref选 <名字>",
         # ref 固定最多 1 张，pattern 与 vibe 选保持一致捕获 names 组；store 层若收到 >1 会拒
-        pattern=r"^(?:.*?)/nai\s+ref选\s+(?P<names>\S+(?:\s+\S+)*)\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref选\s+(?P<names>\S+(?:\s+\S+)*)\s*$",
     )
     async def handle_nai_ref_select_command(
         self,
@@ -2285,7 +2309,7 @@ class NaiPicPlugin(MaiBotPlugin):
     @Command(
         "nai_ref_clear_command",
         description="一键清空角色参考图库（当前用户）：/nai ref清空",
-        pattern=r"^(?:.*?)/nai\s+ref清空\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref清空\s*$",
     )
     async def handle_nai_ref_clear_command(
         self,
@@ -2308,7 +2332,7 @@ class NaiPicPlugin(MaiBotPlugin):
         "nai_ref_type_command",
         description="切换本会话角色参考类型：/nai ref类型 <character|style|both>",
         # 无参时打印当前态；both 是 character&style 的友好别名
-        pattern=r"^(?:.*?)/nai\s+ref类型(?:\s+(?P<value>\S+))?\s*$",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+ref类型(?:\s+(?P<value>\S+))?\s*$",
     )
     async def handle_nai_ref_type_command(
         self,

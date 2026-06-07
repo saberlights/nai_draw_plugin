@@ -41,6 +41,15 @@ def _compile(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern)
 
 
+def _matching_command_names(patterns: Dict[str, str], message: str) -> list[str]:
+    """按 plugin.py 注册顺序返回所有能匹配该消息的命令名。"""
+    return [
+        name
+        for name, pattern in patterns.items()
+        if _compile(pattern).search(message)
+    ]
+
+
 # ── 图生图族命令 pattern ─────────────────────────────────────────────────
 
 
@@ -67,6 +76,7 @@ def test_i2i_ref_vibe_patterns_tolerate_quote_reply_prefix() -> None:
     patterns = _load_command_patterns()
     quote_prefixes = [
         "[回复 alice 的消息: 来一张] ",
+        "[回复了alice的消息: 来一张] ",
         "[CQ:reply,id=12345] ",
         "alice，说：",  # 老的 MaiBot 转述前缀仍需兼容
     ]
@@ -111,6 +121,9 @@ def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
         assert generic.match(sample) is None, f"通用 /nai 不应吞掉 {sample!r}"
     # 但正常 /nai <描述> 仍需匹配
     assert generic.match("/nai 画一张初音未来") is not None
+    assert generic.match("/nai artgen 画师风格生成") is not None
+    assert generic.match("/nai artr 画师风格重随机") is not None
+    assert generic.match("/nai artfix 画师风格修复") is not None
 
 
 # ── 命名图库子命令 pattern ───────────────────────────────────────────────
@@ -201,7 +214,7 @@ def test_vibe_ref_select_patterns_capture_multiple_names() -> None:
 def test_subcommand_patterns_tolerate_quote_reply_prefix() -> None:
     """vibe存 / ref存 也常带 reply 前缀（用户回复一张图后存图），同样要兼容。"""
     patterns = _load_command_patterns()
-    prefixes = ["[回复 alice 的消息: 这张] ", "[CQ:reply,id=999] ", "alice，说："]
+    prefixes = ["[回复 alice 的消息: 这张] ", "[回复了alice的消息: 这张] ", "[CQ:reply,id=999] ", "alice，说："]
     for cmd_name, body in [
         ("nai_vibe_save_command", "/nai vibe存 角色A"),
         ("nai_ref_save_command", "/nai ref存 角色A"),
@@ -210,6 +223,34 @@ def test_subcommand_patterns_tolerate_quote_reply_prefix() -> None:
         for prefix in prefixes:
             message = f"{prefix}{body}"
             assert regex.match(message) is not None, f"{cmd_name} 应匹配 {message!r}"
+
+
+def test_quote_reply_content_does_not_trigger_command() -> None:
+    """引用内容里的历史命令不能被当成本次消息命令执行。"""
+    patterns = _load_command_patterns()
+    quoted_command_messages = [
+        ("nai_retag_command", "[回复 alice 的消息: /nai 反推] 收到"),
+        ("nai_retag_command", "[回复了alice的消息: /nai 反推] 收到"),
+        ("nai_i2i_command", "[回复 alice 的消息: /nai i2i 改成森林背景] 收到"),
+        ("nai_i2i_command", "[回复了alice的消息: /nai i2i 改成森林背景] 收到"),
+        ("nai_vibe_save_command", "[回复 alice 的消息: /nai vibe存 角色A] 收到"),
+        ("nai_ref_type_command", "[回复 alice 的消息: /nai ref类型 both] 收到"),
+    ]
+    for cmd_name, message in quoted_command_messages:
+        regex = _compile(patterns[cmd_name])
+        assert regex.match(message) is None, f"{cmd_name} 不应被引用内容触发: {message!r}"
+        assert _matching_command_names(patterns, message) == []
+
+
+def test_current_command_after_quoted_command_still_matches() -> None:
+    """引用内容可以包含历史命令；只要当前正文另有命令，仍应按正文命令匹配。"""
+    patterns = _load_command_patterns()
+    message = "[回复 alice 的消息: /nai 反推] /nai i2i 改成森林背景"
+    regex = _compile(patterns["nai_i2i_command"])
+    match = regex.match(message)
+    assert match is not None
+    assert match.group("description") == "改成森林背景"
+    assert _matching_command_names(patterns, message) == ["nai_i2i_command"]
 
 
 def test_vibe_ref_clear_patterns_match_keyword_only() -> None:
