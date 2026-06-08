@@ -44,6 +44,24 @@ def _merge_config_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[
 
 
 _CONFIG_VALUE_MISSING = object()
+_WEBUI_TYPE_NAMES = {
+    str: "string",
+    int: "integer",
+    float: "number",
+    bool: "boolean",
+    list: "array",
+    dict: "object",
+}
+_WEBUI_TEXTAREA_FIELDS = {
+    "custom_prompt_add",
+    "negative_prompt_add",
+    "selfie_prompt_add",
+    "selfie_negative_prompt_add",
+    "nai_artist_prompt",
+    "prompt_template",
+    "system_prompt",
+}
+_WEBUI_PASSWORD_FIELD_TOKENS = ("api_key", "password", "secret", "token")
 
 
 def _resolve_existing_config_value(
@@ -74,6 +92,140 @@ def _resolve_existing_config_value(
     if raw is _CONFIG_VALUE_MISSING:
         return default
     return raw.unwrap() if hasattr(raw, "unwrap") else raw
+
+
+def _webui_field_type(field_def: ConfigField) -> str:
+    """把 ConfigField Python 类型转换成 WebUI 使用的规范类型名。"""
+    return _WEBUI_TYPE_NAMES.get(field_def.type, "string")
+
+
+def _webui_label(field_name: str, field_def: ConfigField) -> str:
+    """从描述里提取短标签，避免 WebUI label 变成整段说明。"""
+    if field_def.label:
+        return field_def.label
+    first_line = str(field_def.description or "").strip().splitlines()[0:1]
+    if first_line:
+        label = first_line[0].split("；", 1)[0].strip()
+        if label:
+            return label
+    return field_name
+
+
+def _webui_ui_type(field_name: str, field_def: ConfigField) -> str:
+    """补齐 WebUI 控件类型；密钥和长 prompt 字段用更合适的控件。"""
+    if field_def.input_type:
+        return field_def.input_type
+    lowered = field_name.lower()
+    if any(token in lowered for token in _WEBUI_PASSWORD_FIELD_TOKENS):
+        return "password"
+    if field_def.type is str and (
+        field_name in _WEBUI_TEXTAREA_FIELDS
+        or "\n" in str(field_def.default or "")
+        or len(str(field_def.default or "")) > 120
+    ):
+        return "textarea"
+    return field_def.get_ui_type()
+
+
+def _webui_item_schema_from_value(value: Any) -> dict[str, Any]:
+    """为 list[dict] 的元素字段生成 WebUI schema。"""
+    value_type = "number" if isinstance(value, (int, float)) and not isinstance(value, bool) else "string"
+    if isinstance(value, bool):
+        value_type = "boolean"
+    return {
+        "type": value_type,
+        "label": "",
+        "default": value,
+    }
+
+
+def _webui_list_item_fields(field_name: str, default: Any) -> dict[str, Any] | None:
+    """推断列表对象字段；显式补上常用可选字段，避免 WebUI 只能编辑默认样例。"""
+    if field_name == "artist_presets":
+        return {
+            "name": {"type": "string", "label": "名称", "default": ""},
+            "prompt": {"type": "string", "label": "正向提示词", "default": ""},
+            "negative_prompt_add": {"type": "string", "label": "负向提示词", "default": ""},
+        }
+    if field_name == "wd14_spaces":
+        return {
+            "name": {"type": "string", "label": "Space", "default": ""},
+            "type": {"type": "string", "label": "类型", "default": ""},
+            "api": {"type": "string", "label": "API", "default": ""},
+        }
+    if isinstance(default, list) and default and isinstance(default[0], dict):
+        return {
+            str(key): {**_webui_item_schema_from_value(value), "label": str(key)}
+            for key, value in default[0].items()
+        }
+    return None
+
+
+def _webui_field_schema(
+    section_name: str,
+    field_name: str,
+    field_def: ConfigField,
+    *,
+    hidden: bool,
+    order: int,
+) -> dict[str, Any]:
+    """把单个 ConfigField 转换成 WebUI 字段 schema。"""
+    field_schema = field_def.to_dict()
+    ui_type = _webui_ui_type(field_name, field_def)
+    field_schema.update(
+        {
+            "name": field_name,
+            "type": _webui_field_type(field_def),
+            "label": _webui_label(field_name, field_def),
+            "hidden": bool(hidden or field_def.hidden),
+            "order": field_def.order or order,
+            "input_type": field_def.input_type or ("password" if ui_type == "password" else None),
+            "ui_type": ui_type,
+            "rows": max(field_def.rows, 8) if ui_type == "textarea" else field_def.rows,
+        }
+    )
+    if field_def.type is list:
+        default = field_def.default
+        item_fields = field_def.item_fields or _webui_list_item_fields(field_name, default)
+        if item_fields is not None:
+            field_schema["item_type"] = field_def.item_type or "object"
+            field_schema["item_fields"] = item_fields
+        elif field_def.item_type:
+            field_schema["item_type"] = field_def.item_type
+        elif isinstance(default, list) and default and isinstance(default[0], (int, float)):
+            field_schema["item_type"] = "number"
+        else:
+            field_schema["item_type"] = "string"
+    field_schema.setdefault("depends_on", None)
+    field_schema.setdefault("depends_value", None)
+    field_schema["section"] = section_name
+    return field_schema
+
+
+def _webui_ordered_sections(schema: dict[str, Any], order: list[str]) -> list[str]:
+    """按 config_section_order 输出 section，剩余 section 保持 schema 原顺序。"""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for section_name in order:
+        if section_name in schema and isinstance(schema[section_name], dict):
+            ordered.append(section_name)
+            seen.add(section_name)
+    for section_name in schema:
+        if section_name not in seen and isinstance(schema[section_name], dict):
+            ordered.append(section_name)
+            seen.add(section_name)
+    return ordered
+
+
+def _webui_section_title(section_name: str, group_headers: dict[str, Any]) -> str:
+    """从配置文件分组标题提取 WebUI section 标题。"""
+    raw = group_headers.get(section_name)
+    if isinstance(raw, str):
+        for line in raw.splitlines():
+            title = line.strip().strip("=- ")
+            if title:
+                return title
+    return section_name
 
 
 def _dump_scalar_kv(key: str, value: Any) -> str:
@@ -1126,6 +1278,60 @@ class NaiPicPlugin(MaiBotPlugin):
             if section:
                 default_config[section_name] = section
         return default_config
+
+    def get_webui_config_schema(
+        self,
+        *,
+        plugin_id: str = "",
+        plugin_name: str = "",
+        plugin_version: str = "",
+        plugin_description: str = "",
+        plugin_author: str = "",
+    ) -> dict[str, Any]:
+        """返回 WebUI 可渲染的配置 Schema。"""
+        schema = getattr(type(self), "config_schema", None) or {}
+        hidden_map = getattr(type(self), "config_hidden_fields", None) or {}
+        order = getattr(type(self), "config_section_order", None) or []
+        group_headers = getattr(type(self), "config_section_group_headers", None) or {}
+
+        sections: dict[str, Any] = {}
+        for section_index, section_name in enumerate(_webui_ordered_sections(schema, order)):
+            fields = schema.get(section_name)
+            if not isinstance(fields, dict):
+                continue
+            hidden_fields = hidden_map.get(section_name) or set()
+            section_fields: dict[str, Any] = {}
+            for field_index, (field_name, field_def) in enumerate(fields.items()):
+                if not isinstance(field_def, ConfigField):
+                    continue
+                section_fields[field_name] = _webui_field_schema(
+                    section_name,
+                    field_name,
+                    field_def,
+                    hidden=field_name in hidden_fields,
+                    order=field_index,
+                )
+            sections[section_name] = {
+                "name": section_name,
+                "title": _webui_section_title(section_name, group_headers),
+                "description": group_headers.get(section_name),
+                "icon": None,
+                "collapsed": False,
+                "order": section_index,
+                "fields": section_fields,
+            }
+
+        return {
+            "plugin_id": plugin_id or self.plugin_name,
+            "plugin_info": {
+                "name": plugin_name or self.plugin_name,
+                "version": plugin_version or self.plugin_version,
+                "description": plugin_description,
+                "author": plugin_author or self.plugin_author,
+            },
+            "sections": sections,
+            "layout": {"type": "auto", "tabs": []},
+        }
 
     def __init__(self) -> None:
         """初始化插件实例。"""

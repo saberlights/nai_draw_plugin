@@ -123,6 +123,31 @@ def test_default_config_directs_nai_without_removing_wd14_proxy() -> None:
     assert "wd14_proxy" in default["retag"]
 
 
+def test_webui_config_schema_exposes_configfield_metadata() -> None:
+    plugin = NaiPicPlugin()
+    schema = plugin.get_webui_config_schema(plugin_id="nai_draw_plugin")
+
+    api_key = schema["sections"]["model"]["fields"]["api_key"]
+    assert api_key["type"] == "string"
+    assert api_key["ui_type"] == "password"
+    assert api_key["input_type"] == "password"
+    assert api_key["label"]
+
+    prompt_template = schema["sections"]["prompt_generator"]["fields"]["prompt_template"]
+    assert prompt_template["ui_type"] == "textarea"
+    assert prompt_template["rows"] >= 8
+
+
+def test_webui_config_schema_hides_advanced_wd14_spaces() -> None:
+    plugin = NaiPicPlugin()
+    schema = plugin.get_webui_config_schema(plugin_id="nai_draw_plugin")
+
+    wd14_spaces = schema["sections"]["retag"]["fields"]["wd14_spaces"]
+    assert wd14_spaces["hidden"] is True
+    assert wd14_spaces["item_type"] == "object"
+    assert set(wd14_spaces["item_fields"]) == {"name", "type", "api"}
+
+
 def test_rendered_config_places_retag_between_tag_retriever_and_custom_prompt() -> None:
     text = _render_default_config_text()
     idx_tag = text.find("\n[tag_retriever]")
