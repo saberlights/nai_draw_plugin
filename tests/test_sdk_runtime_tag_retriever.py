@@ -135,8 +135,16 @@ def _build_image_send_invocation() -> NaiInvocation:
     invocation.log_prefix = "test"
     invocation.stream_id = "stream-1"
     invocation.user_id = "user-1"
+    invocation.source = "command"
     invocation._last_send_timestamp = None
     invocation.api_client = types.SimpleNamespace()
+
+    # 本组用例只验证发图行为；跳过识图回写由 test_skip_self_vlm.py 覆盖，
+    # 这里置空避免触达图片库 / 真实 DB。
+    async def _noop_register(_image_base64: str, _description: str) -> None:
+        return None
+
+    invocation._register_self_image_as_processed = _noop_register
     return invocation
 
 

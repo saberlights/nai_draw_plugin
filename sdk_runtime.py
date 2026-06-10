@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import hashlib
 import json
 import tomllib
 from collections.abc import Callable
@@ -1121,18 +1123,83 @@ class NaiInvocation(ModelConfigMixin):
 
         return base64.b64encode(content).decode("utf-8")
 
-    async def _send_base64_image_result(self, image_base64: str, display_message: str) -> bool:
+    async def _send_base64_image_result(
+        self, image_base64: str, display_message: str, *, image_description: str = ""
+    ) -> bool:
         """以 Base64 image 段直发图片到平台。
 
         maim_message + napcat 协议原生支持 base64 image segment，napcat 自行落盘
         后再投递；插件无需也不应当依赖 ``file://`` 本地路径——一旦 napcat 与本插件
         不在同一文件系统（如 napcat 跑在容器内），``file://`` 引用就无法被读取。
         """
-        return await self.send_custom(
+        sent = await self.send_custom(
             "image",
             image_base64,
             display_message=display_message,
         )
+        # 命令 / 自动跟图发出的图：发送（已 await 入库）后立刻在图片库标记“已识别”，
+        # 让 MaiBot 后续不再对这张图触发 VLM 识图；action（麦麦主动画图）不在此列。
+        if self._skip_self_vlm():
+            await self._register_self_image_as_processed(image_base64, image_description)
+        return sent
+
+    def _skip_self_vlm(self) -> bool:
+        """是否跳过 MaiBot 对“本插件这次发出的图”的 VLM 识图。
+
+        仅 ``action``（LLM 工具调用 handle_action）保留识图，让麦麦能“看见”自己在对话里
+        主动画的图；命令（/nai 等）与自动跟图（reply_auto_draw）都是用户点单或配图的产物，
+        描述已知、无需再过 VLM，一律跳过。
+        """
+        return self.source != "action"
+
+    async def _register_self_image_as_processed(self, image_base64: str, description: str) -> None:
+        """把本插件刚发出的图片在 MaiBot 图片库标记为“已识别”，从源头省掉 VLM 识图。
+
+        根因：插件经 ``send.custom("image", ...)`` 发图时，宿主构造的 ImageComponent 不带
+        content，落库时 ``vlm_processed=False``；此后任何对该图的 ``get_image_description``
+        都会触发后台 VLM。这里在发送（send_service 已 await 写库）后，按宿主同款
+        ``sha256(原始字节)`` 定位该图记录，写入已知描述并置 ``vlm_processed=True``，使后续
+        识图直接命中缓存、不再调 VLM。``description`` 为空时兜底为占位，确保命中缓存所需的
+        “描述非空”条件成立。
+
+        尽力而为：图未入库（imageurl 直发、storage_message=False 等）时查不到记录直接跳过；
+        本回写属于发送主链外的优化边路，图片此刻已送达，故异常只记日志、不向上抛。
+        """
+        payload = image_base64.split(",", 1)[1] if image_base64.startswith("data:") else image_base64
+        try:
+            image_bytes = base64.b64decode(payload)
+        except (binascii.Error, ValueError) as exc:
+            logger.warning("%s 跳过识图回写终止：图片 Base64 解码失败 %r", self.log_prefix, exc)
+            return
+        image_hash = hashlib.sha256(image_bytes).hexdigest()
+        final_description = description.strip() or "[由 NovelAI 生成的图片]"
+
+        def _mark_processed() -> bool:
+            from src.chat.image_system.image_manager import image_manager
+
+            record = image_manager.get_image_from_db(image_hash)
+            if record is None:
+                return False
+            record.description = final_description
+            record.vlm_processed = True
+            return image_manager.update_image_description(record)
+
+        try:
+            updated = await asyncio.to_thread(_mark_processed)
+        except Exception as exc:
+            logger.warning("%s 跳过识图回写失败: hash=%s error=%r", self.log_prefix, image_hash[:12], exc)
+            return
+
+        if updated:
+            logger.info(
+                "%s 已将图片标记为跳过识图（source=%s）: hash=%s",
+                self.log_prefix, self.source, image_hash[:12],
+            )
+        else:
+            logger.debug(
+                "%s 跳过识图回写未命中图片库记录（可能未入库，已忽略）: hash=%s",
+                self.log_prefix, image_hash[:12],
+            )
 
     async def _send_help_image(self) -> bool:
         """直接发送随插件打包的帮助图。
@@ -1155,7 +1222,9 @@ class NaiInvocation(ModelConfigMixin):
         image_base64 = base64.b64encode(raw).decode("ascii")
         return await self._send_base64_image_result(image_base64, "📖 NovelAI 画图插件帮助")
 
-    async def _send_image_url_with_fallback(self, image_url: str, display_message: str) -> bool:
+    async def _send_image_url_with_fallback(
+        self, image_url: str, display_message: str, *, image_description: str = ""
+    ) -> bool:
         """优先发送远程图片 URL，失败时回退为本地下载再发送 Base64。"""
         target_platform = self._get_target_platform()
         if target_platform == "qq":
@@ -1192,7 +1261,9 @@ class NaiInvocation(ModelConfigMixin):
             return False
 
         logger.info("%s 远程图片 URL 已回退为 Base64 发送", self.log_prefix)
-        return await self._send_base64_image_result(image_base64, display_message)
+        return await self._send_base64_image_result(
+            image_base64, display_message, image_description=image_description
+        )
 
     async def manual_recall(self) -> tuple[bool, str | None, bool]:
         """执行 `/nai 撤回`。"""
@@ -1319,12 +1390,14 @@ class NaiInvocation(ModelConfigMixin):
                 send_ok = await self._send_image_url_with_fallback(
                     final_image_data,
                     display_message,
+                    image_description=description,
                 )
             elif final_image_data.startswith(("iVBORw", "/9j/", "UklGR", "R0lGOD")):
                 remember_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
                 send_ok = await self._send_base64_image_result(
                     final_image_data,
                     display_message,
+                    image_description=description,
                 )
             else:
                 await self.send_text("API 返回了无法识别的图片格式")
