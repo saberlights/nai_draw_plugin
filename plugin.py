@@ -1071,6 +1071,11 @@ class NaiPicPlugin(MaiBotPlugin):
                 default=True,
                 description="是否启用 Danbooru Tag 检索增强；可填 true / false"
             ),
+            "show_result": ConfigField(
+                type=bool,
+                default=False,
+                description="是否默认显示 Danbooru 检索结果；可填 true / false；运行时可用 /nai tag on|off 切换，仅影响回显"
+            ),
             "mode": ConfigField(
                 type=str,
                 default="online",
@@ -2077,7 +2082,7 @@ class NaiPicPlugin(MaiBotPlugin):
         # negative lookahead 排除所有 /nai 子命令；vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
         # 所以用 ``(?:\b|[一-鿿])`` 覆盖空格后置和中文后缀两种情形，避免 ``vibe存`` 被
         # 通用命令吞掉（vibe\b 在 latin→CJK 边界不成立）
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,
@@ -2211,6 +2216,30 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         action = str((matched_groups or {}).get("action", "") or "").strip().lower()
         return await invocation.handle_prompt_show_command(action)
+
+    @Command(
+        "nai_tag_retriever_show_command",
+        description="Danbooru 检索结果显示控制命令：/nai tag <on|off>",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+tag\s+(?P<action>on|off)$",
+    )
+    async def handle_nai_tag_retriever_show_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai tag on|off`。"""
+        del kwargs
+        invocation = await self._create_invocation(
+            stream_id,
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
+        return await invocation.handle_tag_retriever_show_command(action)
 
     @Command(
         "nai_models_command",

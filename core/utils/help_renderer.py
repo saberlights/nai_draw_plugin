@@ -144,6 +144,7 @@ HELP_DOC: HelpDoc = HelpDoc(
             accent2="#5b8def",
             items=(
                 ("/nai pt on/off", "开关 prompt 回显"),
+                ("/nai tag on/off", "开关 Danbooru 检索结果回显"),
                 ("/nai nsfw", "查看 NSFW 过滤状态"),
                 ("/nai nsfw on/off", "开关 NSFW 过滤（仅管理员，会话级）"),
             ),

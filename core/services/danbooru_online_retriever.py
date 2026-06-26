@@ -73,7 +73,7 @@ class DanbooruOnlineRetriever:
         Returns:
             {
                 "search": [{"tag": ..., "cn_name": ..., "score": ..., "category": ...}, ...],
-                "related": [{"tag": ..., "cn_name": ..., "cooc_score": ..., "category": ...}, ...],
+                "related": [{"tag": ..., "cn_name": ..., "cooc_score": ..., "source_count": ..., "seed_count": ..., "category": ...}, ...],
             }
             失败时返回空结构
         """
@@ -100,7 +100,11 @@ class DanbooruOnlineRetriever:
             {
                 "tag": item["tag"],
                 "cn_name": item.get("cn_name", ""),
-                "score": item.get("final_score", 0.0),
+                "score": (
+                    float(item["final_score"])
+                    if isinstance(item.get("final_score"), (int, float))
+                    else None
+                ),
                 "category": item.get("category", "General"),
             }
             for item in search_resp["results"]
@@ -117,18 +121,43 @@ class DanbooruOnlineRetriever:
                 show_nsfw=self.show_nsfw,
             )
             if related_resp:
+                related_items = (
+                    related_resp.get("results")
+                    if isinstance(related_resp, dict)
+                    else related_resp
+                )
+            else:
+                related_items = []
+
+            if related_items:
                 # 去重：排除已在 search 结果中的标签
                 search_tag_set = {r["tag"] for r in search_results}
-                related_results = [
-                    {
-                        "tag": item["tag"],
-                        "cn_name": item.get("cn_name", ""),
-                        "cooc_score": item.get("cooc_score", 0.0),
-                        "category": item.get("category", "General"),
-                    }
-                    for item in related_resp
-                    if item["tag"] not in search_tag_set
-                ]
+                normalized_related_results = []
+                for item in related_items:
+                    if not isinstance(item, dict):
+                        continue
+                    tag = item.get("tag")
+                    if not isinstance(tag, str) or not tag or tag in search_tag_set:
+                        continue
+                    sources = item.get("sources")
+                    source_count = len(sources) if isinstance(sources, list) else 0
+                    raw_cooc_score = item.get("cooc_score")
+                    cooc_score = (
+                        float(raw_cooc_score)
+                        if isinstance(raw_cooc_score, (int, float))
+                        else None
+                    )
+                    normalized_related_results.append(
+                        {
+                            "tag": tag,
+                            "cn_name": item.get("cn_name", ""),
+                            "cooc_score": cooc_score,
+                            "source_count": source_count,
+                            "seed_count": len(seed_tags),
+                            "category": item.get("category", "General"),
+                        }
+                    )
+                related_results = normalized_related_results
 
         logger.info(
             f"DanbooruOnline 检索完成：query='{query[:30]}' → "
@@ -163,9 +192,10 @@ class DanbooruOnlineRetriever:
                 cn = item.get("cn_name", "")
                 tag = item["tag"]
                 category = item.get("category", "")
-                score = item.get("score", 0.0)
                 cn_part = f"{cn} → " if cn else ""
-                lines.append(f"- {cn_part}{tag} [{category}] (相关度 {score:.2f})")
+                score = item.get("score")
+                metric = f" (相关度 {score:.2f})" if isinstance(score, (int, float)) and score > 0 else ""
+                lines.append(f"- {cn_part}{tag} [{category}]{metric}")
 
         # 共现推荐部分
         if related_items:
@@ -175,9 +205,20 @@ class DanbooruOnlineRetriever:
                 cn = item.get("cn_name", "")
                 tag = item["tag"]
                 category = item.get("category", "")
-                cooc = item.get("cooc_score", 0.0)
                 cn_part = f"{cn} → " if cn else ""
-                lines.append(f"- {cn_part}{tag} [{category}] (共现度 {cooc:.2f})")
+                metric = "共现推荐"
+                cooc = item.get("cooc_score")
+                if isinstance(cooc, (int, float)) and cooc > 0:
+                    metric = f"共现度 {cooc:.2f}"
+                else:
+                    source_count = item.get("source_count", 0)
+                    seed_count = item.get("seed_count", 0)
+                    if isinstance(source_count, int) and source_count > 0:
+                        if isinstance(seed_count, int) and seed_count > 0:
+                            metric = f"共现来源 {source_count}/{seed_count}"
+                        else:
+                            metric = f"共现来源 {source_count}"
+                lines.append(f"- {cn_part}{tag} [{category}] ({metric})")
 
         lines.append("</tag_candidates>")
 

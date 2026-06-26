@@ -116,6 +116,7 @@ def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
         "/nai ref删 角色A",
         "/nai ref选 角色A",
         "/nai ref清空",
+        "/nai tag on",
     ]
     for sample in skip_samples:
         assert generic.match(sample) is None, f"通用 /nai 不应吞掉 {sample!r}"
@@ -124,6 +125,19 @@ def test_generic_nai_pattern_still_skips_i2i_ref_vibe() -> None:
     assert generic.match("/nai artgen 画师风格生成") is not None
     assert generic.match("/nai artr 画师风格重随机") is not None
     assert generic.match("/nai artfix 画师风格修复") is not None
+
+
+def test_tag_show_command_pattern_matches_plain_invocation() -> None:
+    """Danbooru 检索结果显示控制命令应匹配 `/nai tag on|off`。"""
+    patterns = _load_command_patterns()
+    regex = _compile(patterns["nai_tag_retriever_show_command"])
+    for sample, expected_action in [
+        ("/nai tag on", "on"),
+        ("/nai tag off", "off"),
+    ]:
+        match = regex.match(sample)
+        assert match is not None, f"tag 显示命令应匹配 {sample!r}"
+        assert match.group("action") == expected_action
 
 
 # ── 命名图库子命令 pattern ───────────────────────────────────────────────

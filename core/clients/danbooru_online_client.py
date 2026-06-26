@@ -33,6 +33,15 @@ class DanbooruOnlineClient:
         self.timeout = timeout
         self._available: Optional[bool] = None
 
+    def _create_async_client(self) -> httpx.AsyncClient:
+        """创建忽略宿主代理环境变量的 HTTP 客户端。
+
+        宿主进程可能全局注入 ``HTTP(S)_PROXY`` / ``ALL_PROXY`` 指向本地代理，
+        但 Danbooru 在线检索不依赖这些代理，且坏代理会直接把检索打成空结果。
+        这里固定 ``trust_env=False``，避免被宿主环境污染。
+        """
+        return httpx.AsyncClient(timeout=self.timeout, trust_env=False)
+
     async def health_check(self) -> bool:
         """
         探活：检查远程服务是否可用。
@@ -41,7 +50,7 @@ class DanbooruOnlineClient:
             True 表示服务在线且模型已加载
         """
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with self._create_async_client() as client:
                 resp = await client.get(f"{self.base_url}/health")
                 if resp.status_code == 200:
                     data = resp.json()
@@ -49,7 +58,7 @@ class DanbooruOnlineClient:
                 else:
                     self._available = False
         except Exception as e:
-            logger.warning(f"DanbooruOnline 探活失败: {e}")
+            logger.warning(f"DanbooruOnline 探活失败 [{type(e).__name__}]: {e!r}")
             self._available = False
         return self._available
 
@@ -100,7 +109,7 @@ class DanbooruOnlineClient:
             payload["target_categories"] = target_categories
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with self._create_async_client() as client:
                 resp = await client.post(f"{self.base_url}/search", json=payload)
                 resp.raise_for_status()
                 return resp.json()
@@ -109,7 +118,7 @@ class DanbooruOnlineClient:
             self._available = False
             return None
         except Exception as e:
-            logger.warning(f"DanbooruOnline search 失败: {e}")
+            logger.warning(f"DanbooruOnline search 失败 [{type(e).__name__}]: {e!r}")
             return None
 
     async def related(
@@ -140,13 +149,26 @@ class DanbooruOnlineClient:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with self._create_async_client() as client:
                 resp = await client.post(f"{self.base_url}/related", json=payload)
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                if isinstance(data, dict):
+                    results = data.get("results")
+                    if isinstance(results, list):
+                        return results
+                    preview = ", ".join(str(key) for key in list(data.keys())[:10]) or "<empty>"
+                    logger.warning(f"DanbooruOnline related 返回非预期结构: keys={preview}")
+                    return None
+                if isinstance(data, list):
+                    return data
+                logger.warning(
+                    f"DanbooruOnline related 返回非预期类型: {type(data).__name__}"
+                )
+                return None
         except httpx.TimeoutException:
             logger.warning(f"DanbooruOnline related 超时 (>{self.timeout}s)")
             return None
         except Exception as e:
-            logger.warning(f"DanbooruOnline related 失败: {e}")
+            logger.warning(f"DanbooruOnline related 失败 [{type(e).__name__}]: {e!r}")
             return None

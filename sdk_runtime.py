@@ -50,6 +50,7 @@ from .core.clients.nai_web_client import NaiWebClient
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.mixins.model_config_mixin import ModelConfigMixin
 from .core.rules.prompt_rules import PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_TEMPLATE
+from .core.tag_retriever_display import build_tag_retriever_display_messages
 from .core.rules.selfie_rules import (
     detect_bot_self_image_intent,
     detect_explicit_image_request,
@@ -677,6 +678,13 @@ class NaiInvocation(ModelConfigMixin):
         if not chat_id:
             return False
         return session_state.is_prompt_show_enabled(platform, chat_id, self.get_config)
+
+    def _is_tag_retriever_show_enabled(self) -> bool:
+        """检查是否开启 Danbooru 检索结果显示。"""
+        platform, chat_id, _ = self._get_chat_identity()
+        if not chat_id:
+            return False
+        return session_state.is_tag_retriever_show_enabled(platform, chat_id, self.get_config)
 
     def _sanitize_prompt_for_sfw_mode(self, prompt: str) -> str:
         """LLM 翻译完到送 API 之间的最后清洗钩子：
@@ -1618,6 +1626,45 @@ class NaiInvocation(ModelConfigMixin):
             log_prefix=self.log_prefix,
         )
 
+    async def _send_tag_retriever_display(self, tag_candidates: str) -> None:
+        """尽力回显 Danbooru 检索结果；平台拒绝长文本时自动缩小分段重试。"""
+        retriever_config = self.get_config("tag_retriever", {}) or {}
+        retriever_mode = "online"
+        if isinstance(retriever_config, dict):
+            retriever_mode = str(retriever_config.get("mode", "online") or "online").strip().lower() or "online"
+
+        if not isinstance(tag_candidates, str) or not tag_candidates.strip():
+            tag_candidates = (
+                "<tag_candidates>\n"
+                f"⚠️ 未检索到候选标签（mode={retriever_mode}）\n"
+                "</tag_candidates>"
+            )
+
+        for max_chars in (180, 120, 90, 72):
+            display_messages = build_tag_retriever_display_messages(
+                tag_candidates,
+                max_chars=max_chars,
+            )
+            if not display_messages:
+                return
+
+            send_failed = False
+            for display_message in display_messages:
+                if await self.send_text(display_message, storage_message=False):
+                    continue
+                logger.warning(
+                    "%s Danbooru 检索结果回显发送失败，尝试缩小分段重试: max_chars=%s",
+                    self.log_prefix,
+                    max_chars,
+                )
+                send_failed = True
+                break
+
+            if not send_failed:
+                return
+
+        logger.warning("%s Danbooru 检索结果回显发送失败，已放弃回显", self.log_prefix)
+
     async def _generate_prompt_with_llm(
         self,
         request_text: str,
@@ -1694,6 +1741,8 @@ class NaiInvocation(ModelConfigMixin):
             reasoning_context_text=reasoning_context_text,
         )
         tag_candidates = await self._retrieve_tag_candidates(request_text)
+        if self._is_tag_retriever_show_enabled():
+            await self._send_tag_retriever_display(tag_candidates)
         prompt = prompt.replace("<<TAG_CANDIDATES>>", tag_candidates).strip()
 
         response = await self._request_llm_text(
@@ -3586,6 +3635,30 @@ class NaiInvocation(ModelConfigMixin):
         session_state.set_prompt_show_enabled(platform, chat_id, enabled)
         await self.send_text("✅ 已开启提示词显示" if enabled else "✅ 已关闭提示词显示")
         return True, "提示词显示状态已更新", True
+
+    async def handle_tag_retriever_show_command(self, action: str) -> tuple[bool, str | None, bool]:
+        """处理 `/nai tag on|off`。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        platform, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+
+        if session_state.is_admin_mode_enabled(platform, chat_id, self.get_config):
+            if not session_state.is_admin_user(user_id, self.get_config):
+                await self.send_text("❌ 当前会话已开启管理员模式，仅管理员可以修改 Danbooru 检索结果显示设置", storage_message=False)
+                return False, "没有权限", True
+
+        enabled = action == "on"
+        session_state.set_tag_retriever_show_enabled(platform, chat_id, enabled)
+        await self.send_text(
+            "✅ 已开启 Danbooru 检索结果显示"
+            if enabled
+            else "✅ 已关闭 Danbooru 检索结果显示"
+        )
+        return True, "Danbooru 检索结果显示状态已更新", True
 
     async def handle_models_command(self) -> tuple[bool, str | None, bool]:
         """处理 `/nai models`：拉 ``GET /v1/models`` 展示网关实时模型列表，

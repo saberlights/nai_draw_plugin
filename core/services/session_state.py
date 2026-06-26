@@ -10,6 +10,7 @@
 - 自动撤回
 - NSFW过滤
 - 提示词显示
+- Danbooru 检索结果显示
 
 替代原来分散在各个 Command 类中的状态字典
 """
@@ -66,6 +67,9 @@ class SessionStateManager:
 
         # 提示词显示：{chat_key: bool}
         self._prompt_show: Dict[str, bool] = {}
+
+        # Danbooru 检索结果显示：{chat_key: bool}
+        self._tag_retriever_show: Dict[str, bool] = {}
 
         # 角色参考提取目标：{chat_key: "character" / "style" / "character&style"}
         # 缺省回退 character_reference.type 配置；仅 /nai ref 路径生效
@@ -441,6 +445,24 @@ class SessionStateManager:
         self._prompt_show[key] = enabled
         logger.info(f"[nai_pic] 会话 {key} 提示词显示已{'开启' if enabled else '关闭'}")
 
+    def is_tag_retriever_show_enabled(
+        self,
+        platform: str,
+        chat_id: str,
+        get_config: Callable,
+    ) -> bool:
+        """检查是否启用 Danbooru 检索结果显示。"""
+        key = self._make_key(platform, chat_id)
+        if key in self._tag_retriever_show:
+            return self._tag_retriever_show[key]
+        return bool(get_config("tag_retriever.show_result", False))
+
+    def set_tag_retriever_show_enabled(self, platform: str, chat_id: str, enabled: bool) -> None:
+        """设置 Danbooru 检索结果显示。"""
+        key = self._make_key(platform, chat_id)
+        self._tag_retriever_show[key] = enabled
+        logger.info(f"[nai_pic] 会话 {key} Danbooru 检索结果显示已{'开启' if enabled else '关闭'}")
+
     # ==================== 角色参考提取目标（/nai ref） ====================
 
     # NewAPI §20.4 character_references[i].type 取值；前端命令值（包括 ``both`` 别名）
@@ -488,6 +510,7 @@ class SessionStateManager:
             "recall": self._recall_enabled.get(key),
             "nsfw_filter": nsfw_state_store.get(platform, chat_id),
             "prompt_show": self._prompt_show.get(key),
+            "tag_retriever_show": self._tag_retriever_show.get(key),
             "character_reference_type": self._character_reference_type.get(key),
         }
 
@@ -502,6 +525,7 @@ class SessionStateManager:
         self._nsfw_filter.pop(key, None)
         nsfw_state_store.clear(platform, chat_id)
         self._prompt_show.pop(key, None)
+        self._tag_retriever_show.pop(key, None)
         self._character_reference_type.pop(key, None)
         logger.info(f"[nai_pic] 会话 {key} 状态已清除")
 

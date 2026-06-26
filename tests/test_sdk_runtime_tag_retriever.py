@@ -82,6 +82,8 @@ tag_retriever_module.get_tag_retriever = lambda **_kwargs: None
 sys.modules.setdefault("plugins.nai_draw_plugin.core.services.tag_retriever", tag_retriever_module)
 
 from plugins.nai_draw_plugin.core.services import tag_candidate_resolver as resolver_module
+from plugins.nai_draw_plugin.core.tag_retriever_display import build_tag_retriever_display_message
+from plugins.nai_draw_plugin.core.tag_retriever_display import build_tag_retriever_display_messages
 from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation
 from plugins.nai_draw_plugin import sdk_runtime as sdk_runtime_module
 
@@ -233,6 +235,232 @@ def test_retrieve_tag_candidates_falls_back_to_local_when_online_returns_empty(
     assert result == "<local>"
     assert online_retriever.queries == ["画一张猫耳少女"]
     assert local_retriever.calls == [("画一张猫耳少女", 6, 0.45)]
+
+
+def test_build_tag_retriever_display_message_strips_internal_wrapper() -> None:
+    message = build_tag_retriever_display_message(
+        "<tag_candidates>\n"
+        "## 语义匹配（与用户描述直接相关，优先选用）\n"
+        "- 初音未来 → hatsune_miku [character] (相关度 0.95)\n"
+        "\n"
+        "## 共现推荐（与上述标签在真实画作中经常搭配出现）\n"
+        "- 双马尾 → twintails [general] (共现度 0.82)\n"
+        "</tag_candidates>"
+    )
+
+    assert message == (
+        "🔎 Danbooru Tag 检索结果:\n"
+        "## 语义匹配（与用户描述直接相关，优先选用）\n"
+        "- 初音未来 → hatsune_miku [character] (相关度 0.95)\n"
+        "## 共现推荐（与上述标签在真实画作中经常搭配出现）\n"
+        "- 双马尾 → twintails [general] (共现度 0.82)"
+    )
+
+
+def test_build_tag_retriever_display_messages_splits_long_output() -> None:
+    messages = build_tag_retriever_display_messages(
+        "<tag_candidates>\n"
+        "## 语义匹配（与用户描述直接相关，优先选用）\n"
+        + "\n".join(f"- 标签{i:02d} → tag_{i:02d} [general] (相关度 0.95)" for i in range(1, 25))
+        + "\n</tag_candidates>",
+        max_chars=180,
+    )
+
+    assert len(messages) > 1
+    assert messages[0].startswith("🔎 Danbooru Tag 检索结果 (1/")
+    assert messages[-1].startswith(f"🔎 Danbooru Tag 检索结果 ({len(messages)}/{len(messages)}):")
+    assert all(len(message) <= 180 for message in messages)
+    assert "标签01" in messages[0]
+    assert "标签24" in messages[-1]
+
+
+def test_generate_prompt_with_llm_shows_tag_candidates_when_enabled() -> None:
+    invocation = object.__new__(NaiInvocation)
+    invocation.stream_id = "stream-tag-show"
+    invocation.group_id = ""
+    invocation.user_id = "user-1"
+    invocation.log_prefix = "test"
+    sent_texts: list[tuple[str, bool]] = []
+
+    async def fake_send_text(text: str, storage_message: bool = True) -> bool:
+        sent_texts.append((text, storage_message))
+        return True
+
+    async def fake_retrieve_tag_candidates(_request_text: str) -> str:
+        return (
+            "<tag_candidates>\n"
+            "## 语义匹配（与用户描述直接相关，优先选用）\n"
+            "- 初音未来 → hatsune_miku [character] (相关度 0.95)\n"
+            "</tag_candidates>"
+        )
+
+    async def fake_request_llm_text(*_args, **_kwargs) -> str:
+        return "1girl, hatsune_miku"
+
+    invocation.send_text = fake_send_text
+    invocation.get_config = lambda _key, default=None: default
+    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
+    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
+    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
+    invocation._request_llm_text = fake_request_llm_text
+    invocation._cleanup_llm_prompt = lambda response: response
+    invocation._is_tag_retriever_show_enabled = lambda: True
+
+    result = asyncio.run(
+        invocation._generate_prompt_with_llm(
+            "画一张初音未来",
+            allow_inherit=False,
+        )
+    )
+
+    assert result == ("1girl, hatsune_miku", None)
+    assert sent_texts == [
+        (
+            "🔎 Danbooru Tag 检索结果:\n"
+            "## 语义匹配（与用户描述直接相关，优先选用）\n"
+            "- 初音未来 → hatsune_miku [character] (相关度 0.95)",
+            False,
+        )
+    ]
+
+
+def test_generate_prompt_with_llm_splits_tag_candidates_output_when_long() -> None:
+    invocation = object.__new__(NaiInvocation)
+    invocation.stream_id = "stream-tag-show-long"
+    invocation.group_id = ""
+    invocation.user_id = "user-1"
+    invocation.log_prefix = "test"
+    sent_texts: list[tuple[str, bool]] = []
+
+    async def fake_send_text(text: str, storage_message: bool = True) -> bool:
+        sent_texts.append((text, storage_message))
+        return True
+
+    async def fake_retrieve_tag_candidates(_request_text: str) -> str:
+        return (
+            "<tag_candidates>\n"
+            "## 语义匹配（与用户描述直接相关，优先选用）\n"
+            + "\n".join(f"- 标签{i:02d} → tag_{i:02d} [general] (相关度 0.95)" for i in range(1, 25))
+            + "\n</tag_candidates>"
+        )
+
+    async def fake_request_llm_text(*_args, **_kwargs) -> str:
+        return "1girl, tag_01"
+
+    invocation.send_text = fake_send_text
+    invocation.get_config = lambda _key, default=None: default
+    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
+    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
+    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
+    invocation._request_llm_text = fake_request_llm_text
+    invocation._cleanup_llm_prompt = lambda response: response
+    invocation._is_tag_retriever_show_enabled = lambda: True
+
+    result = asyncio.run(
+        invocation._generate_prompt_with_llm(
+            "画一张初音未来",
+            allow_inherit=False,
+        )
+    )
+
+    assert result == ("1girl, tag_01", None)
+    assert len(sent_texts) > 1
+    assert sent_texts[0][0].startswith("🔎 Danbooru Tag 检索结果 (1/")
+    assert sent_texts[-1][0].startswith(f"🔎 Danbooru Tag 检索结果 ({len(sent_texts)}/{len(sent_texts)}):")
+    assert sent_texts[0][1] is False
+    assert all(storage_message is False for _, storage_message in sent_texts)
+
+
+def test_generate_prompt_with_llm_retries_smaller_tag_chunks_when_send_fails() -> None:
+    invocation = object.__new__(NaiInvocation)
+    invocation.stream_id = "stream-tag-show-retry"
+    invocation.group_id = ""
+    invocation.user_id = "user-1"
+    invocation.log_prefix = "test"
+    sent_texts: list[tuple[str, bool]] = []
+
+    async def fake_send_text(text: str, storage_message: bool = True) -> bool:
+        if len(text) > 90:
+            return False
+        sent_texts.append((text, storage_message))
+        return True
+
+    async def fake_retrieve_tag_candidates(_request_text: str) -> str:
+        return (
+            "<tag_candidates>\n"
+            "## 语义匹配（与用户描述直接相关，优先选用）\n"
+            + "\n".join(f"- 标签{i:02d} → tag_{i:02d} [general] (相关度 0.95)" for i in range(1, 12))
+            + "\n</tag_candidates>"
+        )
+
+    async def fake_request_llm_text(*_args, **_kwargs) -> str:
+        return "1girl, tag_01"
+
+    invocation.send_text = fake_send_text
+    invocation.get_config = lambda _key, default=None: default
+    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
+    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
+    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
+    invocation._request_llm_text = fake_request_llm_text
+    invocation._cleanup_llm_prompt = lambda response: response
+    invocation._is_tag_retriever_show_enabled = lambda: True
+
+    result = asyncio.run(
+        invocation._generate_prompt_with_llm(
+            "画一张初音未来",
+            allow_inherit=False,
+        )
+    )
+
+    assert result == ("1girl, tag_01", None)
+    assert sent_texts
+    assert all(len(text) <= 90 for text, _ in sent_texts)
+    assert all(storage_message is False for _, storage_message in sent_texts)
+
+
+def test_generate_prompt_with_llm_shows_empty_tag_retriever_notice_when_no_candidates() -> None:
+    invocation = object.__new__(NaiInvocation)
+    invocation.stream_id = "stream-tag-show-empty"
+    invocation.group_id = ""
+    invocation.user_id = "user-1"
+    invocation.log_prefix = "test"
+    sent_texts: list[tuple[str, bool]] = []
+
+    async def fake_send_text(text: str, storage_message: bool = True) -> bool:
+        sent_texts.append((text, storage_message))
+        return True
+
+    async def fake_retrieve_tag_candidates(_request_text: str) -> str:
+        return ""
+
+    async def fake_request_llm_text(*_args, **_kwargs) -> str:
+        return "1girl, tag_01"
+
+    invocation.send_text = fake_send_text
+    invocation.get_config = lambda key, default=None: (
+        {"mode": "online"} if key == "tag_retriever" else default
+    )
+    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
+    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
+    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
+    invocation._request_llm_text = fake_request_llm_text
+    invocation._cleanup_llm_prompt = lambda response: response
+    invocation._is_tag_retriever_show_enabled = lambda: True
+
+    result = asyncio.run(
+        invocation._generate_prompt_with_llm(
+            "画一张初音未来",
+            allow_inherit=False,
+        )
+    )
+
+    assert result == ("1girl, tag_01", None)
+    assert sent_texts == [
+        (
+            "🔎 Danbooru Tag 检索结果:\n⚠️ 未检索到候选标签（mode=online）",
+            False,
+        )
+    ]
 
 
 def test_send_image_result_downloads_generation_url_then_sends_base64_for_unknown_platform(
