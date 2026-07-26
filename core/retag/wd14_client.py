@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 try:
     from gradio_client import Client, handle_file
@@ -87,6 +87,7 @@ class WD14Client:
         retry_delay: float = 3.0,
         spaces_config: Optional[List[Dict[str, str]]] = None,
         proxy: Optional[str] = None,
+        run_blocking: Callable[..., Awaitable[Any]],
     ) -> None:
         self.model = model if model in self.AVAILABLE_MODELS else self.AVAILABLE_MODELS[0]
         normalized_timeout = float(timeout or self.SAFE_SPACE_TIMEOUT_CAP)
@@ -96,6 +97,7 @@ class WD14Client:
         self.logger = logging.getLogger(__name__)
         self.max_retries = max(1, int(max_retries or 1))
         self.retry_delay = max(0.5, float(retry_delay or 0.5))
+        self._run_blocking = run_blocking
 
         # 使用配置文件提供的 Space 列表，如果未提供则使用默认列表
         self.available_spaces = spaces_config if spaces_config else self.DEFAULT_SPACES
@@ -231,9 +233,8 @@ class WD14Client:
 
         # gradio_client.Client(...) 内部用 httpx 同步抓 Space manifest；直接 await 之外的
         # 同步调用会冻结整个 event loop，把其它插件的 OBSERVE hook 全部怼到 timeout。
-        # 这里始终把构造扔到默认线程池，避免 12s 量级的阻塞。
-        loop = asyncio.get_event_loop()
-        client = await loop.run_in_executor(None, self._get_or_create_client, space_name)
+        # 插件自有执行器同时负责卸载收口，避免默认线程池在进程退出时悬挂。
+        client = await self._run_blocking(self._get_or_create_client, space_name)
         if not client:
             raise WD14ClientError(f"无法连接到 Space: {space_name}")
 
@@ -248,10 +249,8 @@ class WD14Client:
             if character_threshold is None:
                 character_threshold = 0.8
 
-            loop = asyncio.get_event_loop()
             result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None,
+                self._run_blocking(
                     self._predict_space_with_retry,
                     client,
                     tmp_path,
@@ -265,7 +264,7 @@ class WD14Client:
             processed = self._process_space_result(result, threshold, space_type)
             self.logger.info(f"Space 标注成功: {len(processed['tags'])} 个标签 (阈值: {threshold})")
             return processed
-        except TimeoutError as exc:
+        except asyncio.TimeoutError as exc:
             raise WD14ClientError(f"Space 调用超时（{self.timeout:.1f}s）: {space_name}") from exc
         finally:
             try:

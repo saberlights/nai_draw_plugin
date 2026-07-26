@@ -20,6 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from plugins.nai_draw_plugin.core.retag.wd14_client import WD14Client, WD14ClientError
 
 
+async def _run_inline(function, *args, **_kwargs):
+    return function(*args)
+
+
 def _make_spaces(n: int) -> list[Dict[str, Any]]:
     return [
         {"name": f"demo/space_{i}", "type": "pixai", "api": "/predict_image"}
@@ -28,7 +32,12 @@ def _make_spaces(n: int) -> list[Dict[str, Any]]:
 
 
 def _build_client(spaces: list[Dict[str, Any]]) -> WD14Client:
-    client = WD14Client(spaces_config=spaces, max_retries=1, retry_delay=0.01)
+    client = WD14Client(
+        spaces_config=spaces,
+        max_retries=1,
+        retry_delay=0.01,
+        run_blocking=_run_inline,
+    )
     client._gradio_available = True
     return client
 

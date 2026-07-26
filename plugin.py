@@ -93,6 +93,7 @@ class NaiPicPlugin(MaiBotPlugin):
             thread_name_prefix="nai-http-io",
             max_workers=4,
         )
+        self._wd14_io = BlockingIORunner(thread_name_prefix="nai-wd14-io")
         self._foreground_tasks: set[asyncio.Task[Any]] = set()
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
         # reply 自动跟图：同一 session 在同一 reply 链路里只触发一次，避免 retry 重复出图。
@@ -122,6 +123,7 @@ class NaiPicPlugin(MaiBotPlugin):
             task.cancel()
         if foreground_tasks:
             await asyncio.gather(*foreground_tasks, return_exceptions=True)
+        self._wd14_io.close()
         self._http_io.close()
         self._blocking_io.close()
         for invocation in list(self._active_invocations):
@@ -228,6 +230,7 @@ class NaiPicPlugin(MaiBotPlugin):
                 retry_delay=float(retag_config.get("wd14_retry_delay", 0.5) or 0.5),
                 spaces_config=spaces_config or None,
                 proxy=str(retag_config.get("wd14_proxy", "") or "").strip() or None,
+                run_blocking=self._wd14_io.run,
             )
         else:
             wd14_client = None
@@ -755,7 +758,16 @@ class NaiPicPlugin(MaiBotPlugin):
         反推链路全部走插件内单例，命令本身不接 Invocation。
         """
         del kwargs
-        return await self._run_retag(stream_id=stream_id, user_id=user_id)
+        if self._background_tasks.is_closing:
+            raise RuntimeError("插件正在卸载，拒绝新的反推调用")
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._foreground_tasks.add(current_task)
+        try:
+            return await self._run_retag(stream_id=stream_id, user_id=user_id)
+        finally:
+            if current_task is not None:
+                self._foreground_tasks.discard(current_task)
 
     @Command(
         "nai_draw",

@@ -187,6 +187,33 @@ def test_refresh_runtime_singletons_uses_local_retriever(monkeypatch: pytest.Mon
     }
 
 
+def test_refresh_retag_runtime_injects_wd14_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+
+    async def run_wd14(function, *args, **kwargs):
+        return function(*args)
+
+    plugin._wd14_io = types.SimpleNamespace(run=run_wd14)
+    plugin._image_cache_service = types.SimpleNamespace(update_config=lambda **_kwargs: None)
+    plugin._reverse_service = types.SimpleNamespace(
+        update_wd14_client=lambda client: captured.setdefault("client", client),
+        update_wd14_thresholds=lambda **_kwargs: None,
+    )
+    plugin.get_plugin_config_data = lambda: {"retag": {"wd14_enabled": True}}
+    captured: dict[str, object] = {}
+
+    class _CapturingWD14Client:
+        def __init__(self, **kwargs: object) -> None:
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(plugin_module, "WD14Client", _CapturingWD14Client)
+
+    plugin._refresh_retag_runtime()
+
+    assert captured["client"].__class__ is _CapturingWD14Client
+    assert captured["kwargs"]["run_blocking"] is run_wd14
+
+
 class _DummySend:
     def __init__(self) -> None:
         self.text_calls: list[tuple[str, str, bool]] = []
@@ -512,6 +539,7 @@ def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._wd14_io = types.SimpleNamespace(close=lambda: None)
     plugin._http_io = types.SimpleNamespace(close=lambda: None)
     plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
     plugin._foreground_tasks = set()
@@ -623,6 +651,7 @@ def test_unload_cancels_foreground_before_closing_http_runner(
     plugin._foreground_tasks = set()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
     events: list[str] = []
+    plugin._wd14_io = types.SimpleNamespace(close=lambda: events.append("wd14-close"))
     plugin._http_io = types.SimpleNamespace(close=lambda: events.append("http-close"))
     monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
     invocation = _DummyInvocation()
@@ -650,7 +679,44 @@ def test_unload_cancels_foreground_before_closing_http_runner(
 
     asyncio.run(scenario())
 
-    assert events == ["foreground-finalize", "http-close"]
+    assert events == ["foreground-finalize", "wd14-close", "http-close"]
     assert invocation.close_calls == 1
     assert plugin._foreground_tasks == set()
     assert list(plugin._active_invocations) == []
+
+
+def test_unload_cancels_retag_before_closing_wd14_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
+    plugin._http_io = types.SimpleNamespace(close=lambda: None)
+    plugin._active_invocations = WeakSet()
+    plugin._foreground_tasks = set()
+    plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
+    events: list[str] = []
+    plugin._wd14_io = types.SimpleNamespace(close=lambda: events.append("wd14-close"))
+    monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
+
+    async def blocking_retag(**_kwargs: Any) -> tuple[bool, str | None, bool]:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("retag-finalize")
+
+    monkeypatch.setattr(plugin, "_run_retag", blocking_retag)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            plugin.handle_nai_retag_command(stream_id="stream-retag", user_id="user-retag")
+        )
+        while not plugin._foreground_tasks:
+            await asyncio.sleep(0)
+        await plugin.on_unload()
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+    assert events == ["retag-finalize", "wd14-close"]
+    assert plugin._foreground_tasks == set()
