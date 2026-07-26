@@ -82,8 +82,6 @@ tag_retriever_module = types.ModuleType("plugins.nai_draw_plugin.core.services.t
 tag_retriever_module.get_tag_retriever = lambda **_kwargs: None
 sys.modules.setdefault("plugins.nai_draw_plugin.core.services.tag_retriever", tag_retriever_module)
 
-# 与 test_sdk_runtime_tag_retriever 一致：截断 core.mixins 包的 __init__，
-# 避免间接加载 auto_recall_mixin → src.chat 的重链路
 mixins_package = types.ModuleType("plugins.nai_draw_plugin.core.mixins")
 mixins_package.__path__ = [os.path.join(MAIBOT_ROOT, "plugins", "nai_draw_plugin", "core", "mixins")]
 sys.modules.setdefault("plugins.nai_draw_plugin.core.mixins", mixins_package)
@@ -405,4 +403,3 @@ def test_inject_self_image_hint_empty_description() -> None:
     out = sdk_runtime_module._inject_self_image_hint("", mode="portrait")
     assert "肖像照" in out
     assert "一女" in out
-
