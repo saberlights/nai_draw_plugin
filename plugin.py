@@ -473,7 +473,7 @@ class NaiPicPlugin(MaiBotPlugin):
         if task is None:
             _finalize()
             return False
-        return task is not None
+        return True
 
     async def _start_command_image_generation(
         self,

@@ -10,7 +10,6 @@ import binascii
 import hashlib
 from typing import Any, Dict, List, Optional
 
-import asyncio
 import re
 import time
 from pathlib import Path
