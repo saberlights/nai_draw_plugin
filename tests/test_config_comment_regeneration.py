@@ -114,7 +114,8 @@ elif _existing_tag_stub is None:
 
 import inspect as _inspect  # noqa: E402
 
-from plugins.nai_draw_plugin.plugin import NaiPicPlugin, _resolve_existing_config_value  # noqa: E402
+from plugins.nai_draw_plugin.core.plugin_config import _resolve_existing_config_value  # noqa: E402
+from plugins.nai_draw_plugin.plugin import NaiPicPlugin  # noqa: E402
 
 
 def _make_plugin_pointing_to(config_path: Path) -> NaiPicPlugin:

@@ -93,13 +93,13 @@ sys.modules.setdefault(
 
 import tomlkit  # noqa: E402
 
+from plugins.nai_draw_plugin.core.plugin_config import PLUGIN_CONFIG  # noqa: E402
 from plugins.nai_draw_plugin.plugin import NaiPicPlugin  # noqa: E402
 
 
 def _render_default_config_text() -> str:
-    plugin = NaiPicPlugin()
-    runner_dump = tomlkit.dumps(plugin.get_default_config())
-    return plugin._compose_commented_config_text(tomlkit.parse(runner_dump))
+    runner_dump = tomlkit.dumps(PLUGIN_CONFIG.default_config())
+    return PLUGIN_CONFIG.compose_commented_text(tomlkit.parse(runner_dump))
 
 
 def test_default_config_excludes_hidden_wd14_spaces() -> None:
