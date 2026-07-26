@@ -79,9 +79,13 @@ sys.modules.setdefault("plugins.nai_draw_plugin.core.mixins", mixins_package)
 
 tag_retriever_module = types.ModuleType("plugins.nai_draw_plugin.core.services.tag_retriever")
 tag_retriever_module.get_tag_retriever = lambda **_kwargs: None
+tag_retriever_module.reset_tag_retriever = lambda: None
 sys.modules.setdefault("plugins.nai_draw_plugin.core.services.tag_retriever", tag_retriever_module)
 
 from plugins.nai_draw_plugin.core.services import tag_candidate_resolver as resolver_module
+from plugins.nai_draw_plugin.core.services.generation_admission_policy import (
+    AdmissionDecision,
+)
 from plugins.nai_draw_plugin.core.services.prompt_generation_workflow import (
     PromptGenerationWorkflow,
 )
@@ -129,6 +133,25 @@ class _FakeTextGenerator:
         return self.response
 
 
+class _RecordingAdmissionPolicy:
+    def __init__(self, decision: AdmissionDecision | None = None) -> None:
+        self.decision = decision or AdmissionDecision(True, "proactive", "准入")
+        self.action_calls: list[dict[str, object]] = []
+        self.auto_draw_calls: list[dict[str, object]] = []
+        self.success_calls: list[dict[str, object]] = []
+
+    def evaluate_action(self, **kwargs: object) -> AdmissionDecision:
+        self.action_calls.append(kwargs)
+        return self.decision
+
+    def evaluate_auto_draw(self, **kwargs: object) -> AdmissionDecision:
+        self.auto_draw_calls.append(kwargs)
+        return self.decision
+
+    def record_success(self, **kwargs: object) -> None:
+        self.success_calls.append(kwargs)
+
+
 def _build_prompt_workflow(
     *,
     send_text,
@@ -163,6 +186,7 @@ def _build_image_send_invocation() -> NaiInvocation:
     invocation.source = "command"
     invocation._last_send_timestamp = None
     invocation.api_client = types.SimpleNamespace()
+    invocation._generation_admission_policy = _RecordingAdmissionPolicy()
 
     # 本组用例只验证发图行为；跳过识图回写由 test_skip_self_vlm.py 覆盖，
     # 这里置空避免触达图片库 / 真实 DB。
@@ -187,10 +211,12 @@ def test_invocation_injects_plugin_http_runner_into_web_client(
 
     monkeypatch.setattr(sdk_runtime_module, "NaiWebClient", _CapturingWebClient)
     monkeypatch.setattr(NaiInvocation, "_is_tag_retriever_show_enabled", lambda self: False)
+    admission_policy = _RecordingAdmissionPolicy()
     plugin = types.SimpleNamespace(
         ctx=object(),
         _http_io=types.SimpleNamespace(run=run_blocking),
         _background_tasks=types.SimpleNamespace(start=lambda *_args, **_kwargs: None),
+        _generation_admission_policy=admission_policy,
     )
 
     invocation = NaiInvocation(plugin, {}, "stream-http-runner")
@@ -200,6 +226,78 @@ def test_invocation_injects_plugin_http_runner_into_web_client(
         "log_prefix": "nai_draw_plugin",
         "run_blocking": run_blocking,
     }
+    assert invocation._generation_admission_policy is admission_policy
+
+
+def test_preflight_action_guard_returns_typed_cached_policy_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision = AdmissionDecision(
+        should_generate=False,
+        category="blocked",
+        detail="用户明确表示不需要图片",
+        signal_source="user_text",
+        signal_text="别画了",
+    )
+    policy = _RecordingAdmissionPolicy(decision)
+    invocation = object.__new__(NaiInvocation)
+    invocation.plugin_config = {"action_guard": {"enabled": True}}
+    invocation.stream_id = "stream-guard"
+    invocation.reasoning = "用户要求看图"
+    invocation._generation_admission_policy = policy
+    invocation._cached_action_trigger_assessment = None
+
+    async def fake_fetch(*, lookback: int = 6) -> tuple[str, float]:
+        return "别画了", 12.5
+
+    monkeypatch.setattr(invocation, "_fetch_last_user_text_with_age", fake_fetch)
+
+    async def scenario() -> tuple[AdmissionDecision | None, AdmissionDecision | None]:
+        first = await invocation.preflight_action_guard()
+        second = await invocation.preflight_action_guard()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first is decision
+    assert second is decision
+    assert policy.action_calls == [
+        {
+            "stream_id": "stream-guard",
+            "config": invocation.plugin_config,
+            "user_text": "别画了",
+            "user_text_age_seconds": 12.5,
+            "reasoning": "用户要求看图",
+        }
+    ]
+
+
+def test_auto_draw_assessment_passes_recent_user_signal_to_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decision = AdmissionDecision(True, "auto_draw", "准入")
+    policy = _RecordingAdmissionPolicy(decision)
+    invocation = object.__new__(NaiInvocation)
+    invocation.plugin_config = {"auto_draw_on_reply": {"min_interval_seconds": 180}}
+    invocation.stream_id = "stream-auto"
+    invocation._generation_admission_policy = policy
+
+    async def fake_fetch(*, lookback: int = 6) -> tuple[str, float]:
+        return "给我用文字讲讲", 8.0
+
+    monkeypatch.setattr(invocation, "_fetch_last_user_text_with_age", fake_fetch)
+
+    result = asyncio.run(invocation._assess_auto_draw_trigger())
+
+    assert result is decision
+    assert policy.auto_draw_calls == [
+        {
+            "stream_id": "stream-auto",
+            "config": invocation.plugin_config,
+            "user_text": "给我用文字讲讲",
+            "user_text_age_seconds": 8.0,
+        }
+    ]
 
 
 def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -490,7 +588,6 @@ def test_send_image_result_downloads_generation_url_then_sends_base64_for_unknow
     send_calls: list[tuple[str, str, str]] = []
     sent_texts: list[str] = []
     remember_calls: list[tuple[str, float]] = []
-    session_marks: list[tuple[str, float]] = []
     schedule_calls: list[bool] = []
 
     async def fake_send_custom(
@@ -523,12 +620,6 @@ def test_send_image_result_downloads_generation_url_then_sends_base64_for_unknow
         "discard_pending_plugin_image_send",
         lambda *_args, **_kwargs: pytest.fail("unexpected pending-image discard"),
     )
-    monkeypatch.setattr(
-        sdk_runtime_module.session_state,
-        "set_last_action_image_sent_at",
-        lambda stream_id, send_timestamp: session_marks.append((stream_id, send_timestamp)),
-    )
-
     invocation.send_custom = fake_send_custom
     invocation.send_text = fake_send_text
     invocation._get_target_platform = lambda: ""
@@ -542,7 +633,13 @@ def test_send_image_result_downloads_generation_url_then_sends_base64_for_unknow
     assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]")]
     assert sent_texts == []
     assert len(remember_calls) == 1
-    assert len(session_marks) == 1
+    assert invocation._generation_admission_policy.success_calls == [
+        {
+            "stream_id": "stream-1",
+            "category": "action",
+            "sent_at": invocation._last_send_timestamp,
+        }
+    ]
     assert schedule_calls == [True]
 
 
@@ -553,7 +650,6 @@ def test_send_image_result_downloads_generation_url_for_qq_after_direct_url_fail
     invocation = _build_image_send_invocation()
     send_calls: list[tuple[str, str, str]] = []
     sent_texts: list[str] = []
-    session_marks: list[tuple[str, float]] = []
     schedule_calls: list[bool] = []
 
     async def fake_send_custom(
@@ -589,12 +685,6 @@ def test_send_image_result_downloads_generation_url_for_qq_after_direct_url_fail
         "discard_pending_plugin_image_send",
         lambda *_args, **_kwargs: pytest.fail("unexpected pending-image discard"),
     )
-    monkeypatch.setattr(
-        sdk_runtime_module.session_state,
-        "set_last_action_image_sent_at",
-        lambda stream_id, send_timestamp: session_marks.append((stream_id, send_timestamp)),
-    )
-
     invocation.send_custom = fake_send_custom
     invocation.send_text = fake_send_text
     invocation._get_target_platform = lambda: "qq"
@@ -609,7 +699,13 @@ def test_send_image_result_downloads_generation_url_for_qq_after_direct_url_fail
         ("imageurl", "https://std.loliyc.com/generate?tag=test", "[nai-image]"),
         ("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB", "[nai-image]"),
     ]
-    assert len(session_marks) == 1
+    assert invocation._generation_admission_policy.success_calls == [
+        {
+            "stream_id": "stream-1",
+            "category": "action",
+            "sent_at": invocation._last_send_timestamp,
+        }
+    ]
     assert schedule_calls == [True]
     assert sent_texts == []
 
@@ -620,7 +716,6 @@ def test_send_image_result_falls_back_to_base64_after_remote_url_exception(
     """普通 CDN URL：直发抛异常 → 下载 → base64 image 段重发。"""
     invocation = _build_image_send_invocation()
     send_calls: list[tuple[str, str]] = []
-    session_marks: list[tuple[str, float]] = []
 
     async def fake_send_custom(
         message_type: str,
@@ -649,12 +744,6 @@ def test_send_image_result_falls_back_to_base64_after_remote_url_exception(
         "discard_pending_plugin_image_send",
         lambda *_args, **_kwargs: pytest.fail("unexpected pending-image discard"),
     )
-    monkeypatch.setattr(
-        sdk_runtime_module.session_state,
-        "set_last_action_image_sent_at",
-        lambda stream_id, send_timestamp: session_marks.append((stream_id, send_timestamp)),
-    )
-
     invocation.send_custom = fake_send_custom
     invocation.send_text = fake_send_text
     invocation._get_target_platform = lambda: ""
@@ -669,7 +758,50 @@ def test_send_image_result_falls_back_to_base64_after_remote_url_exception(
         ("imageurl", "https://cdn.example.com/images/test.png"),
         ("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAC"),
     ]
-    assert len(session_marks) == 1
+    assert invocation._generation_admission_policy.success_calls == [
+        {
+            "stream_id": "stream-1",
+            "category": "action",
+            "sent_at": invocation._last_send_timestamp,
+        }
+    ]
+
+
+def test_send_image_result_records_auto_draw_success() -> None:
+    invocation = _build_image_send_invocation()
+
+    async def fake_send_custom(
+        message_type: str,
+        content: str,
+        *,
+        display_message: str = "",
+        storage_message: bool = True,
+    ) -> bool:
+        return True
+
+    async def fake_schedule() -> None:
+        return None
+
+    invocation.send_custom = fake_send_custom
+    invocation._schedule_auto_recall = fake_schedule
+    invocation._build_image_display_message = lambda _desc="": "[nai-image]"
+
+    result = asyncio.run(
+        invocation._send_image_result(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+            "一女 自拍",
+            track_as_auto_draw=True,
+        )
+    )
+
+    assert result == (True, "图片生成成功", True)
+    assert invocation._generation_admission_policy.success_calls == [
+        {
+            "stream_id": "stream-1",
+            "category": "auto_draw",
+            "sent_at": invocation._last_send_timestamp,
+        }
+    ]
 
 
 def test_send_base64_image_result_sends_image_segment_directly() -> None:

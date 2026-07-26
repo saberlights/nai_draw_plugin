@@ -13,13 +13,10 @@ from src.common.logger import get_logger
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.plugin_config import PLUGIN_CONFIG
 from .core.retag import ImageCacheService, ReverseService, WD14Client
-from .core.rules.reply_auto_draw import (
-    compose_description_from_reply,
-    score_reply_for_auto_draw,
-)
 from .core.reply_command_text import normalize_reply_command_text
 from .core.services.background_task_supervisor import BackgroundTaskSupervisor
 from .core.services.blocking_io_runner import BlockingIORunner
+from .core.services.generation_admission_policy import GenerationAdmissionPolicy
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -96,9 +93,10 @@ class NaiPicPlugin(MaiBotPlugin):
         self._wd14_io = BlockingIORunner(thread_name_prefix="nai-wd14-io")
         self._foreground_tasks: set[asyncio.Task[Any]] = set()
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
-        # reply 自动跟图：同一 session 在同一 reply 链路里只触发一次，避免 retry 重复出图。
-        # key=session_id, value=已触发的 reply 文本哈希集合
-        self._auto_draw_fired_signatures: dict[str, set[str]] = {}
+        self._generation_admission_policy = GenerationAdmissionPolicy(
+            state=session_state,
+            logger=logger,
+        )
         # 反推链路：图片缓存与编排服务都在 __init__ 阶段就准备好，避免 HookHandler 在配置加载前触发时 NoneError
         self._image_cache_service: ImageCacheService = ImageCacheService()
         self._reverse_service: ReverseService = ReverseService(wd14_client=None)
@@ -129,6 +127,7 @@ class NaiPicPlugin(MaiBotPlugin):
         for invocation in list(self._active_invocations):
             invocation.close()
         reset_runtime_recall_tracking_state()
+        self._generation_admission_policy.clear()
         self._image_cache_service.clear()
         self._refresh_runtime_singletons(reset_only=True)
 
@@ -345,32 +344,19 @@ class NaiPicPlugin(MaiBotPlugin):
             plugin_config = await self._load_plugin_config_data()
         except Exception:
             return
-        auto_cfg = plugin_config.get("auto_draw_on_reply") if isinstance(plugin_config, dict) else None
-        if not isinstance(auto_cfg, dict) or not auto_cfg.get("enabled", True):
+        if not isinstance(plugin_config, dict):
             return
-
-        threshold = float(auto_cfg.get("score_threshold", 0.6) or 0.6)
-        signal = score_reply_for_auto_draw(reply_text)
-        if signal.score < threshold or not signal.should_draw:
-            return
-
-        # 同一 session 同一 reply 文本只触发一次（防止 retry 流程重复出图）
-        signature = f"{len(reply_text)}:{hash(reply_text) & 0xFFFFFFFF:08x}"
-        fired = self._auto_draw_fired_signatures.setdefault(normalized_session, set())
-        if signature in fired:
-            return
-        fired.add(signature)
-        # 简单 LRU：每个 session 最多记 16 条最近触发签名，避免无界增长
-        if len(fired) > 16:
-            self._auto_draw_fired_signatures[normalized_session] = set(list(fired)[-16:])
-
-        description = compose_description_from_reply(reply_text, signal)
-        if not description:
+        decision = self._generation_admission_policy.evaluate_reply_candidate(
+            stream_id=normalized_session,
+            reply_text=reply_text,
+            config=plugin_config,
+        )
+        if not decision.should_generate:
             return
 
         invocation = await self._create_invocation(
             normalized_session,
-            action_data={"description": description},
+            action_data={"description": decision.seed_description},
             source="reply_auto_draw",
         )
 
@@ -378,7 +364,7 @@ class NaiPicPlugin(MaiBotPlugin):
         self._start_image_generation_in_background(
             normalized_session,
             lambda: invocation.handle_auto_draw_from_reply(
-                description,
+                decision.seed_description,
                 reply_context_text=reply_text,
             ),
             invocation=invocation,
@@ -1652,9 +1638,9 @@ class NaiPicPlugin(MaiBotPlugin):
         # Action Guard 同步预检：让 Planner 第一时间拿到拦截原因，避免后台默默吞掉
         # 评估结果会缓存到 invocation，后台 handle_action 复用同一次结论，不会重复读消息库
         guard_state = await invocation.preflight_action_guard()
-        if guard_state is not None and not guard_state["should_generate"]:
+        if guard_state is not None and not guard_state.should_generate:
             self._close_invocation(invocation)
-            return False, guard_state["detail"]
+            return False, guard_state.detail
 
         if not self._start_image_generation_in_background(
             stream_id,

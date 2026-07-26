@@ -96,6 +96,9 @@ from plugins.nai_draw_plugin import plugin as plugin_module
 from plugins.nai_draw_plugin.core.services.background_task_supervisor import (
     BackgroundTaskSupervisor,
 )
+from plugins.nai_draw_plugin.core.services.generation_admission_policy import (
+    AdmissionDecision,
+)
 from plugins.nai_draw_plugin.plugin import NaiPicPlugin
 
 
@@ -212,6 +215,128 @@ def test_refresh_retag_runtime_injects_wd14_runner(monkeypatch: pytest.MonkeyPat
 
     assert captured["client"].__class__ is _CapturingWD14Client
     assert captured["kwargs"]["run_blocking"] is run_wd14
+
+
+def test_reply_hook_uses_admission_description_for_background_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin_config = {
+        "auto_draw_on_reply": {"enabled": True, "score_threshold": 0.6},
+        "action_guard": {"enabled": True},
+    }
+    policy_calls: list[dict[str, object]] = []
+    create_calls: list[tuple[str, dict[str, str], str]] = []
+    start_calls: list[tuple[str, str, object]] = []
+
+    class _Policy:
+        def evaluate_reply_candidate(self, **kwargs: object) -> AdmissionDecision:
+            policy_calls.append(kwargs)
+            return AdmissionDecision(
+                should_generate=True,
+                category="auto_draw",
+                detail="准入",
+                seed_description="一女 自拍 近景 窗边",
+            )
+
+    class _Invocation:
+        async def handle_auto_draw_from_reply(
+            self,
+            description: str,
+            *,
+            reply_context_text: str,
+        ) -> None:
+            start_calls.append((description, reply_context_text, self))
+
+    invocation = _Invocation()
+    plugin._generation_admission_policy = _Policy()
+
+    async def fake_load_config() -> dict[str, object]:
+        return plugin_config
+
+    async def fake_create_invocation(
+        stream_id: str,
+        *,
+        action_data: dict[str, str],
+        source: str,
+    ) -> _Invocation:
+        create_calls.append((stream_id, action_data, source))
+        return invocation
+
+    def fake_start(
+        stream_id: str,
+        job_factory,
+        *,
+        invocation: object,
+        name: str,
+    ) -> bool:
+        assert stream_id == "stream-1"
+        assert name == "nai-reply-auto-draw"
+        asyncio.get_running_loop().create_task(job_factory())
+        return True
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", fake_load_config)
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+    monkeypatch.setattr(plugin, "_start_image_generation_in_background", fake_start)
+
+    async def scenario() -> None:
+        await plugin.handle_replyer_after_response_for_auto_draw(
+            session_id=" stream-1 ",
+            response=" 我刚洗完澡靠在窗边发呆，有点累 ",
+        )
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+    assert policy_calls == [
+        {
+            "stream_id": "stream-1",
+            "reply_text": "我刚洗完澡靠在窗边发呆，有点累",
+            "config": plugin_config,
+        }
+    ]
+    assert create_calls == [
+        (
+            "stream-1",
+            {"description": "一女 自拍 近景 窗边"},
+            "reply_auto_draw",
+        )
+    ]
+    assert start_calls == [
+        ("一女 自拍 近景 窗边", "我刚洗完澡靠在窗边发呆，有点累", invocation)
+    ]
+
+
+def test_reply_hook_rejection_does_not_create_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    create_calls = 0
+
+    class _Policy:
+        def evaluate_reply_candidate(self, **kwargs: object) -> AdmissionDecision:
+            return AdmissionDecision(False, "blocked", "reply 未达到阈值")
+
+    plugin._generation_admission_policy = _Policy()
+
+    async def fake_load_config() -> dict[str, object]:
+        return {"auto_draw_on_reply": {"enabled": True}}
+
+    async def fake_create_invocation(*args: object, **kwargs: object) -> None:
+        nonlocal create_calls
+        create_calls += 1
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", fake_load_config)
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    asyncio.run(
+        plugin.handle_replyer_after_response_for_auto_draw(
+            session_id="stream-1",
+            response="我刚洗完澡靠在窗边发呆，有点累",
+        )
+    )
+
+    assert create_calls == 0
 
 
 class _DummySend:
@@ -545,6 +670,10 @@ def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
     plugin._foreground_tasks = set()
     plugin._active_invocations = WeakSet()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
+    admission_clear_calls: list[bool] = []
+    plugin._generation_admission_policy = types.SimpleNamespace(
+        clear=lambda: admission_clear_calls.append(True)
+    )
     monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
     invocation = _DummyInvocation()
     plugin._active_invocations.add(invocation)
@@ -570,6 +699,7 @@ def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
 
     assert session_state.get_pending_image_generation_started_at(stream_id) is None
     assert invocation.close_calls == 1
+    assert admission_clear_calls == [True]
 
 
 def test_closing_supervisor_rejects_generation_and_releases_acquired_lease() -> None:
@@ -650,6 +780,7 @@ def test_unload_cancels_foreground_before_closing_http_runner(
     plugin._active_invocations = WeakSet()
     plugin._foreground_tasks = set()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
+    plugin._generation_admission_policy = types.SimpleNamespace(clear=lambda: None)
     events: list[str] = []
     plugin._wd14_io = types.SimpleNamespace(close=lambda: events.append("wd14-close"))
     plugin._http_io = types.SimpleNamespace(close=lambda: events.append("http-close"))
@@ -695,6 +826,7 @@ def test_unload_cancels_retag_before_closing_wd14_runner(
     plugin._active_invocations = WeakSet()
     plugin._foreground_tasks = set()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
+    plugin._generation_admission_policy = types.SimpleNamespace(clear=lambda: None)
     events: list[str] = []
     plugin._wd14_io = types.SimpleNamespace(close=lambda: events.append("wd14-close"))
     monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)

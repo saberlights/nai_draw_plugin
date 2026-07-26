@@ -30,11 +30,10 @@ from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.mixins.model_config_mixin import ModelConfigMixin
 from .core.rules.selfie_rules import (
     detect_bot_self_image_intent,
-    detect_explicit_image_request,
-    detect_negative_image_intent_strength,
     detect_selfie_from_output,
     merge_selfie_prompt,
 )
+from .core.services.generation_admission_policy import AdmissionDecision
 from .core.services.llm_text_generator import MaiBotLLMTextGenerator
 from .core.services.prompt_generation_workflow import PromptGenerationWorkflow
 from .core.services.random_scene_planner import RandomScenePlanner
@@ -177,26 +176,6 @@ def _is_image_message(message: Any) -> bool:
     return False
 
 
-# Planner reasoning 中暗示"用户明确要求图片"的措辞。仅在拿不到用户原话时作为 fallback。
-# 选词保守：只覆盖明显指向"用户/对方请求"的转述，避免把 bot 自身视觉描写误判成 explicit。
-_REASONING_EXPLICIT_HINTS: tuple[str, ...] = (
-    "用户要求", "用户想看", "用户想要", "用户希望", "用户让",
-    "对方要求", "对方想看", "对方想要", "对方希望", "对方让",
-    "他要求", "他想看", "她要求", "她想看",
-    "明确要求", "明确想看", "明确请求",
-    "要我画", "让我画", "叫我画", "要我发", "让我发",
-    "追图", "继续画", "再画一张", "再来一张",
-)
-
-
-def _reasoning_implies_explicit_request(reasoning: str) -> bool:
-    """fallback：从 Planner reasoning 里识别用户显式请求语义。"""
-    if not reasoning:
-        return False
-    lowered = reasoning.lower()
-    return any(hint in reasoning or hint.lower() in lowered for hint in _REASONING_EXPLICIT_HINTS)
-
-
 def _row_age_seconds(row: Any) -> float | None:
     """根据消息行的 timestamp 字段返回距今秒数；解析失败返回 None。"""
     if isinstance(row, dict):
@@ -337,6 +316,7 @@ class NaiInvocation(ModelConfigMixin):
         self.text = str(text or "")
         self.source = source
         self.log_prefix = "nai_draw_plugin"
+        self._generation_admission_policy = plugin._generation_admission_policy
         self.api_client = NaiWebClient(
             log_prefix=self.log_prefix,
             run_blocking=self.plugin._http_io.run,
@@ -366,7 +346,7 @@ class NaiInvocation(ModelConfigMixin):
         )
         self._last_send_timestamp: float | None = None
         # Action Guard 评估缓存：主路径同步预检后，后台 handle_action 复用结果，避免重复读消息库
-        self._cached_action_trigger_assessment: dict[str, Any] | None = None
+        self._cached_action_trigger_assessment: AdmissionDecision | None = None
 
     def close(self) -> None:
         """释放当前调用持有的可关闭资源。"""
@@ -934,10 +914,11 @@ class NaiInvocation(ModelConfigMixin):
             # NapCat 适配器在处理大图片时可能超时（30s），但图片会在后台继续发送
             # 保留 pending 记录以支持后续撤回，假定发送成功继续后续流程
 
-        if track_as_auto_draw:
-            session_state.set_last_auto_draw_sent_at(self.stream_id, self._last_send_timestamp)
-        else:
-            session_state.set_last_action_image_sent_at(self.stream_id, self._last_send_timestamp)
+        self._generation_admission_policy.record_success(
+            stream_id=self.stream_id,
+            category="auto_draw" if track_as_auto_draw else "action",
+            sent_at=self._last_send_timestamp,
+        )
         await self._schedule_auto_recall()
         return True, "图片生成成功", True
 
@@ -1928,22 +1909,22 @@ class NaiInvocation(ModelConfigMixin):
         is_named_character = self._is_named_character_intent()
 
         trigger_assessment = await self._assess_action_trigger(reasoning=self.reasoning)
-        if self._is_action_guard_enabled() and not trigger_assessment["should_generate"]:
+        if self._is_action_guard_enabled() and not trigger_assessment.should_generate:
             logger.info(
                 "%s Action 出图已拦截: category=%s detail=%s signal=%s text=%s",
                 self.log_prefix,
-                trigger_assessment["category"],
-                trigger_assessment["detail"],
-                trigger_assessment.get("signal_source", ""),
-                trigger_assessment.get("signal_text", ""),
+                trigger_assessment.category,
+                trigger_assessment.detail,
+                trigger_assessment.signal_source,
+                trigger_assessment.signal_text,
             )
-            return False, trigger_assessment["detail"]
+            return False, trigger_assessment.detail
 
         # 主动出图自动 self-image 增强：bot 自己想发图时，让出来的图更像"她给你看一眼自己"
         # 而不是"画了一张陌生女孩"。explicit 路径不动，保持用户原意。
         # 画指定角色路径不注入：本轮主体是指定角色而非 bot，加"肖像照 近景"会把角色洗成 bot 肖像。
         if (
-            trigger_assessment["category"] == "proactive"
+            trigger_assessment.category == "proactive"
             and bool(self.get_config("action_guard.proactive_self_image_boost", True))
             and description
             and not is_named_character
@@ -2072,14 +2053,14 @@ class NaiInvocation(ModelConfigMixin):
 
         # auto_draw 单独跑 guard：负向用户原话仍要兜底，间隔走 auto_draw 档
         guard_state = await self._assess_auto_draw_trigger()
-        if self._is_action_guard_enabled() and not guard_state["should_generate"]:
+        if self._is_action_guard_enabled() and not guard_state.should_generate:
             logger.info(
                 "%s reply 自动跟图被拦截: detail=%s text=%s",
                 self.log_prefix,
-                guard_state["detail"],
-                guard_state.get("signal_text", ""),
+                guard_state.detail,
+                guard_state.signal_text,
             )
-            return False, guard_state["detail"]
+            return False, guard_state.detail
 
         # 自动 self-image 增强：description 不含自拍/肖像/生活照标签时补一个
         if (
@@ -2157,181 +2138,44 @@ class NaiInvocation(ModelConfigMixin):
         )
         return send_result[0], send_result[1] or ""
 
-    async def _assess_auto_draw_trigger(self) -> dict[str, Any]:
-        """auto_draw 用的 guard：保留负向用户原话兜底 + auto_draw 档间隔。"""
+    async def _assess_auto_draw_trigger(self) -> AdmissionDecision:
+        """读取最近用户原话并评估 reply 自动跟图。"""
         user_text, age_seconds = await self._fetch_last_user_text_with_age()
-        if user_text:
-            negative_strength = detect_negative_image_intent_strength(user_text)
-            if negative_strength == "strong":
-                return {
-                    "should_generate": False,
-                    "detail": "用户明确表示不需要图片",
-                    "signal_text": user_text[:120],
-                }
-            if negative_strength == "weak":
-                weak_ttl = max(
-                    0,
-                    int(self.get_config("action_guard.weak_negative_ttl_seconds", 60) or 60),
-                )
-                if age_seconds is None or age_seconds <= weak_ttl:
-                    return {
-                        "should_generate": False,
-                        "detail": "用户刚才偏好文字回复",
-                        "signal_text": user_text[:120],
-                    }
-        can_send, detail = self._check_action_image_interval("auto_draw")
-        return {
-            "should_generate": can_send,
-            "detail": detail,
-            "signal_text": (user_text or "")[:120],
-        }
+        return self._generation_admission_policy.evaluate_auto_draw(
+            stream_id=self.stream_id,
+            config=self.plugin_config,
+            user_text=user_text,
+            user_text_age_seconds=age_seconds,
+        )
 
     def _is_action_guard_enabled(self) -> bool:
         """检查是否启用自动出图保护。"""
         return bool(self.get_config("action_guard.enabled", True))
 
-    async def preflight_action_guard(self) -> dict[str, Any] | None:
+    async def preflight_action_guard(self) -> AdmissionDecision | None:
         """Action Guard 同步预检：让 Planner 在 RPC 返回时就能拿到拦截原因。
 
-        返回 None 表示 guard 未启用，调用方应放行；返回 dict 表示 guard 结论，
-        ``should_generate`` 为 False 时 ``detail`` 给出可透传给 Planner 的失败原因。
+        返回 None 表示 guard 未启用，调用方应放行；否则返回类型化准入结论。
         结果会缓存到 invocation 上，后台 ``handle_action`` 复用同一次评估，避免重复读消息库。
         """
         if not self._is_action_guard_enabled():
             return None
         return await self._assess_action_trigger(reasoning=self.reasoning)
 
-    async def _assess_action_trigger(self, reasoning: str = "") -> dict[str, Any]:
+    async def _assess_action_trigger(self, reasoning: str = "") -> AdmissionDecision:
         """Action Guard 评估入口；结果缓存供 handle_action 后台复用。"""
         if self._cached_action_trigger_assessment is not None:
             return self._cached_action_trigger_assessment
-        result = await self._compute_action_trigger_assessment(reasoning=reasoning)
+        user_text, age_seconds = await self._fetch_last_user_text_with_age()
+        result = self._generation_admission_policy.evaluate_action(
+            stream_id=self.stream_id,
+            config=self.plugin_config,
+            user_text=user_text,
+            user_text_age_seconds=age_seconds,
+            reasoning=reasoning,
+        )
         self._cached_action_trigger_assessment = result
         return result
-
-    async def _compute_action_trigger_assessment(self, reasoning: str = "") -> dict[str, Any]:
-        """评估当前 Action 是否真的适合出图，并应用频率保护。
-
-        设计原则：
-        - 信任 Planner 的语义判断：Planner 调了 Action 即"它认为该发图"，Guard 不再做白名单二次拦截
-        - Guard 只负责两件事：
-          ① 否定意图黑名单兜底（用户明确说"不要画"也调用了，按 Planner 误判处理）
-          ② 频率保护，按"用户原话强度"分级 explicit / proactive 两档
-        - 判定输入必须是用户原话，不能是 action_data["description"]（那是 LLM 生成的关键词）
-          原话取不到时回落 Planner reasoning：reasoning 含"用户/对方/他说/明确/要求"等显式信号视为 explicit
-        - 否定关键词区分强弱：strong（"不要画"）永久阻断；weak（"用文字"）仅在新鲜（< 60s）且
-          是最近一条消息时阻断，避免 stale 偏好一直冻结。
-        """
-        user_text, age_seconds = await self._fetch_last_user_text_with_age()
-        signal_source = "user_text"
-        signal_text = user_text
-
-        if user_text:
-            negative_strength = detect_negative_image_intent_strength(user_text)
-            if negative_strength == "strong":
-                return {
-                    "should_generate": False,
-                    "explicit_request": False,
-                    "category": "blocked",
-                    "detail": "用户明确表示不需要图片",
-                    "signal_source": "user_text",
-                    "signal_text": user_text[:120],
-                }
-            if negative_strength == "weak":
-                weak_ttl = max(
-                    0,
-                    int(self.get_config("action_guard.weak_negative_ttl_seconds", 60) or 60),
-                )
-                # age 未知时保守按"未过期"处理，仍然阻断；明确过期才放行
-                if age_seconds is None or age_seconds <= weak_ttl:
-                    return {
-                        "should_generate": False,
-                        "explicit_request": False,
-                        "category": "blocked",
-                        "detail": "用户刚才偏好文字回复",
-                        "signal_source": "user_text",
-                        "signal_text": user_text[:120],
-                    }
-
-        if user_text and detect_explicit_image_request(user_text):
-            is_explicit = True
-        elif user_text:
-            is_explicit = False
-        else:
-            # 拿不到用户原话时退化到 Planner reasoning：仅当 reasoning 出现明确指向用户请求的措辞才升级到 explicit
-            reasoning_text = str(reasoning or "").strip()
-            signal_source = "reasoning" if reasoning_text else "none"
-            signal_text = reasoning_text
-            is_explicit = bool(reasoning_text) and _reasoning_implies_explicit_request(reasoning_text)
-
-        category = "explicit" if is_explicit else "proactive"
-        can_send, detail = self._check_action_image_interval(category)
-        return {
-            "should_generate": can_send,
-            "explicit_request": is_explicit,
-            "category": category,
-            "detail": detail,
-            "signal_source": signal_source,
-            "signal_text": signal_text[:120],
-        }
-
-    def _check_action_image_interval(self, category: str) -> tuple[bool, str]:
-        """检查自动出图间隔，避免短时间连续刷图。
-
-        分档：
-        - explicit:  用户原话明确要求看图/画图/自拍/追图 → 短间隔（默认 45s）
-        - proactive: bot 主动判断需要配图 → 中间隔（默认 240s）
-        - auto_draw: reply 后置 hook 自动跟图 → 独立间隔（默认 180s），同时尊重
-          action_image_sent_at 与 auto_draw_sent_at 中较新的那次出图
-        """
-        # 三档间隔走 ``get_config`` 的 default 兜底，不再用 ``or X`` 二次兜底——
-        # 否则用户显式配 0（"完全不节流"）会被当成 falsy 顶替成默认值
-        explicit_interval = max(
-            0,
-            int(self.get_config("action_guard.explicit_request_min_interval_seconds", 5)),
-        )
-        proactive_interval = max(
-            0,
-            int(self.get_config("action_guard.proactive_min_interval_seconds", 10)),
-        )
-        auto_draw_interval = max(
-            0,
-            int(self.get_config("auto_draw_on_reply.min_interval_seconds", 15)),
-        )
-
-        last_action_at = session_state.get_last_action_image_sent_at(self.stream_id)
-        last_auto_draw_at = session_state.get_last_auto_draw_sent_at(self.stream_id)
-
-        if category == "auto_draw":
-            # 自动跟图：尊重所有最近出图时间，取最近的一次做间隔判定
-            effective_last = max(
-                (ts for ts in (last_action_at, last_auto_draw_at) if ts is not None),
-                default=None,
-            )
-            required_interval = auto_draw_interval
-        elif category == "explicit":
-            effective_last = last_action_at
-            required_interval = explicit_interval
-        else:
-            effective_last = last_action_at
-            required_interval = proactive_interval
-
-        if effective_last is None:
-            return True, "首次出图"
-
-        elapsed = max(0.0, time.time() - effective_last)
-        if elapsed >= required_interval:
-            return True, "触发条件满足"
-
-        remaining_seconds = int(required_interval - elapsed + 0.999)
-        logger.debug(
-            "%s Action 出图节流命中: category=%s required=%ds remaining=%ds",
-            self.log_prefix, category, required_interval, remaining_seconds,
-        )
-        # 给 Planner 的 detail 不含具体秒数、不出现"等待"字样：之前写成"还需等待约 X 秒"
-        # 会被 Planner LLM 直接联想到主程序的 wait 工具，进而调 wait(seconds=120) 把整个
-        # 对话循环锁死。这里改成只描述"本轮跳过 + 走文字"，并明确禁止 wait。
-        return False, "图片节流中，本轮跳过出图、直接用文字回复推进；插件会自行解除冷却，请不要使用 wait 工具"
 
     async def handle_admin_command(self, action: str, param: str) -> tuple[bool, str | None, bool]:
         """处理 `/nai st|sp|set|art|size|help`。"""
