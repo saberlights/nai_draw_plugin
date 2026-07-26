@@ -437,7 +437,7 @@ class NaiPicPlugin(MaiBotPlugin):
         "model": "========== NewAPI 兼容网关连接与默认模型 ==========",
         "prompt_generator": "========== 提示词生成（/nai） ==========",
         "action_guard": "========== 自动出图触发保护 ==========",
-        "random_scene": "========== 随机场景生成（/nai 随机） ==========\n未配置的项会回退到 [prompt_generator]",
+        "random_scene": "========== 随机场景生成（/nai 随机 [角色]） ==========\n未配置的项会回退到 [prompt_generator]",
         "components": "========== 功能开关 ==========",
         "retag": (
             "========== 图片反推（/nai 反推） ==========\n"
@@ -1039,20 +1039,20 @@ class NaiPicPlugin(MaiBotPlugin):
         "random_scene": {
             "temperature": ConfigField(
                 type=float,
-                default=1.0,
+                default=1.2,
                 description="随机场景生成 LLM 温度；可填正浮点数；常用 1.0~1.5，越高越发散"
             ),
             "max_tokens": ConfigField(
                 type=int,
-                default=200,
+                default=240,
                 description="随机场景生成 LLM 响应的最大 token；可填正整数"
             ),
             "custom_model": ConfigField(
                 type=dict,
                 default={
                     "model_list": [],
-                    "max_tokens": 200,
-                    "temperature": 1.0,
+                    "max_tokens": 240,
+                    "temperature": 1.2,
                     "slow_threshold": 30.0
                 },
                 description="随机场景自定义模型配置；填 {model_list, max_tokens, temperature, slow_threshold}；留空则继承 prompt_generator.custom_model"
@@ -2078,11 +2078,12 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @Command(
         "nai_draw",
-        description="使用自然语言描述生成图片",
-        # negative lookahead 排除所有 /nai 子命令；vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
+        description="使用自然语言描述生成图片；/nai 随机 [角色] 或 /nai 随机自拍 [角色] 可生成开放题材随机色图",
+        # negative lookahead 排除所有 /nai 子命令；随机命令同时兼容 `/nai随机` 的紧凑写法；
+        # vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
         # 所以用 ``(?:\b|[一-鿿])`` 覆盖空格后置和中文后缀两种情形，避免 ``vibe存`` 被
         # 通用命令吞掉（vibe\b 在 latin→CJK 边界不成立）
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai(?:\s+|(?=随机(?:自拍)?(?:\s|$)))(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,

@@ -2,8 +2,7 @@
 """
 随机场景中文描述清洗工具
 
-将 LLM 返回的随机中文短语标准化为更贴近 Danbooru 中文对照表的表达，
-提升后续 tag 检索命中率。
+清理 LLM 返回的随机自然语言，并为本地场景判重保留标准化能力。
 """
 
 from __future__ import annotations
@@ -67,6 +66,52 @@ _CLUSTER_RULES = [
     (("修女", "教堂", "告解室", "神像"), "宗教"),
     (("办公室", "秘书", "上司", "职场"), "职场"),
 ]
+
+
+_RANDOM_REQUEST_RE = re.compile(
+    r"^(?P<mode>随机自拍|随机|random\s+selfie|random|rand)"
+    r"(?:\s+(?P<character>.+))?$",
+    re.IGNORECASE,
+)
+
+
+def parse_random_scene_request(text: str) -> tuple[bool, bool, str]:
+    """解析 ``/nai`` 描述中的随机场景请求。
+
+    返回 ``(是否随机, 是否随机自拍, 指定角色)``。角色只作为锚点透传，
+    不把它拆成普通场景标签，避免角色名被随机规则改写。
+    """
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    cleaned = re.sub(r"^(随机自拍|随机|random\s+selfie|random|rand)[:：]\s*", r"\1 ", cleaned, flags=re.IGNORECASE)
+    match = _RANDOM_REQUEST_RE.fullmatch(cleaned)
+    if match is None:
+        return False, False, ""
+
+    mode = re.sub(r"\s+", " ", match.group("mode").strip()).casefold()
+    character = re.sub(r"\s+", " ", (match.group("character") or "").strip(" \t,，、"))
+    return True, mode in {"随机自拍", "random selfie"}, character
+
+
+def normalize_random_scene_narrative(text: str) -> str:
+    """清理随机场景自然语言，同时保留句内标点和语义关系。"""
+    cleaned = str(text or "").strip().strip("`")
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\s*\n\s*", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def ensure_random_scene_character(description: str, character: str) -> str:
+    """把指定角色作为随机场景的稳定锚点保留下来。"""
+    normalized_description = normalize_random_scene_narrative(description)
+    normalized_character = re.sub(r"\s+", " ", str(character or "").strip(" \t,，、"))
+    if not normalized_character:
+        return normalized_description
+    if not normalized_description:
+        return normalized_character
+    if normalized_character.casefold() in normalized_description.casefold():
+        return normalized_description
+    return f"主角是{normalized_character}。{normalized_description}"
 
 
 def _normalize_count_token(token: str) -> str:

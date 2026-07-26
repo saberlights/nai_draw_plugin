@@ -45,13 +45,17 @@ HELP_DOC: HelpDoc = HelpDoc(
             accent2="#ff8e72",
             items=(
                 ("/nai <描述>", "自然语言生成（中文即可）"),
-                ("/nai 随机", "随机生成一张 NSFW 图片"),
-                ("/nai 随机自拍", "随机生成一张 NSFW 自拍"),
+                ("/nai 随机 [角色]", "完全随机生成 NSFW 色图；可指定角色"),
+                (
+                    "/nai 随机自拍 [角色]",
+                    "完全随机生成自拍色图；指定角色时不套用 Bot 形象",
+                ),
                 ("/nai0 <英文标签>", "直接用英文 tag 生成（不过 LLM）"),
             ),
             hint=(
                 "描述含「自拍/selfie」走自拍路径；"
-                "含「肖像/portrait」走肖像路径；其它走普通画图。"
+                "含「肖像/portrait」走肖像路径；其它走普通画图。\n"
+                "随机命令也支持紧凑写法：/nai随机 [角色]。"
             ),
         ),
         HelpSection(
@@ -98,7 +102,10 @@ HELP_DOC: HelpDoc = HelpDoc(
                 ("/nai ref清空", "清空 ref 图库（仅管理员）"),
                 ("/nai ref选 <名字>", "设定默认 ref 图（仅管理员）"),
                 ("/nai ref [@<名字>] <描述>", "用默认 / 单次指定 ref 出图（仅管理员）"),
-                ("/nai ref类型 character|style|both", "切换提取目标（仅管理员，会话级）"),
+                (
+                    "/nai ref类型 [character|style|both]",
+                    "查看 / 切换提取目标（仅管理员，会话级）",
+                ),
                 ("/nai0 ref [@<名字>] <英文>", "同上但直发英文，不过 LLM"),
             ),
             hint=(

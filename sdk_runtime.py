@@ -10,7 +10,6 @@ import binascii
 import hashlib
 import json
 import tomllib
-from collections.abc import Callable
 from uuid import uuid4
 from typing import Any, Dict, List, Optional
 
@@ -54,7 +53,6 @@ from .core.tag_retriever_display import build_tag_retriever_display_messages
 from .core.rules.selfie_rules import (
     detect_bot_self_image_intent,
     detect_explicit_image_request,
-    detect_negative_image_intent,
     detect_negative_image_intent_strength,
     detect_selfie_from_output,
     get_selfie_hint,
@@ -102,9 +100,11 @@ from .core.utils.prompt_postprocessor import (
     user_mentions_appearance,
 )
 from .core.utils.random_scene_description import (
+    ensure_random_scene_character,
     get_random_scene_similarity_score,
     is_random_scene_too_similar,
-    normalize_random_scene_description,
+    normalize_random_scene_narrative,
+    parse_random_scene_request,
 )
 
 logger = get_logger("nai_draw_plugin")
@@ -1769,23 +1769,33 @@ class NaiInvocation(ModelConfigMixin):
 
         return cleaned_prompt, structured_payload
 
-    async def _generate_random_description(self, *, selfie: bool = False) -> str | None:
-        """生成随机场景描述。"""
+    async def _generate_random_description(
+        self,
+        *,
+        selfie: bool = False,
+        character: str = "",
+    ) -> str | None:
+        """生成开放题材的随机场景描述，并保留可选角色锚点。"""
         random_config = self._get_random_scene_config()
+        character = str(character or "").strip()
 
         best_candidate: str | None = None
         best_score: float | None = None
         rejected_candidates: list[str] = []
 
-        for attempt in range(self._max_random_scene_attempts):
-            prompt = self._build_random_scene_prompt(selfie=selfie, rejected_candidates=rejected_candidates)
+        for _attempt in range(self._max_random_scene_attempts):
+            prompt = self._build_random_scene_prompt(
+                selfie=selfie,
+                character=character,
+                rejected_candidates=rejected_candidates,
+            )
             response = await self._request_llm_text(
                 prompt,
                 request_type="nai_draw_plugin.random_scene",
                 generator_config=random_config,
                 default_model_name="planner",
-                default_temperature=1.0,
-                default_max_tokens=200,
+                default_temperature=1.2,
+                default_max_tokens=240,
             )
             if not response:
                 continue
@@ -1794,7 +1804,10 @@ class NaiInvocation(ModelConfigMixin):
             if not lines:
                 continue
 
-            candidate = normalize_random_scene_description(lines[0])
+            normalized_candidate = normalize_random_scene_narrative(lines[0])
+            if not normalized_candidate:
+                continue
+            candidate = ensure_random_scene_character(normalized_candidate, character)
             score = get_random_scene_similarity_score(candidate, self._recent_random_scenes)
             if not is_random_scene_too_similar(
                 candidate,
@@ -1818,28 +1831,66 @@ class NaiInvocation(ModelConfigMixin):
         self,
         *,
         selfie: bool = False,
+        character: str = "",
         rejected_candidates: Optional[list[str]] = None,
     ) -> str:
-        """构造随机场景提示。"""
+        """构造不受封闭题材池限制的随机场景提示。"""
+        character = str(character or "").strip()
+        character_instruction = ""
+        if character:
+            character_literal = json.dumps(character, ensure_ascii=False)
+            character_instruction = (
+                "\n\n指定角色锚点（必须原样保留）：\n"
+                f"- 自然语言描述必须包含字面角色名 {character_literal}，不得替换成泛称或其它角色\n"
+                "- 以该角色为画面主体；可以按随机结果增加其它成年配角\n"
+            )
+
         selfie_extra = ""
         if selfie:
             selfie_extra = (
                 "\n\n额外要求（自拍模式）：\n"
-                "- 必须明确是自拍，输出中包含“自拍”或具体自拍方式\n"
-                "- 自拍内容同样要明确偏成人向\n"
-                "- 自拍场景和方式也要多样化"
+                "- 必须明确是手持相机、手机自拍、镜子自拍或其它可视化自拍方式\n"
+                "- 自拍内容仍然是明确成人向色图，不要退化成普通写真\n"
+                "- 自拍只是镜头形式，不限制其它题材和成人行为"
             )
 
         prompt = (
-            "随机生成一个二次元 NSFW 场景，并用空格分隔的中文短标签描述它。\n\n"
-            "要求：\n"
-            "- 题材不限，强度不限，可以是任何成人向内容\n"
-            "- 结果必须具体、可视化、适合转成 Danbooru 风格标签\n"
-            "- 只输出 1 行，包含 6-10 个中文短标签\n"
-            "- 标签尽量简短，使用明确视觉概念，不要写成句子\n"
-            "- 标签尽量覆盖人数、人物构成、状态、互动、视角、场景\n"
-            "- 不要和最近结果过于相似，尽量主动切换题材和画面类型"
-            f"{selfie_extra}"
+            "你是二次元成人向生图的开放式随机场景设计器。\n"
+            "目标是生成一张明确的 NSFW 色图场景，而不是普通插画或安全写真。\n"
+            f"本轮随机熵（只用于内部抽签，不要输出）：{uuid4().hex}\n\n"
+            "随机规则：\n"
+            "- 不要从固定清单或少数安全模板中轮换；题材空间开放，可以选择常见、冷门、跨题材、"
+            "超现实或新奇的成人设定，并主动发明没有见过的组合。\n"
+            "- 独立决定人物构成与关系、成人行为/癖好、服装与身体状态、姿势互动、镜头构图、"
+            "地点与时代、道具、光线和情绪；每次至少改变其中 4 个维度。\n"
+            "- 不要因为‘随机’就总是单人、卧室、站立、自拍或同一种体位；最近结果中出现过的"
+            "题材、地点、镜头和动作都要主动避开。\n"
+            "- 所有参与者必须明确是成年人（18+）且自愿，不生成未成年人色情。\n\n"
+            "开放灵感（仅为非穷举示例，绝不是白名单）：可以探索性交/插入、口交/乳交/后入等"
+            "不同体位，多人或复杂关系，拘束/支配、触手/异种、医疗/实验、露出/公共场所、制服/"
+            "角色扮演，以及任何你能构思的其它成人题材；不要把随机结果限制在这些例子里。\n\n"
+            "创作流程（不要输出思考过程）：\n"
+            "- 先在内部完成一份导演式画面设计，再整理成简洁连贯的自然语言；情色主轴必须清晰，至少出现明确成人行为、"
+            "身体接触、裸露状态或性兴奋状态，不能只写暧昧、泳装、漂亮或普通写真。\n"
+            "- 角色当下状态要具体：表情、视线、呼吸/汗/脸红等身体反应、姿态重心、手脚位置、头发和"
+            "肌肤状态，以及角色之间正在发生的互动。\n"
+            "- 服饰状态要具体：服装款式、材质、颜色、层次和穿着变化（例如扣子解开、肩带滑落、半穿、"
+            "内衣、袜子、鞋）；服饰类型要主动变化，不要固定成校服或单一裸身模板。示例不是白名单。\n"
+            "- 加入 1-3 个与动作和地点有关系的配饰/道具，例如首饰、项圈、眼镜、发饰、手套、丝袜、"
+            "家具、镜子、手机或成人用品；要说明它们在画面中的作用，而不是孤立罗列名词。\n"
+            "- 认真设计构图：明确视觉焦点和主体位置，安排前景、中景、背景，交代景别、留白、裁切、"
+            "透视和动作线，让画面有层次、平衡、可读性，不要把人物和道具堆在画面中央。\n"
+            "- 明确视角与镜头：第一人称/旁观/自拍/镜面/俯视/低角度/侧后方等视角，配合近景/中景/"
+            "全身、镜头角度、透视和焦段感；镜头形式也要随机变化。\n"
+            "- 描述完整环境：地点、时间、天气、光源、色调、空气和氛围，让角色状态、服饰和场景彼此"
+            "呼应；发挥想象力，创造新奇但合理的成人画面组合。\n\n"
+            "输出格式：\n"
+            "- 只输出 1 行自然语言，由 1-2 个完整中文句子组成；不要解释、编号、Markdown 或思考过程。\n"
+            "- 不要输出标签清单或用空格堆砌词条；使用正常中文语序和标点，把人物之间的关系与动作写清楚。\n"
+            "- 描述必须包含具体可视化细节，覆盖角色/人数、情色行为与状态、服饰与配饰、姿势互动、"
+            "场景、构图视角和光线氛围，供后续在线检索和 Danbooru tag 生成使用。\n"
+            "- 例子只是帮助理解维度，不是白名单；不要把输出限制在例子范围内。"
+            f"{character_instruction}{selfie_extra}"
         )
 
         if self._recent_random_scenes:
@@ -1994,9 +2045,15 @@ class NaiInvocation(ModelConfigMixin):
                 await self.send_text("请输入你想画的内容，例如：/nai 画一张初音未来")
                 return False, "未提供描述", True
 
-            is_random_selfie = description in {"随机自拍", "random selfie"}
-            if description in {"随机", "random", "rand"} or is_random_selfie:
-                description = await self._generate_random_description(selfie=is_random_selfie) or ""
+            raw_description = description
+            is_random_request, is_random_selfie, random_character = parse_random_scene_request(
+                raw_description
+            )
+            if is_random_request:
+                description = await self._generate_random_description(
+                    selfie=is_random_selfie,
+                    character=random_character,
+                ) or ""
                 if not description:
                     await self.send_text("随机场景生成失败，请稍后再试~")
                     return False, "随机生成失败", True
@@ -2016,8 +2073,13 @@ class NaiInvocation(ModelConfigMixin):
             # 旧实现 detect_selfie_from_output 会把 LLM 用作 framing 的 `portrait photo`
             # / `full body portrait` 误判成 "bot 本人图片"，导致 `/nai 中野二乃，
             # 展示身材` 这类点名二次元角色的请求被注入 bot 默认外貌，把角色洗成 bot 自己。
-            # 随机自拍场景下 description 已被替换为随机场景文本，靠 is_random_selfie 保留意图。
-            is_selfie = is_random_selfie or detect_bot_self_image_intent(description)
+            # 随机场景的内容可能恰好包含“自拍”，但那只是镜头形式，不代表用户要画 bot 本人。
+            # 只有无指定角色的 `/nai 随机自拍` 保留旧的 bot 自拍后处理；普通命令仍按用户原话判定。
+            is_selfie = (
+                (is_random_selfie and not random_character)
+                if is_random_request
+                else detect_bot_self_image_intent(raw_description)
+            )
             selfie_base_prompt = generated_prompt
             if is_selfie:
                 generated_prompt = self._process_selfie_prompt(

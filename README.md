@@ -3,6 +3,7 @@
 通过 NewAPI 兼容 OpenAI 协议（POST `/v1/chat/completions`）调用 NovelAI 绘图的 MaiBot 插件。
 
 - `/nai` 自然语言生图（LLM 转 Danbooru tag）
+- `/nai 随机 [角色]` / `/nai 随机自拍 [角色]` 完全随机生成 NSFW 色图；可选指定角色
 - `/nai0` 直接英文标签生图（跳过 LLM）
 - `/nai i2i` 图生图（引用回复一张图，§20.1）
 - `/nai vibe` / `/nai ref` 命名图库：把常用参考图存为命名条目，跨重启保留；vibe = §20.3 风格/氛围迁移，ref = §20.4 角色参考（仅 V4.5）
@@ -63,6 +64,8 @@ default_model = "nai-diffusion-4-5-full"
 ```
 /nai 画一张初音未来
 /nai 自拍，微笑
+/nai 随机 初音未来       # 指定角色，题材/场景/姿势仍完全随机
+/nai 随机自拍            # Bot 形象随机自拍
 /nai0 1girl, hatsune miku, smile
 /nai set 4.5     # 切模型
 /nai size 横     # 切尺寸
@@ -74,7 +77,8 @@ default_model = "nai-diffusion-4-5-full"
 | 命令 | 说明 |
 |------|------|
 | `/nai <描述>` | 自然语言生图（LLM 生成 prompt） |
-| `/nai 随机` / `/nai 随机自拍` | 随机 NSFW 场景 / 自拍 |
+| `/nai 随机 [角色]` | 完全随机 NSFW 色图；省略角色时主体也随机 |
+| `/nai 随机自拍 [角色]` | 完全随机自拍色图；指定角色时不套用 Bot 形象 |
 | `/nai0 <标签>` | 直接英文标签生图（跳过 LLM） |
 | `/nai i2i <描述>` | 图生图（§20.1）：引用一张图，以它为底重绘；宽高须 64 整除 |
 | `/nai vibe存 <名字>` | 把引用回复的图存入 vibe 图库（跨重启保留，**仅管理员**） |
@@ -85,16 +89,26 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai vibe @<名字1> [@<名字2>...] <描述>` | 单次用指定 vibe 图（1~4 张，不动默认选定） |
 | `/nai vibe <描述>` | 用本会话默认 vibe 图生图（§20.3） |
 | `/nai0 vibe [@<名字...>] <英文 tags>` | 同 `/nai vibe` 但直接发英文 tags，**不过 LLM** |
-| `/nai ref存 / ref图库 / ref删 / ref清空 / ref选 / ref @<名字> / ref <描述>` 与 `/nai0 ref ...` | 角色参考族，结构与 vibe 对称但**仅 1 张**（§20.4 `character_references`，仅 V4.5 系列模型，**整族仅管理员可用**） |
-| `/nai ref类型 <character\|style\|both>` | 切换本会话 §20.4 提取目标（仅管理员，会话级）；`both` = `character&style` |
+| `/nai ref存 <名字>` | 把引用回复的图存入角色参考图库（**仅管理员**） |
+| `/nai ref图库` | 列出角色参考图库（**仅管理员**） |
+| `/nai ref删 <名字>` | 删除一张角色参考图（**仅管理员**） |
+| `/nai ref清空` | 清空角色参考图库并重置选定（**仅管理员**） |
+| `/nai ref选 <名字>` | 设定本会话默认角色参考图（**仅管理员**） |
+| `/nai ref [@<名字>] <描述>` | 使用默认或单次指定的角色参考图（仅 V4.5，**仅管理员**） |
+| `/nai0 ref [@<名字>] <英文 tags>` | 角色参考直发英文 tags（不过 LLM，**仅管理员**） |
+| `/nai ref类型 [character\|style\|both]` | 不带参数查看当前类型；带参数切换 §20.4 提取目标（**仅管理员，会话级**） |
 | `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
 | `/nai set [3/f3/4c/4/4.5c/4.5]` | 查看/切换模型 |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
+| `/nai art [编号]` | 查看/切换画师风格预设 |
 | `/nai models` | 拉取 NewAPI 网关实时可用模型清单 |
-| `/nai nsfw [on/off]` | 切换 NSFW 过滤（会话级，仅管理员） |
+| `/nai nsfw [on/off]` | 查看 / 切换 NSFW 过滤（会话级，切换仅管理员） |
 | `/nai pt on/off` | 切换提示词显示 |
+| `/nai tag on/off` | 开关 Danbooru 检索结果回显 |
 | `/nai on/off` | 切换自动撤回（仅管理员） |
+| `/nai 撤回` | 撤回最近一张本插件发送的图片 |
 | `/nai st/sp` | 开/关管理员模式（仅管理员） |
+| `/nai ban <用户ID>` / `/nai unban <用户ID>` / `/nai banlist` | 管理黑名单（仅管理员） |
 | `/nai help` | 帮助 |
 
 `set` / `size` / `nsfw` 都是**会话级**且**运行时临时**，重启后回退到配置默认值。
@@ -284,7 +298,7 @@ fidelity = 1.0                # 0.0~1.0，保真度（次要强度）
 strength = 1.0                # 0.0~1.0，主参考强度
 ```
 
-> `[character_reference].type` 可以在会话里运行时切换：`/nai ref类型 character|style|both`（仅管理员）；命令切换的值优先于配置默认。
+> `[character_reference].type` 可以在会话里运行时查看或切换：`/nai ref类型` 查看当前值，`/nai ref类型 character|style|both` 切换（仅管理员）；命令切换的值优先于配置默认。
 
 ### 分版本模型配置
 
@@ -326,6 +340,9 @@ A: `/nai` 自然语言模式。LLM 自动转 Danbooru tag，无需掌握 NAI 语
 
 **Q: 自拍模式怎么触发？**
 A: 描述里含"自拍 / selfie / 镜子 / 合照 / 手机拍 / 前置相机 / 俯拍 / 仰拍"等 24 个关键词中任一即可。会自动按描述选 5 种类型之一（手机前置 / 镜子 / 高角度 / 低角度 / 合照），并叠加 `selfie_prompt_add` 配置的 Bot 形象特征。
+
+**Q: 随机色图怎么指定角色？**
+A: 用 `/nai 随机 [角色]`，例如 `/nai 随机 初音未来`；角色会被固定为主体锚点，其余题材、场景、姿势和构图由开放式 LLM 随机生成，并主动避开近期重复。需要自拍构图时用 `/nai 随机自拍 [角色]`；省略角色时沿用 Bot 随机自拍，指定角色后不会注入 Bot 形象。
 
 **Q: 怎么定制 LLM 提示词生成？**
 A: `[prompt_generator]` 可改 `model_name` / `temperature` / `max_tokens` / `prompt_template`；`[prompt_generator.custom_model]` 可独立指定模型。
@@ -420,7 +437,7 @@ Rabbit
 
 ### v1.5.0 (2026-03-23)
 - Danbooru Tag 检索增强：embedding 模型从 5481 条中文 tag 对照表语义检索候选标签
-- `/nai 随机` / `/nai 随机自拍`：LLM 随机生成 NSFW 场景（+ Bot 形象）
+- `/nai 随机 [角色]` / `/nai 随机自拍 [角色]`：开放式 LLM 随机生成 NSFW 场景；指定角色时保留角色锚点
 - `[tag_retriever]` 配置节、xlsx → JSON tag 数据构建工具
 
 ### v1.4.0 (2026-05-22)
