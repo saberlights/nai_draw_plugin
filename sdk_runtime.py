@@ -359,7 +359,7 @@ class NaiInvocation(ModelConfigMixin):
             stream_id=self.stream_id,
             context=self.ctx,
             send_text=self.send_text,
-            track_task=self.plugin._track_task,
+            start_task=self.plugin._background_tasks.start,
             log_prefix=self.log_prefix,
         )
         self._last_send_timestamp: float | None = None
@@ -820,7 +820,7 @@ class NaiInvocation(ModelConfigMixin):
             return image_manager.update_image_description(record)
 
         try:
-            updated = await asyncio.to_thread(_mark_processed)
+            updated = await self.plugin._blocking_io.run(_mark_processed)
         except Exception as exc:
             logger.warning("%s 跳过识图回写失败: hash=%s error=%r", self.log_prefix, image_hash[:12], exc)
             return

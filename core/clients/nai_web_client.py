@@ -79,8 +79,8 @@ class NaiWebClient:
 
     def __init__(self, action_instance):
         self.log_prefix = action_instance.log_prefix
-        self.session: requests.Session = self._create_session(trust_env=True)
-        self.direct_session: requests.Session = self._create_session(trust_env=False)
+        self.session: requests.Session | None = None
+        self.direct_session: requests.Session | None = None
         # 上一次 _parse_response 提取出的 vibe cache 注释（文档 §20.3.1）；
         # generate_image 在 controlnet 路径里读取该字段做缓存落库
         self._last_response_vibe_cache_ids: List[Dict[str, Any]] = []
@@ -88,10 +88,14 @@ class NaiWebClient:
     def close(self) -> None:
         """关闭底层 HTTP Session，供插件热重载时清理资源。"""
         for session in (self.session, self.direct_session):
+            if session is None:
+                continue
             try:
                 session.close()
             except Exception:
                 continue
+        self.session = None
+        self.direct_session = None
 
     # ========== Session 与配置解析 ==========
 
@@ -102,7 +106,12 @@ class NaiWebClient:
         return session
 
     def _get_session(self, trust_env: bool) -> requests.Session:
-        return self.session if trust_env else self.direct_session
+        attribute = "session" if trust_env else "direct_session"
+        session = getattr(self, attribute, None)
+        if session is None:
+            session = self._create_session(trust_env=trust_env)
+            setattr(self, attribute, session)
+        return session
 
     @staticmethod
     def _resolve_proxy_mode(model_config: Dict[str, Any]) -> str:
@@ -1083,16 +1092,32 @@ class NaiWebClient:
     ) -> requests.Response:
         """同步发送 GET 请求；与 POST 路径共享 session 与代理回退策略。"""
         if proxy_mode == "direct":
-            return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
+            return self._get_session(False).get(
+                url=url,
+                headers=headers,
+                timeout=request_timeout,
+            )
         if proxy_mode == "inherit":
-            return self.session.get(url=url, headers=headers, timeout=request_timeout)
+            return self._get_session(True).get(
+                url=url,
+                headers=headers,
+                timeout=request_timeout,
+            )
         try:
-            return self.direct_session.get(url=url, headers=headers, timeout=request_timeout)
+            return self._get_session(False).get(
+                url=url,
+                headers=headers,
+                timeout=request_timeout,
+            )
         except requests.RequestException as exc:
             logger.warning(
                 f"{self.log_prefix} (NewAPI) 直连失败，自动改用环境代理: {exc}"
             )
-            return self.session.get(url=url, headers=headers, timeout=request_timeout)
+            return self._get_session(True).get(
+                url=url,
+                headers=headers,
+                timeout=request_timeout,
+            )
 
     def _parse_models_response(self, response: requests.Response) -> Tuple[bool, List[str] | str]:
         """解析 /v1/models 响应；返回字符串数组或失败原因。"""

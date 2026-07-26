@@ -34,6 +34,32 @@ sys.modules["src.common.logger"] = dummy_logger_module
 from plugins.nai_draw_plugin.core.clients.nai_web_client import NaiWebClient
 
 
+def test_http_sessions_are_created_lazily_and_closed_when_initialized(monkeypatch) -> None:
+    created: list[tuple[bool, _RecordingSession]] = []
+
+    def create_session(trust_env: bool) -> _RecordingSession:
+        session = _RecordingSession()
+        session.close_calls = 0
+        session.close = lambda: setattr(session, "close_calls", session.close_calls + 1)
+        created.append((trust_env, session))
+        return session
+
+    monkeypatch.setattr(NaiWebClient, "_create_session", staticmethod(create_session))
+    client = NaiWebClient(types.SimpleNamespace(log_prefix="test"))
+
+    assert created == []
+    assert client._get_session(False) is created[0][1]
+    assert client._get_session(False) is created[0][1]
+    assert client._get_session(True) is created[1][1]
+
+    client.close()
+
+    assert [(trust_env, session.close_calls) for trust_env, session in created] == [
+        (False, 1),
+        (True, 1),
+    ]
+
+
 def test_build_inner_draw_params_uses_integer_array_size_and_omits_random_seed() -> None:
     inner = NaiWebClient._build_inner_draw_params(
         "1girl",

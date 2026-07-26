@@ -3,6 +3,7 @@ import types
 import asyncio
 from pathlib import Path
 from typing import Any
+from weakref import WeakSet
 
 import pytest
 
@@ -92,6 +93,9 @@ llm_service_module.resolve_task_name_from_model_config = (
 sys.modules["src.services.llm_service"] = llm_service_module
 
 from plugins.nai_draw_plugin import plugin as plugin_module
+from plugins.nai_draw_plugin.core.services.background_task_supervisor import (
+    BackgroundTaskSupervisor,
+)
 from plugins.nai_draw_plugin.plugin import NaiPicPlugin
 
 
@@ -192,36 +196,50 @@ class _DummySend:
         return True
 
 
+class _FailingSend(_DummySend):
+    async def text(self, text: str, stream_id: str, storage_message: bool = True) -> bool:
+        raise RuntimeError("ack failed")
+
+
+class _RejectedSend(_DummySend):
+    async def text(self, text: str, stream_id: str, storage_message: bool = True) -> bool:
+        self.text_calls.append((text, stream_id, storage_message))
+        return False
+
+
 class _DummyInvocation:
+    def __init__(self) -> None:
+        self.draw_calls: list[str] = []
+        self.nai0_calls: list[str] = []
+        self.close_calls = 0
+
     async def ensure_generation_permission(self) -> bool:
         return True
 
     async def handle_nai_draw(self, description: str) -> tuple[bool, str | None, bool]:
+        self.draw_calls.append(description)
         return True, description, True
 
     async def handle_nai0_draw(self, tags: str) -> tuple[bool, str | None, bool]:
+        self.nai0_calls.append(tags)
         return True, tags, True
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
 
     invocation = _DummyInvocation()
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
         return invocation
 
-    started_coroutines: list[object] = []
-
-    def fake_run_invocation_in_background(coroutine: object) -> None:
-        started_coroutines.append(coroutine)
-        close = getattr(coroutine, "close", None)
-        if callable(close):
-            close()
-
     monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
-    monkeypatch.setattr(plugin, "_run_invocation_in_background", fake_run_invocation_in_background)
 
     async def _run() -> tuple[tuple[bool, str | None, bool], tuple[bool, str | None, bool]]:
         first = await plugin.handle_nai_draw(
@@ -232,13 +250,16 @@ def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: py
             stream_id="stream-1",
             matched_groups={"description": "初音未来"},
         )
+        await asyncio.sleep(0)
+        await plugin._background_tasks.shutdown()
         return first, second
 
     first, second = asyncio.run(_run())
 
     assert first == (True, "已开始生成图片", True)
     assert second == (True, "已开始生成图片", True)
-    assert len(started_coroutines) == 2
+    assert invocation.draw_calls == ["初音未来", "初音未来"]
+    assert invocation.close_calls == 2
     assert plugin.ctx.send.text_calls == [
         ("收到，正在生成图片，请稍候...", "stream-1", False),
         ("收到，正在生成图片，请稍候...", "stream-1", False),
@@ -248,22 +269,15 @@ def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: py
 def test_handle_nai0_draw_allows_multiple_commands_in_same_stream(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
 
     invocation = _DummyInvocation()
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
         return invocation
 
-    started_coroutines: list[object] = []
-
-    def fake_run_invocation_in_background(coroutine: object) -> None:
-        started_coroutines.append(coroutine)
-        close = getattr(coroutine, "close", None)
-        if callable(close):
-            close()
-
     monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
-    monkeypatch.setattr(plugin, "_run_invocation_in_background", fake_run_invocation_in_background)
 
     async def _run() -> tuple[tuple[bool, str | None, bool], tuple[bool, str | None, bool]]:
         first = await plugin.handle_nai_0_draw(
@@ -274,13 +288,16 @@ def test_handle_nai0_draw_allows_multiple_commands_in_same_stream(monkeypatch: p
             stream_id="stream-2",
             matched_groups={"tags": "1girl, hatsune miku"},
         )
+        await asyncio.sleep(0)
+        await plugin._background_tasks.shutdown()
         return first, second
 
     first, second = asyncio.run(_run())
 
     assert first == (True, "已开始生成图片", True)
     assert second == (True, "已开始生成图片", True)
-    assert len(started_coroutines) == 2
+    assert invocation.nai0_calls == ["1girl, hatsune miku", "1girl, hatsune miku"]
+    assert invocation.close_calls == 2
     assert plugin.ctx.send.text_calls == [
         ("收到，正在生成图片，请稍候...", "stream-2", False),
         ("收到，正在生成图片，请稍候...", "stream-2", False),
@@ -289,7 +306,7 @@ def test_handle_nai0_draw_allows_multiple_commands_in_same_stream(monkeypatch: p
 
 def test_start_image_generation_in_background_still_blocks_duplicate_action_stream() -> None:
     plugin = object.__new__(NaiPicPlugin)
-    plugin._tasks = set()
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     stream_id = "stream-action-guard"
     session_state = plugin_module.session_state
     session_state.clear_pending_image_generation(stream_id)
@@ -314,4 +331,177 @@ def test_start_image_generation_in_background_still_blocks_duplicate_action_stre
 
     assert first is True
     assert second is False
+    assert session_state.get_pending_image_generation_started_at(stream_id) is None
+
+
+def test_duplicate_generation_closes_rejected_invocation_without_starting_it() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+    stream_id = "stream-duplicate-close"
+    session_state = plugin_module.session_state
+    session_state.clear_pending_image_generation(stream_id)
+    first_owner = session_state.acquire_pending_image_generation(stream_id)
+    job_calls = 0
+
+    async def generation() -> None:
+        nonlocal job_calls
+        job_calls += 1
+
+    try:
+        started = plugin._start_image_generation_in_background(
+            stream_id,
+            generation,
+            invocation=invocation,
+        )
+    finally:
+        assert first_owner is not None
+        session_state.release_pending_image_generation(stream_id, first_owner)
+
+    assert started is False
+    assert job_calls == 0
+    assert invocation.close_calls == 1
+
+
+def test_command_background_failure_reports_once_and_closes_invocation() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+
+    async def fail_generation() -> None:
+        raise RuntimeError("unexpected failure")
+
+    async def scenario() -> bool:
+        started = await plugin._start_command_image_generation(
+            "stream-failure",
+            fail_generation,
+            invocation=invocation,
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await plugin._background_tasks.shutdown()
+        return started
+
+    assert asyncio.run(scenario()) is True
+    assert plugin.ctx.send.text_calls == [
+        ("收到，正在生成图片，请稍候...", "stream-failure", False),
+        ("图片生成任务意外中断，请稍后重试。", "stream-failure", False),
+    ]
+    assert invocation.close_calls == 1
+
+
+def test_command_ack_failure_does_not_start_job_and_closes_invocation() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_FailingSend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+    job_calls = 0
+
+    async def generation() -> None:
+        nonlocal job_calls
+        job_calls += 1
+
+    async def scenario() -> None:
+        with pytest.raises(RuntimeError, match="ack failed"):
+            await plugin._start_command_image_generation(
+                "stream-ack-failure",
+                generation,
+                invocation=invocation,
+            )
+
+    asyncio.run(scenario())
+
+    assert job_calls == 0
+    assert invocation.close_calls == 1
+
+
+def test_command_rejected_ack_does_not_start_job_and_closes_invocation() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_RejectedSend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+    job_calls = 0
+
+    async def generation() -> None:
+        nonlocal job_calls
+        job_calls += 1
+
+    started = asyncio.run(
+        plugin._start_command_image_generation(
+            "stream-ack-rejected",
+            generation,
+            invocation=invocation,
+        )
+    )
+
+    assert started is False
+    assert job_calls == 0
+    assert invocation.close_calls == 1
+
+
+def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
+    plugin._active_invocations = WeakSet()
+    plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
+    monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
+    invocation = _DummyInvocation()
+    plugin._active_invocations.add(invocation)
+    stream_id = "stream-unload"
+    session_state = plugin_module.session_state
+    session_state.clear_pending_image_generation(stream_id)
+    started = asyncio.Event()
+
+    async def generation() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    async def scenario() -> None:
+        assert plugin._start_image_generation_in_background(
+            stream_id,
+            generation,
+            invocation=invocation,
+        ) is True
+        await started.wait()
+        await plugin.on_unload()
+
+    asyncio.run(scenario())
+
+    assert session_state.get_pending_image_generation_started_at(stream_id) is None
+    assert invocation.close_calls == 1
+
+
+def test_closing_supervisor_rejects_generation_and_releases_acquired_lease() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+    stream_id = "stream-closing"
+    session_state = plugin_module.session_state
+    session_state.clear_pending_image_generation(stream_id)
+    job_calls = 0
+
+    async def generation() -> None:
+        nonlocal job_calls
+        job_calls += 1
+
+    async def scenario() -> bool:
+        await plugin._background_tasks.shutdown()
+        return plugin._start_image_generation_in_background(
+            stream_id,
+            generation,
+            invocation=invocation,
+        )
+
+    assert asyncio.run(scenario()) is False
+    assert job_calls == 0
+    assert invocation.close_calls == 1
     assert session_state.get_pending_image_generation_started_at(stream_id) is None

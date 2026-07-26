@@ -48,7 +48,7 @@ class RecallWorkflow:
         stream_id: str,
         context: Any,
         send_text: Callable[..., Awaitable[bool]],
-        track_task: Callable[[asyncio.Task[Any]], None],
+        start_task: Callable[..., asyncio.Task[Any] | None],
         log_prefix: str,
         db_path: str | Path = _DEFAULT_DB_PATH,
         napcat_config_path: str | Path = _DEFAULT_NAPCAT_CONFIG_PATH,
@@ -59,7 +59,7 @@ class RecallWorkflow:
         self._stream_id = str(stream_id or "")
         self._context = context
         self._send_text = send_text
-        self._track_task = track_task
+        self._start_task = start_task
         self._log_prefix = str(log_prefix or "nai_draw_plugin")
         self._db_path = Path(db_path)
         self._napcat_config_path = Path(napcat_config_path)
@@ -96,7 +96,7 @@ class RecallWorkflow:
             else:
                 logger.warning("%s 自动撤回失败: %s", self._log_prefix, message_id)
 
-        self._track_task(asyncio.create_task(_job()))
+        self._start_task(_job, name="nai-auto-recall")
 
     async def execute_manual_recall(self) -> tuple[bool, str | None, bool]:
         """按新到旧顺序撤回当前会话最近一张仍在平台时限内的插件图片。"""

@@ -1,13 +1,13 @@
 from typing import Any, List
 from weakref import WeakSet
 
-import asyncio
 import inspect
 import os
 import re
 
 from maibot_sdk import Action, Command, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ActivationType, HookMode, HookOrder
+from src.common.logger import get_logger
 
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.plugin_config import PLUGIN_CONFIG
@@ -17,6 +17,8 @@ from .core.rules.reply_auto_draw import (
     score_reply_for_auto_draw,
 )
 from .core.reply_command_text import normalize_reply_command_text
+from .core.services.background_task_supervisor import BackgroundTaskSupervisor
+from .core.services.blocking_io_runner import BlockingIORunner
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -25,6 +27,9 @@ from .runtime_recall import (
     reset_runtime_recall_tracking_state,
 )
 from .sdk_runtime import NaiInvocation
+
+
+logger = get_logger("nai_draw_plugin")
 
 
 def _load_online_retriever_api() -> tuple[Any, Any] | None:
@@ -80,7 +85,8 @@ class NaiPicPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         """初始化插件实例。"""
         super().__init__()
-        self._tasks: set[asyncio.Task[Any]] = set()
+        self._background_tasks = BackgroundTaskSupervisor(logger=logger)
+        self._blocking_io = BlockingIORunner(thread_name_prefix="nai-plugin-io")
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
         # reply 自动跟图：同一 session 在同一 reply 链路里只触发一次，避免 retry 重复出图。
         # key=session_id, value=已触发的 reply 文本哈希集合
@@ -99,16 +105,12 @@ class NaiPicPlugin(MaiBotPlugin):
         try:
             self._regenerate_config_with_comments_if_needed()
         except Exception as exc:  # noqa: BLE001
-            from src.common.logger import get_logger
-            get_logger("nai_draw_plugin").debug(f"config 注释回填失败（已忽略）：{exc!r}")
+            logger.debug(f"config 注释回填失败（已忽略）：{exc!r}")
 
     async def on_unload(self) -> None:
         """处理插件卸载。"""
-        for task in list(self._tasks):
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        await self._background_tasks.shutdown()
+        self._blocking_io.close()
         for invocation in list(self._active_invocations):
             invocation.close()
         reset_runtime_recall_tracking_state()
@@ -224,25 +226,35 @@ class NaiPicPlugin(MaiBotPlugin):
             enabled=wd14_enabled,
         )
 
-    def _track_task(self, task: asyncio.Task[Any]) -> None:
-        """跟踪后台任务，便于插件卸载时统一清理。"""
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+    def _close_invocation(self, invocation: NaiInvocation) -> None:
+        """关闭一次 Invocation 并从卸载兜底集合移除。"""
+        try:
+            invocation.close()
+        finally:
+            self._active_invocations.discard(invocation)
 
     def _run_invocation_in_background(
         self,
-        coroutine: asyncio.Future[Any] | asyncio.Task[Any] | Any,
-    ) -> None:
+        coroutine_factory: Any,
+        *,
+        name: str = "nai-invocation",
+        invocation: NaiInvocation | None = None,
+        on_failure: Any = None,
+    ) -> bool:
         """在后台执行一次耗时调用，避免命令 / 工具 RPC 超时。"""
-
-        async def _runner() -> None:
-            try:
-                await coroutine
-            except Exception:
-                # 具体报错已经在 invocation 内部记录，这里只兜底避免任务未处理异常。
-                return
-
-        self._track_task(asyncio.create_task(_runner()))
+        task = self._background_tasks.start(
+            coroutine_factory,
+            name=name,
+            on_failure=on_failure,
+            finalize=(
+                lambda: self._close_invocation(invocation)
+                if invocation is not None
+                else None
+            ),
+        )
+        if task is None and invocation is not None:
+            self._close_invocation(invocation)
+        return task is not None
 
     @HookHandler(
         "send_service.after_build_message",
@@ -353,6 +365,8 @@ class NaiPicPlugin(MaiBotPlugin):
                 description,
                 reply_context_text=reply_text,
             ),
+            invocation=invocation,
+            name="nai-reply-auto-draw",
         )
 
     @HookHandler(
@@ -426,38 +440,79 @@ class NaiPicPlugin(MaiBotPlugin):
         self,
         stream_id: str,
         coroutine_factory: Any,
+        *,
+        invocation: NaiInvocation | None = None,
+        name: str = "nai-image-generation",
     ) -> bool:
         """在后台启动图片生成任务，并阻止同会话重复启动。"""
         if not stream_id:
-            self._run_invocation_in_background(coroutine_factory())
-            return True
+            return self._run_invocation_in_background(
+                coroutine_factory,
+                name=name,
+                invocation=invocation,
+            )
 
         pending_owner = session_state.acquire_pending_image_generation(stream_id)
         if pending_owner is None:
+            if invocation is not None:
+                self._close_invocation(invocation)
             return False
 
-        async def _runner() -> None:
+        def _finalize() -> None:
             try:
-                await coroutine_factory()
-            except Exception:
-                return
+                if invocation is not None:
+                    self._close_invocation(invocation)
             finally:
                 session_state.release_pending_image_generation(stream_id, pending_owner)
 
-        self._track_task(asyncio.create_task(_runner()))
-        return True
+        task = self._background_tasks.start(
+            coroutine_factory,
+            name=name,
+            finalize=_finalize,
+        )
+        if task is None:
+            _finalize()
+            return False
+        return task is not None
 
     async def _start_command_image_generation(
         self,
         stream_id: str,
         coroutine_factory: Any,
+        *,
+        invocation: NaiInvocation,
     ) -> bool:
         """后台执行显式生图命令，允许同会话内并发处理多个用户请求。"""
-        self._run_invocation_in_background(coroutine_factory())
-
+        if self._background_tasks.is_closing:
+            self._close_invocation(invocation)
+            return False
         if stream_id:
-            await self.ctx.send.text("收到，正在生成图片，请稍候...", stream_id, storage_message=False)
-        return True
+            try:
+                acknowledged = await self.ctx.send.text(
+                    "收到，正在生成图片，请稍候...",
+                    stream_id,
+                    storage_message=False,
+                )
+            except Exception:
+                self._close_invocation(invocation)
+                raise
+            if not acknowledged:
+                self._close_invocation(invocation)
+                return False
+        return self._run_invocation_in_background(
+            coroutine_factory,
+            name="nai-command-generation",
+            invocation=invocation,
+            on_failure=(
+                lambda _exc: self.ctx.send.text(
+                    "图片生成任务意外中断，请稍后重试。",
+                    stream_id,
+                    storage_message=False,
+                )
+                if stream_id
+                else None
+            ),
+        )
 
     async def _run_retag(self, *, stream_id: str, user_id: str) -> tuple[bool, str | None, bool]:
         """执行 `/nai 反推`：取目标图 → 反推 → 把结果发回会话。"""
@@ -700,6 +755,7 @@ class NaiPicPlugin(MaiBotPlugin):
         if not await self._start_command_image_generation(
             stream_id,
             lambda: invocation.handle_nai_draw(description),
+            invocation=invocation,
         ):
             return False, "", True
         return True, "已开始生成图片", True
@@ -734,6 +790,7 @@ class NaiPicPlugin(MaiBotPlugin):
         if not await self._start_command_image_generation(
             stream_id,
             lambda: invocation.handle_nai0_draw(tags),
+            invocation=invocation,
         ):
             return False, "", True
         return True, "已开始生成图片", True
@@ -854,7 +911,10 @@ class NaiPicPlugin(MaiBotPlugin):
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.handle_models_command()
+        try:
+            return await invocation.handle_models_command()
+        finally:
+            self._close_invocation(invocation)
 
     @Command(
         "nai_i2i_command",
@@ -1216,6 +1276,7 @@ class NaiPicPlugin(MaiBotPlugin):
             lambda: invocation.handle_image_to_image_draw(
                 description, image_base64=image_base64, mode=mode
             ),
+            invocation=invocation,
         ):
             return False, "", True
         return True, "已开始生成图片", True
@@ -1260,6 +1321,7 @@ class NaiPicPlugin(MaiBotPlugin):
                 description=description,
                 explicit_names=explicit_names,
             ),
+            invocation=invocation,
         ):
             return False, "", True
         return True, "已开始生成图片", True
@@ -1422,6 +1484,7 @@ class NaiPicPlugin(MaiBotPlugin):
                 explicit_names=explicit_names,
                 raw_prompt=raw_tags,
             ),
+            invocation=invocation,
         ):
             return False, "", True
         return True, "已开始生成图片", True
@@ -1520,15 +1583,22 @@ class NaiPicPlugin(MaiBotPlugin):
             source="action",
         )
         if not await invocation.ensure_user_not_blacklisted():
+            self._close_invocation(invocation)
             return False, "黑名单用户"
 
         # Action Guard 同步预检：让 Planner 第一时间拿到拦截原因，避免后台默默吞掉
         # 评估结果会缓存到 invocation，后台 handle_action 复用同一次结论，不会重复读消息库
         guard_state = await invocation.preflight_action_guard()
         if guard_state is not None and not guard_state["should_generate"]:
+            self._close_invocation(invocation)
             return False, guard_state["detail"]
 
-        if not self._start_image_generation_in_background(stream_id, invocation.handle_action):
+        if not self._start_image_generation_in_background(
+            stream_id,
+            invocation.handle_action,
+            invocation=invocation,
+            name="nai-action-generation",
+        ):
             return False, (
                 "同会话已有图片任务在后台进行中，本轮跳过出图、按文字回复推进；"
                 "请不要调用 send_image 或 wait，正在生成的那张图会自行送达"

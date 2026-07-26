@@ -80,12 +80,18 @@ sys.modules.setdefault("plugins.nai_draw_plugin.core.mixins", mixins_package)
 from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation
 
 
+class _BlockingIO:
+    async def run(self, function):
+        return function()
+
+
 def _build_invocation(source: str) -> NaiInvocation:
     """绕过 __init__ 构造一个只带必要字段的 NaiInvocation。"""
     invocation = object.__new__(NaiInvocation)
     invocation.source = source
     invocation.log_prefix = "test"
     invocation.stream_id = "stream-1"
+    invocation.plugin = types.SimpleNamespace(_blocking_io=_BlockingIO())
     return invocation
 
 
