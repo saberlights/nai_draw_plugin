@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import re
 import time
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -24,9 +23,6 @@ import requests
 from aiohttp import ClientSession, ClientTimeout
 
 from src.common.logger import get_logger
-from src.config.model_configs import TaskConfig
-from src.llm_models.utils_model import LLMOrchestrator
-from src.services import llm_service
 
 from .runtime_recall import (
     MANUAL_RECALL_TTL_SECONDS,
@@ -48,19 +44,17 @@ from .runtime_recall import (
 from .core.clients.nai_web_client import NaiWebClient
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.mixins.model_config_mixin import ModelConfigMixin
-from .core.rules.prompt_rules import PROMPT_GENERATOR_TEMPLATE, SFW_PROMPT_GENERATOR_TEMPLATE
-from .core.tag_retriever_display import build_tag_retriever_display_messages
 from .core.rules.selfie_rules import (
     detect_bot_self_image_intent,
     detect_explicit_image_request,
     detect_negative_image_intent_strength,
     detect_selfie_from_output,
-    get_selfie_hint,
     merge_selfie_prompt,
 )
-from .core.services.prompt_memory import render_previous_prompt_block
+from .core.services.llm_text_generator import MaiBotLLMTextGenerator
+from .core.services.prompt_generation_workflow import PromptGenerationWorkflow
+from .core.services.random_scene_planner import RandomScenePlanner
 from .core.services.session_state import session_state
-from .core.services.tag_candidate_resolver import resolve_tag_candidates
 from .core.services.user_blacklist import user_blacklist
 from .core.services.named_reference_store import (
     CapacityExceededError as _NamedRefCapacityExceededError,
@@ -84,11 +78,6 @@ from .core.utils.image_meta import (
     normalize_image_base64 as _normalize_image_for_payload,
     read_image_dimensions as _read_image_dimensions,
 )
-from .core.utils.prompt_output_parser import (
-    extract_last_code_block,
-    parse_prompt_from_structured_output,
-    resolve_multi_character_payload,
-)
 from .core.utils.prompt_postprocessor import (
     normalize_characters_order,
     normalize_prompt_order,
@@ -99,13 +88,7 @@ from .core.utils.prompt_postprocessor import (
     strip_cjk_and_fullwidth_from_characters,
     user_mentions_appearance,
 )
-from .core.utils.random_scene_description import (
-    ensure_random_scene_character,
-    get_random_scene_similarity_score,
-    is_random_scene_too_similar,
-    normalize_random_scene_narrative,
-    parse_random_scene_request,
-)
+from .core.utils.random_scene_description import parse_random_scene_request
 
 logger = get_logger("nai_draw_plugin")
 _DB_PATH = resolve_db_path(__file__)
@@ -161,25 +144,6 @@ def _load_napcat_server_config() -> dict[str, Any] | None:
         "token": token,
         "action_timeout_sec": action_timeout,
     }
-
-
-class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
-    """仅在 nai_low 自定义模型调用中使用的固定模型调度器。"""
-
-    def __init__(self, task_config: TaskConfig, request_type: str = "") -> None:
-        self._pinned_task_config = task_config
-        super().__init__(task_name="planner", request_type=request_type)
-
-    def _get_task_config_or_raise(self) -> TaskConfig:
-        return self._pinned_task_config
-
-    def _refresh_task_config(self) -> TaskConfig:
-        latest = self._pinned_task_config
-        if latest is not self.model_for_task:
-            self.model_for_task = latest
-        if list(self.model_usage.keys()) != latest.model_list:
-            self.model_usage = {model: self.model_usage.get(model, (0, 0, 0)) for model in latest.model_list}
-        return self.model_for_task
 
 
 async def _find_last_plugin_image_row(
@@ -382,46 +346,6 @@ def _inject_self_image_hint(description: str, *, mode: str) -> str:
     return f"{hint} {desc}"
 
 
-def _render_reply_context_block(reply_context_text: str) -> str:
-    """渲染 reply 后置跟图专用的"bot 即将说出的回复原文"语境块。
-
-    Reply hook 链路里，description 是关键词拼接（"一女 自拍 近景 窗边"），LLM 看不到 bot
-    实际要说的那句话。这个块把原文塞回 prompt，让 LLM 基于具体语境补全画面细节（衣着/光照/
-    姿态），避免图与文脱节。其他链路（command / Planner Action）调用方传空字符串即可。
-    """
-    text = (reply_context_text or "").strip()
-    if not text:
-        return ""
-    return (
-        "<bot_reply_context>\n"
-        "（这是 bot 本人这一轮即将说出去的回复原文。请基于这段语境扩展画面细节"
-        "——衣着、姿态、光照、室内陈设等——让生成的图与文匹配，"
-        "而不是仅看 user_request 的关键词。）\n"
-        f"{text}\n"
-        "</bot_reply_context>"
-    )
-
-
-def _render_reasoning_context_block(reasoning_context_text: str) -> str:
-    """渲染 Planner Action 链路专用的"Planner reasoning"语境块。
-
-    Action 链路里，``description`` / 5 个结构化字段都是 Planner 关键词化的二手语义；
-    reasoning 才是原始动机和动词/情绪/关系。把 reasoning 塞回模板，让下游 LLM 在
-    user_request 失真时能回到原意，避免动作被软化、情绪被默认套模板。
-    其他入口（command / reply 自动跟图）传空字符串即可。
-    """
-    text = (reasoning_context_text or "").strip()
-    if not text:
-        return ""
-    return (
-        "<planner_reasoning>\n"
-        "（Planner 本轮 reasoning。与 user_request 冲突时以本块为准："
-        "动词保持原意，情绪贴 reasoning，不要默认套'迷离/陶醉'。）\n"
-        f"{text}\n"
-        "</planner_reasoning>"
-    )
-
-
 def _extract_message_sender_id(message: Any) -> str:
     """从消息行（dict 或对象）中提取发送者 user_id。"""
     if isinstance(message, dict):
@@ -495,11 +419,6 @@ def _resolve_bot_account(platform: str) -> str:
 class NaiInvocation(ModelConfigMixin):
     """一次命令或 Action 调用的上下文封装。"""
 
-    _recent_random_scenes: list[str] = []
-    _max_recent_scenes = 5
-    _max_random_scene_attempts = 4
-    _random_scene_repeat_threshold = 0.6
-
     def __init__(
         self,
         plugin: Any,
@@ -527,6 +446,21 @@ class NaiInvocation(ModelConfigMixin):
         self.source = source
         self.log_prefix = "nai_draw_plugin"
         self.api_client = NaiWebClient(self)
+        text_generator = MaiBotLLMTextGenerator(self.log_prefix)
+        self._prompt_generation_workflow = PromptGenerationWorkflow(
+            config=self.plugin_config,
+            stream_id=self.stream_id,
+            text_generator=text_generator,
+            send_text=self.send_text,
+            show_tag_candidates=self._is_tag_retriever_show_enabled(),
+            log_prefix=self.log_prefix,
+        )
+        random_scene_config = self.get_config("random_scene", {})
+        self._random_scene_planner = RandomScenePlanner(
+            config=random_scene_config if isinstance(random_scene_config, dict) else {},
+            text_generator=text_generator,
+            log_prefix=self.log_prefix,
+        )
         self._last_send_timestamp: float | None = None
         # Action Guard 评估缓存：主路径同步预检后，后台 handle_action 复用结果，避免重复读消息库
         self._cached_action_trigger_assessment: dict[str, Any] | None = None
@@ -1480,191 +1414,6 @@ class NaiInvocation(ModelConfigMixin):
 
         return description
 
-    def _get_prompt_generator_config(self) -> dict[str, Any]:
-        """返回提示词生成配置。"""
-        config = self.get_config("prompt_generator", {})
-        return config if isinstance(config, dict) else {}
-
-    def _get_random_scene_config(self) -> dict[str, Any]:
-        """返回随机场景配置。"""
-        config = self.get_config("random_scene", {})
-        return config if isinstance(config, dict) else {}
-
-    def _resolve_task_name(self, preferred_name: str) -> str | None:
-        """解析当前可用的任务名。"""
-        models = llm_service.get_available_models()
-        if not models:
-            return None
-
-        for candidate in [preferred_name, "planner", "replyer"]:
-            normalized = str(candidate or "").strip()
-            if normalized and normalized in models:
-                return normalized
-
-        return next(iter(models.keys()), None)
-
-    async def _request_llm_text(
-        self,
-        prompt: str,
-        *,
-        request_type: str,
-        generator_config: dict[str, Any],
-        default_model_name: str,
-        default_temperature: float,
-        default_max_tokens: int,
-    ) -> str | None:
-        """统一发起文本生成请求。"""
-        custom_model = generator_config.get("custom_model")
-        temperature_raw = generator_config.get("temperature", default_temperature)
-        max_tokens_raw = generator_config.get("max_tokens", default_max_tokens)
-
-        try:
-            temperature = float(temperature_raw)
-        except (TypeError, ValueError):
-            temperature = default_temperature
-
-        try:
-            max_tokens = int(max_tokens_raw)
-        except (TypeError, ValueError):
-            max_tokens = default_max_tokens
-
-        if isinstance(custom_model, dict) and custom_model.get("model_list"):
-            try:
-                model_list = custom_model.get("model_list", [])
-                normalized_model_list = [str(item).strip() for item in (model_list if isinstance(model_list, list) else [model_list])]
-                normalized_model_list = [item for item in normalized_model_list if item]
-                if normalized_model_list:
-                    pinned_task = TaskConfig(
-                        model_list=normalized_model_list,
-                        max_tokens=int(custom_model.get("max_tokens", max_tokens) or max_tokens),
-                        temperature=float(custom_model.get("temperature", temperature) or temperature),
-                        slow_threshold=float(custom_model.get("slow_threshold", 30.0) or 30.0),
-                        selection_strategy="random",
-                    )
-                    orchestrator = _PinnedTaskLLMOrchestrator(pinned_task, request_type=request_type)
-                    result = await orchestrator.generate_response_async(
-                        prompt=prompt,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
-                    response_text = (result.response or "").strip()
-                    if response_text:
-                        return response_text
-                    logger.warning("%s 自定义提示词模型返回空响应，回退到宿主任务模型", self.log_prefix)
-            except Exception as exc:
-                logger.warning(
-                    "%s 自定义提示词模型调用失败，回退到宿主任务模型: %s",
-                    self.log_prefix,
-                    exc,
-                )
-
-        task_name = self._resolve_task_name(str(generator_config.get("model_name", "") or default_model_name))
-        if not task_name:
-            return None
-
-        result = await llm_service.generate(
-            llm_service.LLMServiceRequest(
-                task_name=task_name,
-                request_type=request_type,
-                prompt=prompt,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        )
-        if not result.success or not result.completion.response:
-            return None
-        return result.completion.response.strip()
-
-    def _render_generator_prompt(
-        self,
-        template: str,
-        request_text: str,
-        *,
-        include_custom_system_prompt: bool = True,
-        previous_prompt: str = "",
-        previous_request: str = "",
-        last_selfie_prompt: str = "",
-        last_selfie_request: str = "",
-        last_selfie_scene: str = "",
-        last_selfie_anchor: Optional[dict[str, list[str]]] = None,
-        reply_context_text: str = "",
-        reasoning_context_text: str = "",
-    ) -> str:
-        """渲染提示词生成模板。"""
-        custom_system_prompt = ""
-        if include_custom_system_prompt:
-            custom_system_prompt = str(self.get_config("custom_prompt.system_prompt", "") or "").strip()
-        if custom_system_prompt:
-            custom_system_prompt = custom_system_prompt + "\n\n"
-
-        previous_block = render_previous_prompt_block(previous_prompt, previous_request)
-        selfie_scene_context = self._build_selfie_scene_context(
-            request_text,
-            last_selfie_prompt=last_selfie_prompt,
-            last_selfie_request=last_selfie_request,
-            last_selfie_scene=last_selfie_scene,
-            last_selfie_anchor=last_selfie_anchor,
-        )
-        reply_context_block = _render_reply_context_block(reply_context_text)
-        reasoning_context_block = _render_reasoning_context_block(reasoning_context_text)
-        prompt = template.replace("<<CUSTOM_SYSTEM_PROMPT>>", custom_system_prompt).strip()
-        prompt = prompt.replace("<<PREVIOUS_PROMPT>>", previous_block).strip()
-        prompt = prompt.replace("<<REPLY_CONTEXT>>", reply_context_block).strip()
-        prompt = prompt.replace("<<REASONING_CONTEXT>>", reasoning_context_block).strip()
-        prompt = prompt.replace("<<CURRENT_TIME_CONTEXT>>", self._build_current_time_context()).strip()
-        prompt = prompt.replace("<<SELFIE_HINT>>", get_selfie_hint()).strip()
-        prompt = prompt.replace("<<SELFIE_SCENE_CONTEXT>>", selfie_scene_context).strip()
-        prompt = prompt.replace("<<USER_REQUEST>>", request_text.strip() or "N/A")
-        return prompt
-
-    async def _retrieve_tag_candidates(self, request_text: str) -> str:
-        """执行 Danbooru tag 检索增强。"""
-        retriever_config = self.get_config("tag_retriever", {}) or {}
-        return await resolve_tag_candidates(
-            retriever_config,
-            request_text,
-            log_prefix=self.log_prefix,
-        )
-
-    async def _send_tag_retriever_display(self, tag_candidates: str) -> None:
-        """尽力回显 Danbooru 检索结果；平台拒绝长文本时自动缩小分段重试。"""
-        retriever_config = self.get_config("tag_retriever", {}) or {}
-        retriever_mode = "online"
-        if isinstance(retriever_config, dict):
-            retriever_mode = str(retriever_config.get("mode", "online") or "online").strip().lower() or "online"
-
-        if not isinstance(tag_candidates, str) or not tag_candidates.strip():
-            tag_candidates = (
-                "<tag_candidates>\n"
-                f"⚠️ 未检索到候选标签（mode={retriever_mode}）\n"
-                "</tag_candidates>"
-            )
-
-        for max_chars in (180, 120, 90, 72):
-            display_messages = build_tag_retriever_display_messages(
-                tag_candidates,
-                max_chars=max_chars,
-            )
-            if not display_messages:
-                return
-
-            send_failed = False
-            for display_message in display_messages:
-                if await self.send_text(display_message, storage_message=False):
-                    continue
-                logger.warning(
-                    "%s Danbooru 检索结果回显发送失败，尝试缩小分段重试: max_chars=%s",
-                    self.log_prefix,
-                    max_chars,
-                )
-                send_failed = True
-                break
-
-            if not send_failed:
-                return
-
-        logger.warning("%s Danbooru 检索结果回显发送失败，已放弃回显", self.log_prefix)
-
     async def _generate_prompt_with_llm(
         self,
         request_text: str,
@@ -1674,100 +1423,16 @@ class NaiInvocation(ModelConfigMixin):
         reply_context_text: str = "",
         reasoning_context_text: str = "",
     ) -> Optional[tuple[str, Optional[dict[str, Any]]]]:
-        """将自然语言描述转换为提示词。
-
-        Returns:
-            ``(text, structured)`` 二元组；``text`` 为拍平后的字符串（含 ``char1:/char2:`` 前缀，
-            用于显示与字符串路径），``structured`` 在 v3 multi JSON 且 ≥2 人时为
-            ``{"global_text", "characters", "has_coords"}``，否则为 ``None``。整体失败返回 ``None``。
-
-        ``reply_context_text`` 仅在 reply 后置自动跟图链路传入，作为 bot 即将说出的回复
-        原文喂给 LLM；``reasoning_context_text`` 仅在 Planner Action 链路传入，作为本轮
-        出图的原始动机/动词/情绪语义喂给 LLM。其他入口传空字符串即可，渲染时占位符会被
-        消解为空。
-        """
-        request_text = str(request_text or "").strip()
-        if not request_text:
-            return None
-
-        generator_config = self._get_prompt_generator_config()
-        output_format = str(generator_config.get("output_format", "json") or "json").strip().lower()
-        nsfw_enabled = session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config)
-
-        if output_format == "json":
-            from .core.rules.prompt_rules import PROMPT_GENERATOR_JSON_TEMPLATE, SFW_PROMPT_GENERATOR_JSON_TEMPLATE
-
-            default_template = SFW_PROMPT_GENERATOR_JSON_TEMPLATE if nsfw_enabled else PROMPT_GENERATOR_JSON_TEMPLATE
-        else:
-            default_template = SFW_PROMPT_GENERATOR_TEMPLATE if nsfw_enabled else PROMPT_GENERATOR_TEMPLATE
-
-        previous_prompt = ""
-        previous_request = ""
-        last_selfie_prompt = ""
-        last_selfie_request = ""
-        last_selfie_scene = ""
-        last_selfie_anchor: dict[str, list[str]] = {}
-        if allow_inherit and self.stream_id:
-            inherit_ttl_raw = self.get_config("prompt_generator.inherit_ttl", 0)
-            try:
-                inherit_ttl = float(inherit_ttl_raw or 0)
-            except (TypeError, ValueError):
-                inherit_ttl = 0.0
-            previous_prompt, previous_request = session_state.get_last_nai_context(self.stream_id, ttl=inherit_ttl)
-            (
-                last_selfie_prompt,
-                last_selfie_request,
-                last_selfie_scene,
-                last_selfie_anchor,
-            ) = session_state.get_last_selfie_context(self.stream_id, ttl=inherit_ttl)
-            previous_prompt = previous_prompt or ""
-            previous_request = previous_request or ""
-
-        prompt_template = str(generator_config.get("prompt_template") or default_template)
-        # 仅在 NSFW 模板（即未开启 NSFW 过滤）路径下注入 custom_prompt.system_prompt；
-        # SFW 模板要保持安全输出，不能被破限词颠覆
-        effective_include_custom_system_prompt = include_custom_system_prompt and not nsfw_enabled
-        prompt = self._render_generator_prompt(
-            prompt_template,
+        result = await self._prompt_generation_workflow.generate(
             request_text,
-            include_custom_system_prompt=effective_include_custom_system_prompt,
-            previous_prompt=previous_prompt if allow_inherit else "",
-            previous_request=previous_request if allow_inherit else "",
-            last_selfie_prompt=last_selfie_prompt if allow_inherit else "",
-            last_selfie_request=last_selfie_request if allow_inherit else "",
-            last_selfie_scene=last_selfie_scene if allow_inherit else "",
-            last_selfie_anchor=last_selfie_anchor if allow_inherit else None,
+            allow_inherit=allow_inherit,
+            include_custom_system_prompt=include_custom_system_prompt,
             reply_context_text=reply_context_text,
             reasoning_context_text=reasoning_context_text,
         )
-        tag_candidates = await self._retrieve_tag_candidates(request_text)
-        if self._is_tag_retriever_show_enabled():
-            await self._send_tag_retriever_display(tag_candidates)
-        prompt = prompt.replace("<<TAG_CANDIDATES>>", tag_candidates).strip()
-
-        response = await self._request_llm_text(
-            prompt,
-            request_type="nai_draw_plugin.prompt_generator",
-            generator_config=generator_config,
-            default_model_name="planner",
-            default_temperature=0.2,
-            default_max_tokens=200,
-        )
-        if not response:
+        if result is None:
             return None
-
-        cleaned_prompt = self._cleanup_llm_prompt(response)
-        if not cleaned_prompt:
-            return None
-
-        # 同时尝试抽出 v3 multi 结构化 payload，供 NewAPI characters[] 通道使用
-        # 先走 JSON 抽取，失败时从拍平的 char1:/char2: 文本反解，保证只要 LLM 判定多人就进结构化通道
-        structured_payload = resolve_multi_character_payload(response, cleaned_prompt)
-
-        if allow_inherit and self.stream_id:
-            session_state.set_last_nai_context(self.stream_id, cleaned_prompt, request_text)
-
-        return cleaned_prompt, structured_payload
+        return result.text, result.structured
 
     async def _generate_random_description(
         self,
@@ -1775,264 +1440,10 @@ class NaiInvocation(ModelConfigMixin):
         selfie: bool = False,
         character: str = "",
     ) -> str | None:
-        """生成开放题材的随机场景描述，并保留可选角色锚点。"""
-        random_config = self._get_random_scene_config()
-        character = str(character or "").strip()
-
-        best_candidate: str | None = None
-        best_score: float | None = None
-        rejected_candidates: list[str] = []
-
-        for _attempt in range(self._max_random_scene_attempts):
-            prompt = self._build_random_scene_prompt(
-                selfie=selfie,
-                character=character,
-                rejected_candidates=rejected_candidates,
-            )
-            response = await self._request_llm_text(
-                prompt,
-                request_type="nai_draw_plugin.random_scene",
-                generator_config=random_config,
-                default_model_name="planner",
-                default_temperature=1.2,
-                default_max_tokens=240,
-            )
-            if not response:
-                continue
-
-            lines = [line.strip() for line in response.splitlines() if line.strip()]
-            if not lines:
-                continue
-
-            normalized_candidate = normalize_random_scene_narrative(lines[0])
-            if not normalized_candidate:
-                continue
-            candidate = ensure_random_scene_character(normalized_candidate, character)
-            score = get_random_scene_similarity_score(candidate, self._recent_random_scenes)
-            if not is_random_scene_too_similar(
-                candidate,
-                self._recent_random_scenes,
-                threshold=self._random_scene_repeat_threshold,
-            ):
-                self._remember_random_scene(candidate)
-                return candidate
-
-            rejected_candidates.append(candidate)
-            if best_score is None or score < best_score:
-                best_candidate = candidate
-                best_score = score
-            logger.info("%s 随机场景过于相似，重试中: %.2f %s", self.log_prefix, score, candidate)
-
-        if best_candidate:
-            self._remember_random_scene(best_candidate)
-        return best_candidate
-
-    def _build_random_scene_prompt(
-        self,
-        *,
-        selfie: bool = False,
-        character: str = "",
-        rejected_candidates: Optional[list[str]] = None,
-    ) -> str:
-        """构造不受封闭题材池限制的随机场景提示。"""
-        character = str(character or "").strip()
-        character_instruction = ""
-        if character:
-            character_literal = json.dumps(character, ensure_ascii=False)
-            character_instruction = (
-                "\n\n指定角色锚点（必须原样保留）：\n"
-                f"- 自然语言描述必须包含字面角色名 {character_literal}，不得替换成泛称或其它角色\n"
-                "- 以该角色为画面主体；可以按随机结果增加其它成年配角\n"
-            )
-
-        selfie_extra = ""
-        if selfie:
-            selfie_extra = (
-                "\n\n额外要求（自拍模式）：\n"
-                "- 必须明确是手持相机、手机自拍、镜子自拍或其它可视化自拍方式\n"
-                "- 自拍内容仍然是明确成人向色图，不要退化成普通写真\n"
-                "- 自拍只是镜头形式，不限制其它题材和成人行为"
-            )
-
-        prompt = (
-            "你是二次元成人向生图的开放式随机场景设计器。\n"
-            "目标是生成一张明确的 NSFW 色图场景，而不是普通插画或安全写真。\n"
-            f"本轮随机熵（只用于内部抽签，不要输出）：{uuid4().hex}\n\n"
-            "随机规则：\n"
-            "- 不要从固定清单或少数安全模板中轮换；题材空间开放，可以选择常见、冷门、跨题材、"
-            "超现实或新奇的成人设定，并主动发明没有见过的组合。\n"
-            "- 独立决定人物构成与关系、成人行为/癖好、服装与身体状态、姿势互动、镜头构图、"
-            "地点与时代、道具、光线和情绪；每次至少改变其中 4 个维度。\n"
-            "- 不要因为‘随机’就总是单人、卧室、站立、自拍或同一种体位；最近结果中出现过的"
-            "题材、地点、镜头和动作都要主动避开。\n"
-            "- 所有参与者必须明确是成年人（18+）且自愿，不生成未成年人色情。\n\n"
-            "开放灵感（仅为非穷举示例，绝不是白名单）：可以探索性交/插入、口交/乳交/后入等"
-            "不同体位，多人或复杂关系，拘束/支配、触手/异种、医疗/实验、露出/公共场所、制服/"
-            "角色扮演，以及任何你能构思的其它成人题材；不要把随机结果限制在这些例子里。\n\n"
-            "创作流程（不要输出思考过程）：\n"
-            "- 先在内部完成一份导演式画面设计，再整理成简洁连贯的自然语言；情色主轴必须清晰，至少出现明确成人行为、"
-            "身体接触、裸露状态或性兴奋状态，不能只写暧昧、泳装、漂亮或普通写真。\n"
-            "- 角色当下状态要具体：表情、视线、呼吸/汗/脸红等身体反应、姿态重心、手脚位置、头发和"
-            "肌肤状态，以及角色之间正在发生的互动。\n"
-            "- 服饰状态要具体：服装款式、材质、颜色、层次和穿着变化（例如扣子解开、肩带滑落、半穿、"
-            "内衣、袜子、鞋）；服饰类型要主动变化，不要固定成校服或单一裸身模板。示例不是白名单。\n"
-            "- 加入 1-3 个与动作和地点有关系的配饰/道具，例如首饰、项圈、眼镜、发饰、手套、丝袜、"
-            "家具、镜子、手机或成人用品；要说明它们在画面中的作用，而不是孤立罗列名词。\n"
-            "- 认真设计构图：明确视觉焦点和主体位置，安排前景、中景、背景，交代景别、留白、裁切、"
-            "透视和动作线，让画面有层次、平衡、可读性，不要把人物和道具堆在画面中央。\n"
-            "- 明确视角与镜头：第一人称/旁观/自拍/镜面/俯视/低角度/侧后方等视角，配合近景/中景/"
-            "全身、镜头角度、透视和焦段感；镜头形式也要随机变化。\n"
-            "- 描述完整环境：地点、时间、天气、光源、色调、空气和氛围，让角色状态、服饰和场景彼此"
-            "呼应；发挥想象力，创造新奇但合理的成人画面组合。\n\n"
-            "输出格式：\n"
-            "- 只输出 1 行自然语言，由 1-2 个完整中文句子组成；不要解释、编号、Markdown 或思考过程。\n"
-            "- 不要输出标签清单或用空格堆砌词条；使用正常中文语序和标点，把人物之间的关系与动作写清楚。\n"
-            "- 描述必须包含具体可视化细节，覆盖角色/人数、情色行为与状态、服饰与配饰、姿势互动、"
-            "场景、构图视角和光线氛围，供后续在线检索和 Danbooru tag 生成使用。\n"
-            "- 例子只是帮助理解维度，不是白名单；不要把输出限制在例子范围内。"
-            f"{character_instruction}{selfie_extra}"
+        return await self._random_scene_planner.generate(
+            selfie=selfie,
+            character=character,
         )
-
-        if self._recent_random_scenes:
-            prompt += "\n\n以下是最近已生成过的内容，禁止与它们重复或相似：\n"
-            prompt += "\n".join(self._recent_random_scenes)
-
-        if rejected_candidates:
-            prompt += "\n\n以下候选刚刚被判定为过于相似，禁止继续沿着这些方向小修小补：\n"
-            prompt += "\n".join(rejected_candidates)
-
-        return prompt
-
-    @classmethod
-    def _remember_random_scene(cls, result: str) -> None:
-        """记录最近的随机场景。"""
-        if not result:
-            return
-        cls._recent_random_scenes.append(result)
-        if len(cls._recent_random_scenes) > cls._max_recent_scenes:
-            cls._recent_random_scenes.pop(0)
-
-    def _build_current_time_context(self) -> str:
-        """构造当前时间上下文。"""
-        now = datetime.now()
-        hour = now.hour
-        if 5 <= hour < 8:
-            period = "清晨"
-        elif 8 <= hour < 11:
-            period = "上午"
-        elif 11 <= hour < 14:
-            period = "中午"
-        elif 14 <= hour < 17:
-            period = "下午"
-        elif 17 <= hour < 19:
-            period = "傍晚"
-        elif 19 <= hour < 23:
-            period = "夜晚"
-        else:
-            period = "深夜"
-        return (
-            "<current_time_context>\n"
-            f"当前本地时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（{period}）。\n"
-            "仅在用户未明确指定时，用于补全时间、光线和背景氛围。\n"
-            "</current_time_context>"
-        )
-
-    def _build_selfie_scene_context(
-        self,
-        request_text: str,
-        *,
-        last_selfie_prompt: str = "",
-        last_selfie_request: str = "",
-        last_selfie_scene: str = "",
-        last_selfie_anchor: Optional[dict[str, list[str]]] = None,
-    ) -> str:
-        """为 Action 的自拍/展示照连续发图构建 LLM 上下文。"""
-        current_request = str(request_text or "").strip()
-        previous_prompt = str(last_selfie_prompt or "").strip()
-        if not self._is_likely_selfie_request(current_request, previous_prompt):
-            return ""
-
-        lines = [
-            "<selfie_scene_context>",
-            "这轮请求很可能属于 bot 本人自拍/展示照 的连续发图。",
-            "若用户没有明确要求切换场景、换穿搭或改光线，默认延续上一轮的背景、穿搭、时间氛围与构图重点。",
-            "服装连续性要尽量真实：若用户没有明确要求换衣服、换颜色、换材质、换风格，默认延续上一轮服装款式、主色、材质、袜子和鞋子的视觉设定，不要突然从白衣变黑衣，或从针织变皮衣。",
-            "如果用户明确指定了本轮想看的重点（如黑丝、鞋子、腿部、全身穿搭、背景），优先保留该重点，并选择能看清它的构图。",
-        ]
-        if last_selfie_request:
-            lines.append(f"上一轮用户请求：{last_selfie_request.strip()}")
-        if previous_prompt:
-            lines.append(f"上一轮自拍提示词：{previous_prompt}")
-        lines.append("</selfie_scene_context>")
-        return "\n".join(lines)
-
-    def _is_likely_selfie_request(self, request_text: str, last_selfie_prompt: str = "") -> bool:
-        """判断当前请求是否属于自拍/肖像/展示照连续请求。
-
-        用于决定是否给 LLM 注入"自拍连续场景"上下文，并不影响 Action 是否触发。
-        """
-        text = str(request_text or "").strip()
-        if not text:
-            return False
-
-        # 强信号：含画图/自拍/肖像/想看 bot/追图等关键词，统一走 selfie_rules
-        if detect_explicit_image_request(text):
-            return True
-
-        # 隐式追图：仅在上一轮已是自拍/肖像时，识别少量未在显式关键词里的延续表达
-        if last_selfie_prompt and detect_selfie_from_output(last_selfie_prompt):
-            continuation_patterns = [
-                r"继续", r"还是.*", r"来点不一样", r"换成.+", r"改成.+",
-                r"换地方", r"同一个场景", r"同样背景",
-            ]
-            return any(re.search(pattern, text) for pattern in continuation_patterns)
-
-        return False
-
-    def _extract_selfie_anchor_data(self, prompt: str) -> dict[str, list[str]]:
-        """自拍连续性不再使用结构化锚点，统一交给 LLM 自行判断。"""
-        return {}
-
-    def _format_selfie_anchor_summary(self, anchor_data: dict[str, list[str]]) -> str:
-        """自拍连续性不再输出锚点摘要。"""
-        return ""
-
-    def _normalize_prompt_tags(self, prompt: str) -> list[str]:
-        """将提示词切分并清洗为可分析标签。"""
-        raw_tags = [segment.strip() for segment in prompt.replace("\n", ",").split(",") if segment.strip()]
-        normalized_tags: list[str] = []
-        for tag in raw_tags:
-            cleaned = re.sub(r"^-?\d+(?:\.\d+)?::", "", tag.strip())
-            cleaned = cleaned.replace("::", "")
-            cleaned = cleaned.strip("{}[]() ")
-            if cleaned:
-                normalized_tags.append(cleaned.lower())
-        return normalized_tags
-
-    def _cleanup_llm_prompt(self, prompt: str) -> str:
-        """清理 LLM 返回的提示词。
-
-        LLM 偶尔输出"思考过程 + ```prompt``` " 混合格式（max_tokens 内会截断闭合 ```），
-        本函数优先用 ``extract_last_code_block`` 抠最后一个 ``` 代码块的内容，避免 thought
-        段被当成 prompt 送给 NAI 污染 tag；没有代码块时退回到整段文本清洗。
-        """
-        if not prompt:
-            return ""
-
-        # 先剥代码块（覆盖"整段 ``` 包裹"/"thought + 代码块"/"未闭合截断"三种形态）
-        extracted = extract_last_code_block(prompt)
-        candidate = extracted if extracted is not None else prompt
-
-        parsed_prompt = parse_prompt_from_structured_output(candidate)
-        if parsed_prompt:
-            return parsed_prompt
-
-        cleaned = candidate.strip()
-        cleaned = re.sub(r"^\s*prompt\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = cleaned.replace("，", ", ")
-        cleaned = re.sub(r"\s*\n\s*", "\n", cleaned)
-        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-        return cleaned.strip("` \n")
 
     async def handle_nai_draw(self, description: str) -> tuple[bool, str | None, bool]:
         """处理 `/nai`。"""

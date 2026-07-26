@@ -82,6 +82,9 @@ tag_retriever_module.get_tag_retriever = lambda **_kwargs: None
 sys.modules.setdefault("plugins.nai_draw_plugin.core.services.tag_retriever", tag_retriever_module)
 
 from plugins.nai_draw_plugin.core.services import tag_candidate_resolver as resolver_module
+from plugins.nai_draw_plugin.core.services.prompt_generation_workflow import (
+    PromptGenerationWorkflow,
+)
 from plugins.nai_draw_plugin.core.tag_retriever_display import build_tag_retriever_display_message
 from plugins.nai_draw_plugin.core.tag_retriever_display import build_tag_retriever_display_messages
 from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation
@@ -118,11 +121,31 @@ class _FakeLocalRetriever:
         return self.formatted
 
 
-def _build_invocation(tag_retriever_config: dict[str, object]) -> NaiInvocation:
-    invocation = object.__new__(NaiInvocation)
-    invocation.plugin_config = {"tag_retriever": tag_retriever_config}
-    invocation.log_prefix = "test"
-    return invocation
+class _FakeTextGenerator:
+    def __init__(self, response: str) -> None:
+        self.response = response
+
+    async def generate(self, _prompt: str, **_kwargs: object) -> str:
+        return self.response
+
+
+def _build_prompt_workflow(
+    *,
+    send_text,
+    response: str,
+    tag_retriever_config: dict[str, object] | None = None,
+) -> PromptGenerationWorkflow:
+    return PromptGenerationWorkflow(
+        config={
+            "prompt_generator": {"output_format": "text"},
+            "tag_retriever": tag_retriever_config or {},
+        },
+        stream_id="stream-tag-show",
+        text_generator=_FakeTextGenerator(response),
+        send_text=send_text,
+        show_tag_candidates=True,
+        log_prefix="test",
+    )
 
 
 def _build_image_send_invocation() -> NaiInvocation:
@@ -151,20 +174,18 @@ def _build_image_send_invocation() -> NaiInvocation:
 
 
 def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    invocation = _build_invocation(
-        {
-            "enabled": True,
-            "mode": "online",
-            "api_url": "https://example.com/api",
-            "timeout": 12.0,
-            "search_limit": 11,
-            "search_top_k": 4,
-            "related_limit": 7,
-            "related_seed_count": 3,
-            "show_nsfw": False,
-            "popularity_weight": 0.2,
-        }
-    )
+    retriever_config = {
+        "enabled": True,
+        "mode": "online",
+        "api_url": "https://example.com/api",
+        "timeout": 12.0,
+        "search_limit": 11,
+        "search_top_k": 4,
+        "related_limit": 7,
+        "related_seed_count": 3,
+        "show_nsfw": False,
+        "popularity_weight": 0.2,
+    }
     online_retriever = _FakeOnlineRetriever(
         {
             "search": [{"tag": "hatsune_miku"}],
@@ -188,7 +209,13 @@ def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(resolver_module, "get_online_retriever", fake_get_online_retriever)
     monkeypatch.setattr(resolver_module, "get_tag_retriever", fake_get_tag_retriever)
 
-    result = asyncio.run(invocation._retrieve_tag_candidates("画一张初音未来"))
+    result = asyncio.run(
+        resolver_module.resolve_tag_candidates(
+            retriever_config,
+            "画一张初音未来",
+            log_prefix="test",
+        )
+    )
 
     assert result == "<online>"
     assert online_retriever.queries == ["画一张初音未来"]
@@ -209,14 +236,12 @@ def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatc
 def test_retrieve_tag_candidates_falls_back_to_local_when_online_returns_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    invocation = _build_invocation(
-        {
-            "enabled": True,
-            "mode": "online",
-            "top_k": 6,
-            "min_score": 0.45,
-        }
-    )
+    retriever_config = {
+        "enabled": True,
+        "mode": "online",
+        "top_k": 6,
+        "min_score": 0.45,
+    }
     online_retriever = _FakeOnlineRetriever({"search": [], "related": []}, "<online-empty>")
     local_results = [{"cn": "初音未来", "tag": "hatsune_miku", "score": 0.93}]
     local_retriever = _FakeLocalRetriever(local_results, "<local>")
@@ -230,7 +255,13 @@ def test_retrieve_tag_candidates_falls_back_to_local_when_online_returns_empty(
     monkeypatch.setattr(resolver_module, "get_online_retriever", fake_get_online_retriever)
     monkeypatch.setattr(resolver_module, "get_tag_retriever", fake_get_tag_retriever)
 
-    result = asyncio.run(invocation._retrieve_tag_candidates("画一张猫耳少女"))
+    result = asyncio.run(
+        resolver_module.resolve_tag_candidates(
+            retriever_config,
+            "画一张猫耳少女",
+            log_prefix="test",
+        )
+    )
 
     assert result == "<local>"
     assert online_retriever.queries == ["画一张猫耳少女"]
@@ -275,11 +306,6 @@ def test_build_tag_retriever_display_messages_splits_long_output() -> None:
 
 
 def test_generate_prompt_with_llm_shows_tag_candidates_when_enabled() -> None:
-    invocation = object.__new__(NaiInvocation)
-    invocation.stream_id = "stream-tag-show"
-    invocation.group_id = ""
-    invocation.user_id = "user-1"
-    invocation.log_prefix = "test"
     sent_texts: list[tuple[str, bool]] = []
 
     async def fake_send_text(text: str, storage_message: bool = True) -> bool:
@@ -294,26 +320,21 @@ def test_generate_prompt_with_llm_shows_tag_candidates_when_enabled() -> None:
             "</tag_candidates>"
         )
 
-    async def fake_request_llm_text(*_args, **_kwargs) -> str:
-        return "1girl, hatsune_miku"
-
-    invocation.send_text = fake_send_text
-    invocation.get_config = lambda _key, default=None: default
-    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
-    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
-    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
-    invocation._request_llm_text = fake_request_llm_text
-    invocation._cleanup_llm_prompt = lambda response: response
-    invocation._is_tag_retriever_show_enabled = lambda: True
+    workflow = _build_prompt_workflow(
+        send_text=fake_send_text,
+        response="1girl, hatsune_miku",
+    )
+    workflow._retrieve_tag_candidates = fake_retrieve_tag_candidates
 
     result = asyncio.run(
-        invocation._generate_prompt_with_llm(
+        workflow.generate(
             "画一张初音未来",
             allow_inherit=False,
         )
     )
 
-    assert result == ("1girl, hatsune_miku", None)
+    assert result is not None
+    assert (result.text, result.structured) == ("1girl, hatsune_miku", None)
     assert sent_texts == [
         (
             "🔎 Danbooru Tag 检索结果:\n"
@@ -325,11 +346,6 @@ def test_generate_prompt_with_llm_shows_tag_candidates_when_enabled() -> None:
 
 
 def test_generate_prompt_with_llm_splits_tag_candidates_output_when_long() -> None:
-    invocation = object.__new__(NaiInvocation)
-    invocation.stream_id = "stream-tag-show-long"
-    invocation.group_id = ""
-    invocation.user_id = "user-1"
-    invocation.log_prefix = "test"
     sent_texts: list[tuple[str, bool]] = []
 
     async def fake_send_text(text: str, storage_message: bool = True) -> bool:
@@ -344,26 +360,21 @@ def test_generate_prompt_with_llm_splits_tag_candidates_output_when_long() -> No
             + "\n</tag_candidates>"
         )
 
-    async def fake_request_llm_text(*_args, **_kwargs) -> str:
-        return "1girl, tag_01"
-
-    invocation.send_text = fake_send_text
-    invocation.get_config = lambda _key, default=None: default
-    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
-    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
-    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
-    invocation._request_llm_text = fake_request_llm_text
-    invocation._cleanup_llm_prompt = lambda response: response
-    invocation._is_tag_retriever_show_enabled = lambda: True
+    workflow = _build_prompt_workflow(
+        send_text=fake_send_text,
+        response="1girl, tag_01",
+    )
+    workflow._retrieve_tag_candidates = fake_retrieve_tag_candidates
 
     result = asyncio.run(
-        invocation._generate_prompt_with_llm(
+        workflow.generate(
             "画一张初音未来",
             allow_inherit=False,
         )
     )
 
-    assert result == ("1girl, tag_01", None)
+    assert result is not None
+    assert (result.text, result.structured) == ("1girl, tag_01", None)
     assert len(sent_texts) > 1
     assert sent_texts[0][0].startswith("🔎 Danbooru Tag 检索结果 (1/")
     assert sent_texts[-1][0].startswith(f"🔎 Danbooru Tag 检索结果 ({len(sent_texts)}/{len(sent_texts)}):")
@@ -372,11 +383,6 @@ def test_generate_prompt_with_llm_splits_tag_candidates_output_when_long() -> No
 
 
 def test_generate_prompt_with_llm_retries_smaller_tag_chunks_when_send_fails() -> None:
-    invocation = object.__new__(NaiInvocation)
-    invocation.stream_id = "stream-tag-show-retry"
-    invocation.group_id = ""
-    invocation.user_id = "user-1"
-    invocation.log_prefix = "test"
     sent_texts: list[tuple[str, bool]] = []
 
     async def fake_send_text(text: str, storage_message: bool = True) -> bool:
@@ -393,37 +399,27 @@ def test_generate_prompt_with_llm_retries_smaller_tag_chunks_when_send_fails() -
             + "\n</tag_candidates>"
         )
 
-    async def fake_request_llm_text(*_args, **_kwargs) -> str:
-        return "1girl, tag_01"
-
-    invocation.send_text = fake_send_text
-    invocation.get_config = lambda _key, default=None: default
-    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
-    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
-    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
-    invocation._request_llm_text = fake_request_llm_text
-    invocation._cleanup_llm_prompt = lambda response: response
-    invocation._is_tag_retriever_show_enabled = lambda: True
+    workflow = _build_prompt_workflow(
+        send_text=fake_send_text,
+        response="1girl, tag_01",
+    )
+    workflow._retrieve_tag_candidates = fake_retrieve_tag_candidates
 
     result = asyncio.run(
-        invocation._generate_prompt_with_llm(
+        workflow.generate(
             "画一张初音未来",
             allow_inherit=False,
         )
     )
 
-    assert result == ("1girl, tag_01", None)
+    assert result is not None
+    assert (result.text, result.structured) == ("1girl, tag_01", None)
     assert sent_texts
     assert all(len(text) <= 90 for text, _ in sent_texts)
     assert all(storage_message is False for _, storage_message in sent_texts)
 
 
 def test_generate_prompt_with_llm_shows_empty_tag_retriever_notice_when_no_candidates() -> None:
-    invocation = object.__new__(NaiInvocation)
-    invocation.stream_id = "stream-tag-show-empty"
-    invocation.group_id = ""
-    invocation.user_id = "user-1"
-    invocation.log_prefix = "test"
     sent_texts: list[tuple[str, bool]] = []
 
     async def fake_send_text(text: str, storage_message: bool = True) -> bool:
@@ -433,28 +429,22 @@ def test_generate_prompt_with_llm_shows_empty_tag_retriever_notice_when_no_candi
     async def fake_retrieve_tag_candidates(_request_text: str) -> str:
         return ""
 
-    async def fake_request_llm_text(*_args, **_kwargs) -> str:
-        return "1girl, tag_01"
-
-    invocation.send_text = fake_send_text
-    invocation.get_config = lambda key, default=None: (
-        {"mode": "online"} if key == "tag_retriever" else default
+    workflow = _build_prompt_workflow(
+        send_text=fake_send_text,
+        response="1girl, tag_01",
+        tag_retriever_config={"mode": "online"},
     )
-    invocation._get_prompt_generator_config = lambda: {"output_format": "text"}
-    invocation._render_generator_prompt = lambda *_args, **_kwargs: "header\n<<TAG_CANDIDATES>>"
-    invocation._retrieve_tag_candidates = fake_retrieve_tag_candidates
-    invocation._request_llm_text = fake_request_llm_text
-    invocation._cleanup_llm_prompt = lambda response: response
-    invocation._is_tag_retriever_show_enabled = lambda: True
+    workflow._retrieve_tag_candidates = fake_retrieve_tag_candidates
 
     result = asyncio.run(
-        invocation._generate_prompt_with_llm(
+        workflow.generate(
             "画一张初音未来",
             allow_inherit=False,
         )
     )
 
-    assert result == ("1girl, tag_01", None)
+    assert result is not None
+    assert (result.text, result.structured) == ("1girl, tag_01", None)
     assert sent_texts == [
         (
             "🔎 Danbooru Tag 检索结果:\n⚠️ 未检索到候选标签（mode=online）",

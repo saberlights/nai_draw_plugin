@@ -91,6 +91,32 @@ mixins_package.__path__ = [
 sys.modules.setdefault("plugins.nai_draw_plugin.core.mixins", mixins_package)
 
 from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation  # noqa: E402
+from plugins.nai_draw_plugin.core.services.random_scene_planner import (  # noqa: E402
+    RandomScenePlanner,
+)
+
+
+class _FakeTextGenerator:
+    def __init__(self, responses: str | list[str]) -> None:
+        self.responses = [responses] if isinstance(responses, str) else list(responses)
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt: str, **_kwargs: object) -> str:
+        self.prompts.append(prompt)
+        index = min(len(self.prompts) - 1, len(self.responses) - 1)
+        return self.responses[index]
+
+
+def _build_random_planner(
+    responses: str | list[str],
+) -> tuple[RandomScenePlanner, _FakeTextGenerator]:
+    text_generator = _FakeTextGenerator(responses)
+    planner = RandomScenePlanner(
+        config={},
+        text_generator=text_generator,
+        log_prefix="test",
+    )
+    return planner, text_generator
 
 
 def _build_invocation() -> NaiInvocation:
@@ -137,12 +163,12 @@ def test_nai_draw_pattern_passes_random_character_text_to_description() -> None:
 def test_random_scene_prompt_locks_character_and_demands_broad_variation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(NaiInvocation, "_recent_random_scenes", [])
-    invocation = _build_invocation()
-
-    prompt = invocation._build_random_scene_prompt(
-        character="初音未来",
+    monkeypatch.setattr(RandomScenePlanner, "_recent_scenes", [])
+    planner, text_generator = _build_random_planner(
+        "成年初音未来在酒店浴室对镜自拍，镜头从侧后方拍摄。"
     )
+    asyncio.run(planner.generate(character="初音未来"))
+    prompt = text_generator.prompts[0]
 
     assert "初音未来" in prompt
     assert any(term in prompt for term in ("角色锚点", "指定角色", "锁定角色", "固定角色"))
@@ -169,11 +195,12 @@ def test_random_scene_prompt_locks_character_and_demands_broad_variation(
     assert any(term in prompt for term in ("随机", "随机化", "每次不同", "主动切换"))
     assert any(term in prompt for term in ("模板", "套路", "固定组合"))
 
-    monkeypatch.setattr(NaiInvocation, "_recent_random_scenes", ["旧场景 制服 教室"])
-    history_prompt = invocation._build_random_scene_prompt(
-        character="初音未来",
-        rejected_candidates=["初音未来 制服 教室"],
+    monkeypatch.setattr(RandomScenePlanner, "_recent_scenes", ["初音未来 制服 教室"])
+    planner, text_generator = _build_random_planner(
+        ["初音未来 制服 教室", "初音未来 制服 教室"],
     )
+    asyncio.run(planner.generate(character="初音未来"))
+    history_prompt = text_generator.prompts[1]
     assert "最近" in history_prompt
     assert any(term in history_prompt for term in ("禁止", "避免"))
     assert any(term in history_prompt for term in ("重复", "相似"))
@@ -181,9 +208,11 @@ def test_random_scene_prompt_locks_character_and_demands_broad_variation(
 
 
 def test_random_scene_prompt_requires_rich_directed_visual_detail() -> None:
-    invocation = _build_invocation()
-
-    prompt = invocation._build_random_scene_prompt(character="初音未来")
+    planner, text_generator = _build_random_planner(
+        "成年初音未来在酒店浴室对镜自拍，镜头从侧后方拍摄。"
+    )
+    asyncio.run(planner.generate(character="初音未来"))
+    prompt = text_generator.prompts[0]
 
     detail_groups = (
         ("情色主轴", "明确成人行为", "成人内容必须是画面主轴"),
@@ -208,41 +237,29 @@ def test_random_scene_prompt_requires_rich_directed_visual_detail() -> None:
 def test_generate_random_description_reanchors_character(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(NaiInvocation, "_recent_random_scenes", [])
-    invocation = _build_invocation()
-    prompts: list[str] = []
-
-    async def fake_request_llm_text(prompt: str, **kwargs) -> str:
-        prompts.append(prompt)
-        return "一名成年女性在酒店浴室对镜自拍，镜头从侧后方拍摄。"
-
-    invocation._request_llm_text = fake_request_llm_text
-
-    result = asyncio.run(
-        invocation._generate_random_description(character="初音未来")
+    monkeypatch.setattr(RandomScenePlanner, "_recent_scenes", [])
+    planner, text_generator = _build_random_planner(
+        "一名成年女性在酒店浴室对镜自拍，镜头从侧后方拍摄。"
     )
+
+    result = asyncio.run(planner.generate(character="初音未来"))
 
     assert result is not None
     assert result == "主角是初音未来。一名成年女性在酒店浴室对镜自拍，镜头从侧后方拍摄。"
-    assert prompts and "初音未来" in prompts[0]
+    assert text_generator.prompts and "初音未来" in text_generator.prompts[0]
 
 
 def test_generate_random_description_preserves_natural_language_punctuation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(NaiInvocation, "_recent_random_scenes", [])
-    invocation = _build_invocation()
+    monkeypatch.setattr(RandomScenePlanner, "_recent_scenes", [])
     natural_description = (
         "成年初音未来在霓虹灯照亮的酒店浴室里对镜自拍，"
         "她穿着黑色蕾丝内衣，镜头捕捉镜面反射。"
     )
 
-    async def fake_request_llm_text(prompt: str, **kwargs) -> str:
-        return natural_description
-
-    invocation._request_llm_text = fake_request_llm_text
-
-    result = asyncio.run(invocation._generate_random_description(character="初音未来"))
+    planner, _text_generator = _build_random_planner(natural_description)
+    result = asyncio.run(planner.generate(character="初音未来"))
 
     assert result == natural_description
 
@@ -292,12 +309,9 @@ def _install_draw_doubles(
     invocation._send_image_result = fake_send_image_result
 
 
-def test_named_character_random_scene_with_selfie_word_stays_normal_draw(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(NaiInvocation, "_recent_random_scenes", [])
+def test_named_character_random_scene_with_selfie_word_stays_normal_draw() -> None:
     invocation = _build_invocation()
-    random_prompts: list[str] = []
+    random_requests: list[tuple[bool, str]] = []
     generated_prompts: list[str] = []
     selfie_calls: list[str] = []
     generated_images: list[dict[str, object]] = []
@@ -306,11 +320,11 @@ def test_named_character_random_scene_with_selfie_word_stays_normal_draw(
         "她穿着黑色蕾丝内衣，镜头从侧后方拍摄。"
     )
 
-    async def fake_request_llm_text(prompt: str, **kwargs) -> str:
-        random_prompts.append(prompt)
+    async def fake_random_description(*, selfie: bool, character: str) -> str:
+        random_requests.append((selfie, character))
         return natural_description
 
-    invocation._request_llm_text = fake_request_llm_text
+    invocation._generate_random_description = fake_random_description
     _install_draw_doubles(
         invocation,
         prompt_result="hatsune miku, selfie, rear entry",
@@ -322,18 +336,15 @@ def test_named_character_random_scene_with_selfie_word_stays_normal_draw(
     result = asyncio.run(invocation.handle_nai_draw("随机 初音未来"))
 
     assert result == (True, "图片生成成功", True)
-    assert random_prompts and "初音未来" in random_prompts[0]
+    assert random_requests == [(False, "初音未来")]
     assert generated_prompts == [natural_description]
     assert selfie_calls == []
     assert generated_images and generated_images[0]["prompt"] == "hatsune miku, selfie, rear entry"
 
 
-def test_random_selfie_has_no_character_anchor_and_keeps_selfie_postprocess(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(NaiInvocation, "_recent_random_scenes", [])
+def test_random_selfie_has_no_character_anchor_and_keeps_selfie_postprocess() -> None:
     invocation = _build_invocation()
-    random_prompts: list[str] = []
+    random_requests: list[tuple[bool, str]] = []
     generated_prompts: list[str] = []
     selfie_calls: list[str] = []
     generated_images: list[dict[str, object]] = []
@@ -342,11 +353,11 @@ def test_random_selfie_has_no_character_anchor_and_keeps_selfie_postprocess(
         "她举着手机，镜面映出潮湿的肌肤。"
     )
 
-    async def fake_request_llm_text(prompt: str, **kwargs) -> str:
-        random_prompts.append(prompt)
+    async def fake_random_description(*, selfie: bool, character: str) -> str:
+        random_requests.append((selfie, character))
         return natural_description
 
-    invocation._request_llm_text = fake_request_llm_text
+    invocation._generate_random_description = fake_random_description
     _install_draw_doubles(
         invocation,
         prompt_result="girl, mirror selfie, holding phone",
@@ -358,7 +369,7 @@ def test_random_selfie_has_no_character_anchor_and_keeps_selfie_postprocess(
     result = asyncio.run(invocation.handle_nai_draw("随机自拍"))
 
     assert result == (True, "图片生成成功", True)
-    assert random_prompts and "初音未来" not in random_prompts[0]
+    assert random_requests == [(True, "")]
     assert generated_prompts == [natural_description]
     assert selfie_calls == ["girl, mirror selfie, holding phone"]
     assert generated_images and generated_images[0]["prompt"] == "girl, mirror selfie, holding phone"

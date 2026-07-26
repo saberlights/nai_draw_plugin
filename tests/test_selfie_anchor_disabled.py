@@ -69,27 +69,16 @@ src_services_module = types.ModuleType("src.services")
 src_services_module.llm_service = types.SimpleNamespace()
 sys.modules["src.services"] = src_services_module
 
-from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation
+from plugins.nai_draw_plugin.core.services.prompt_generation_workflow import (
+    PromptGenerationWorkflow,
+)
 
 
-def test_runtime_selfie_anchor_helpers_are_disabled() -> None:
-    invocation = object.__new__(NaiInvocation)
-
-    assert invocation._extract_selfie_anchor_data(
-        "solo, 1girl, selfie, mirror selfie, by window, sweater, black pantyhose"
-    ) == {}
-    assert invocation._format_selfie_anchor_summary({"scene_type": ["前置自拍"]}) == ""
-
-
-def test_runtime_selfie_scene_context_ignores_anchor_summary() -> None:
-    invocation = object.__new__(NaiInvocation)
-
-    context = invocation._build_selfie_scene_context(
+def test_prompt_workflow_selfie_scene_context_uses_only_text_history() -> None:
+    context = PromptGenerationWorkflow._build_selfie_scene_context(
         "再来一张",
         last_selfie_prompt="solo, 1girl, selfie, by window",
         last_selfie_request="发张自拍",
-        last_selfie_scene="- 自拍类型：前置自拍",
-        last_selfie_anchor={"scene_type": ["前置自拍"]},
     )
 
     assert "上一轮自拍锚点" not in context
