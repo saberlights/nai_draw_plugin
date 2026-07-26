@@ -91,7 +91,6 @@ class NaiPicPlugin(MaiBotPlugin):
             max_workers=4,
         )
         self._wd14_io = BlockingIORunner(thread_name_prefix="nai-wd14-io")
-        self._foreground_tasks: set[asyncio.Task[Any]] = set()
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
         self._generation_admission_policy = GenerationAdmissionPolicy(
             state=session_state,
@@ -116,11 +115,6 @@ class NaiPicPlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         """处理插件卸载。"""
         await self._background_tasks.shutdown()
-        foreground_tasks = list(self._foreground_tasks)
-        for task in foreground_tasks:
-            task.cancel()
-        if foreground_tasks:
-            await asyncio.gather(*foreground_tasks, return_exceptions=True)
         self._wd14_io.close()
         self._http_io.close()
         self._blocking_io.close()
@@ -339,37 +333,37 @@ class NaiPicPlugin(MaiBotPlugin):
         if not normalized_session or not reply_text:
             return
 
-        # 读插件配置：未开启就不做
-        try:
-            plugin_config = await self._load_plugin_config_data()
-        except Exception:
-            return
-        if not isinstance(plugin_config, dict):
-            return
-        decision = self._generation_admission_policy.evaluate_reply_candidate(
-            stream_id=normalized_session,
-            reply_text=reply_text,
-            config=plugin_config,
-        )
-        if not decision.should_generate:
-            return
+        async def _prepare() -> None:
+            try:
+                plugin_config = await self._load_plugin_config_data()
+            except Exception:
+                return
+            if not isinstance(plugin_config, dict):
+                return
+            decision = self._generation_admission_policy.evaluate_reply_candidate(
+                stream_id=normalized_session,
+                reply_text=reply_text,
+                config=plugin_config,
+            )
+            if not decision.should_generate:
+                return
 
-        invocation = await self._create_invocation(
-            normalized_session,
-            action_data={"description": decision.seed_description},
-            source="reply_auto_draw",
-        )
+            invocation = await self._create_invocation(
+                normalized_session,
+                action_data={"description": decision.seed_description},
+                source="reply_auto_draw",
+            )
+            self._start_image_generation_in_background(
+                normalized_session,
+                lambda: invocation.handle_auto_draw_from_reply(
+                    decision.seed_description,
+                    reply_context_text=reply_text,
+                ),
+                invocation=invocation,
+                name="nai-reply-auto-draw",
+            )
 
-        # 走通用后台启动：同 session 已有生成任务则丢弃这次跟图（避免叠加）
-        self._start_image_generation_in_background(
-            normalized_session,
-            lambda: invocation.handle_auto_draw_from_reply(
-                decision.seed_description,
-                reply_context_text=reply_text,
-            ),
-            invocation=invocation,
-            name="nai-reply-auto-draw",
-        )
+        await self._background_tasks.run(_prepare, name="nai-reply-auto-draw-submission")
 
     @HookHandler(
         "chat.receive.before_process",
@@ -445,6 +439,7 @@ class NaiPicPlugin(MaiBotPlugin):
         *,
         invocation: NaiInvocation | None = None,
         name: str = "nai-image-generation",
+        on_failure: Any = None,
     ) -> bool:
         """在后台启动图片生成任务，并阻止同会话重复启动。"""
         if not stream_id:
@@ -452,6 +447,7 @@ class NaiPicPlugin(MaiBotPlugin):
                 coroutine_factory,
                 name=name,
                 invocation=invocation,
+                on_failure=on_failure,
             )
 
         pending_owner = session_state.acquire_pending_image_generation(stream_id)
@@ -470,6 +466,7 @@ class NaiPicPlugin(MaiBotPlugin):
         task = self._background_tasks.start(
             coroutine_factory,
             name=name,
+            on_failure=on_failure,
             finalize=_finalize,
         )
         if task is None:
@@ -485,26 +482,21 @@ class NaiPicPlugin(MaiBotPlugin):
         invocation: NaiInvocation,
     ) -> bool:
         """后台执行显式生图命令，允许同会话内并发处理多个用户请求。"""
-        if self._background_tasks.is_closing:
-            self._close_invocation(invocation)
-            return False
-        if stream_id:
-            try:
-                acknowledged = await self.ctx.send.text(
+        async def _acknowledge() -> bool:
+            if not stream_id:
+                return True
+            return bool(
+                await self.ctx.send.text(
                     "收到，正在生成图片，请稍候...",
                     stream_id,
                     storage_message=False,
                 )
-            except Exception:
-                self._close_invocation(invocation)
-                raise
-            if not acknowledged:
-                self._close_invocation(invocation)
-                return False
-        return self._run_invocation_in_background(
+            )
+
+        return await self._background_tasks.submit(
             coroutine_factory,
+            before_start=_acknowledge,
             name="nai-command-generation",
-            invocation=invocation,
             on_failure=(
                 lambda _exc: self.ctx.send.text(
                     "图片生成任务意外中断，请稍后重试。",
@@ -514,6 +506,7 @@ class NaiPicPlugin(MaiBotPlugin):
                 if stream_id
                 else None
             ),
+            finalize=lambda: self._close_invocation(invocation),
         )
 
     async def _run_retag(self, *, stream_id: str, user_id: str) -> tuple[bool, str | None, bool]:
@@ -594,7 +587,11 @@ class NaiPicPlugin(MaiBotPlugin):
         source: str = "command",
     ) -> NaiInvocation:
         """构造一次命令或 Action 调用的运行上下文。"""
+        if self._background_tasks.is_closing:
+            raise RuntimeError("插件正在卸载，拒绝创建新的调用上下文")
         plugin_config = await self._load_plugin_config_data()
+        if self._background_tasks.is_closing:
+            raise RuntimeError("插件正在卸载，拒绝创建新的调用上下文")
         invocation = NaiInvocation(
             self,
             plugin_config,
@@ -617,20 +614,17 @@ class NaiPicPlugin(MaiBotPlugin):
         **invocation_kwargs: Any,
     ) -> InvocationResultT:
         """执行前台 Invocation，并在任意终态释放其资源。"""
-        if self._background_tasks.is_closing:
-            raise RuntimeError("插件正在卸载，拒绝新的前台调用")
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            self._foreground_tasks.add(current_task)
-        try:
+        async def _execute() -> InvocationResultT:
             invocation = await self._create_invocation(stream_id, **invocation_kwargs)
             try:
                 return await operation(invocation)
             finally:
                 self._close_invocation(invocation)
-        finally:
-            if current_task is not None:
-                self._foreground_tasks.discard(current_task)
+
+        return await self._background_tasks.run(
+            _execute,
+            name="nai-foreground-invocation",
+        )
 
     @Command(
         "nai_admin_control_command",
@@ -744,16 +738,10 @@ class NaiPicPlugin(MaiBotPlugin):
         反推链路全部走插件内单例，命令本身不接 Invocation。
         """
         del kwargs
-        if self._background_tasks.is_closing:
-            raise RuntimeError("插件正在卸载，拒绝新的反推调用")
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            self._foreground_tasks.add(current_task)
-        try:
-            return await self._run_retag(stream_id=stream_id, user_id=user_id)
-        finally:
-            if current_task is not None:
-                self._foreground_tasks.discard(current_task)
+        return await self._background_tasks.run(
+            lambda: self._run_retag(stream_id=stream_id, user_id=user_id),
+            name="nai-retag-foreground",
+        )
 
     @Command(
         "nai_draw",
@@ -775,24 +763,32 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai`。"""
         del kwargs
-        invocation = await self._create_invocation(
-            stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            matched_groups=matched_groups,
-            text=text,
-        )
         description = str((matched_groups or {}).get("description", "") or "").strip()
-        if not await invocation.ensure_generation_permission():
-            self._close_invocation(invocation)
-            return False, "没有权限", True
-        if not await self._start_command_image_generation(
-            stream_id,
-            lambda: invocation.handle_nai_draw(description),
-            invocation=invocation,
-        ):
-            return False, "", True
-        return True, "已开始生成图片", True
+
+        async def _prepare() -> tuple[bool, str | None, bool]:
+            invocation = await self._create_invocation(
+                stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                matched_groups=matched_groups,
+                text=text,
+            )
+            try:
+                if not await invocation.ensure_generation_permission():
+                    self._close_invocation(invocation)
+                    return False, "没有权限", True
+            except BaseException:
+                self._close_invocation(invocation)
+                raise
+            if not await self._start_command_image_generation(
+                stream_id,
+                lambda: invocation.handle_nai_draw(description),
+                invocation=invocation,
+            ):
+                return False, "", True
+            return True, "已开始生成图片", True
+
+        return await self._background_tasks.run(_prepare, name="nai-draw-submission")
 
     @Command(
         "nai_0_draw",
@@ -811,24 +807,32 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai0`。"""
         del kwargs
-        invocation = await self._create_invocation(
-            stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            matched_groups=matched_groups,
-            text=text,
-        )
         tags = str((matched_groups or {}).get("tags", "") or "").strip()
-        if not await invocation.ensure_generation_permission():
-            self._close_invocation(invocation)
-            return False, "没有权限", True
-        if not await self._start_command_image_generation(
-            stream_id,
-            lambda: invocation.handle_nai0_draw(tags),
-            invocation=invocation,
-        ):
-            return False, "", True
-        return True, "已开始生成图片", True
+
+        async def _prepare() -> tuple[bool, str | None, bool]:
+            invocation = await self._create_invocation(
+                stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                matched_groups=matched_groups,
+                text=text,
+            )
+            try:
+                if not await invocation.ensure_generation_permission():
+                    self._close_invocation(invocation)
+                    return False, "没有权限", True
+            except BaseException:
+                self._close_invocation(invocation)
+                raise
+            if not await self._start_command_image_generation(
+                stream_id,
+                lambda: invocation.handle_nai0_draw(tags),
+                invocation=invocation,
+            ):
+                return False, "", True
+            return True, "已开始生成图片", True
+
+        return await self._background_tasks.run(_prepare, name="nai0-draw-submission")
 
     @Command(
         "nai_0_vibe_command",
@@ -1281,38 +1285,45 @@ class NaiPicPlugin(MaiBotPlugin):
         mode: str,
     ) -> tuple[bool, str | None, bool]:
         """/nai i2i 的引用图链路（ref 已迁移到命名图库，不再共享此路径）。"""
-        description = str((matched_groups or {}).get("description", "") or "").strip()
-        image_base64 = self._image_cache_service.resolve_image_base64(
-            stream_id=stream_id,
-            user_id=user_id,
-        )
-        if not image_base64:
-            await self.ctx.send.text(
-                "❌ 未找到参考图\n请引用回复一张图后再发送 /nai i2i，或在同一条消息内附图加命令",
-                stream_id,
-                storage_message=False,
+        async def _prepare() -> tuple[bool, str | None, bool]:
+            description = str((matched_groups or {}).get("description", "") or "").strip()
+            image_base64 = self._image_cache_service.resolve_image_base64(
+                stream_id=stream_id,
+                user_id=user_id,
             )
-            return False, "未找到图片", True
+            if not image_base64:
+                await self.ctx.send.text(
+                    "❌ 未找到参考图\n请引用回复一张图后再发送 /nai i2i，或在同一条消息内附图加命令",
+                    stream_id,
+                    storage_message=False,
+                )
+                return False, "未找到图片", True
 
-        invocation = await self._create_invocation(
-            stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            matched_groups=matched_groups,
-        )
-        if not await invocation.ensure_generation_permission():
-            self._close_invocation(invocation)
-            return False, "没有权限", True
+            invocation = await self._create_invocation(
+                stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                matched_groups=matched_groups,
+            )
+            try:
+                if not await invocation.ensure_generation_permission():
+                    self._close_invocation(invocation)
+                    return False, "没有权限", True
+            except BaseException:
+                self._close_invocation(invocation)
+                raise
 
-        if not await self._start_command_image_generation(
-            stream_id,
-            lambda: invocation.handle_image_to_image_draw(
-                description, image_base64=image_base64, mode=mode
-            ),
-            invocation=invocation,
-        ):
-            return False, "", True
-        return True, "已开始生成图片", True
+            if not await self._start_command_image_generation(
+                stream_id,
+                lambda: invocation.handle_image_to_image_draw(
+                    description, image_base64=image_base64, mode=mode
+                ),
+                invocation=invocation,
+            ):
+                return False, "", True
+            return True, "已开始生成图片", True
+
+        return await self._background_tasks.run(_prepare, name="nai-i2i-submission")
 
     # ── 命名图库 helper（vibe / ref 共用骨架，scope 决定走哪个库） ──────
 
@@ -1330,36 +1341,44 @@ class NaiPicPlugin(MaiBotPlugin):
         命令 pattern 用 ``(?P<at_names>(?:@\\S+\\s+)*)`` 把 0~N 个 ``@<名字>`` 整体捕获，
         这里 ``re.findall`` 拆成 List[str] 透传给 invocation；空列表退化成 None 走粘性选定。
         """
-        description = str((matched_groups or {}).get("description", "") or "").strip()
-        at_names_str = str((matched_groups or {}).get("at_names", "") or "")
-        explicit_names_list = re.findall(r"@(\S+)", at_names_str)
-        explicit_names = explicit_names_list or None
+        async def _prepare() -> tuple[bool, str | None, bool]:
+            description = str((matched_groups or {}).get("description", "") or "").strip()
+            at_names_str = str((matched_groups or {}).get("at_names", "") or "")
+            explicit_names = re.findall(r"@(\S+)", at_names_str) or None
 
-        invocation = await self._create_invocation(
-            stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            matched_groups=matched_groups,
+            invocation = await self._create_invocation(
+                stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                matched_groups=matched_groups,
+            )
+            try:
+                if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
+                    self._close_invocation(invocation)
+                    return False, "没有管理员权限", True
+                if not await invocation.ensure_generation_permission():
+                    self._close_invocation(invocation)
+                    return False, "没有权限", True
+            except BaseException:
+                self._close_invocation(invocation)
+                raise
+
+            if not await self._start_command_image_generation(
+                stream_id,
+                lambda: invocation.handle_named_reference_draw(
+                    scope=scope,
+                    description=description,
+                    explicit_names=explicit_names,
+                ),
+                invocation=invocation,
+            ):
+                return False, "", True
+            return True, "已开始生成图片", True
+
+        return await self._background_tasks.run(
+            _prepare,
+            name=f"nai-{scope}-draw-submission",
         )
-        # 先过管理员鉴权，避免非管理员看到"收到，正在生成图片"再被拒绝的误导
-        if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
-            self._close_invocation(invocation)
-            return False, "没有管理员权限", True
-        if not await invocation.ensure_generation_permission():
-            self._close_invocation(invocation)
-            return False, "没有权限", True
-
-        if not await self._start_command_image_generation(
-            stream_id,
-            lambda: invocation.handle_named_reference_draw(
-                scope=scope,
-                description=description,
-                explicit_names=explicit_names,
-            ),
-            invocation=invocation,
-        ):
-            return False, "", True
-        return True, "已开始生成图片", True
 
     async def _run_named_reference_save_command(
         self,
@@ -1506,37 +1525,45 @@ class NaiPicPlugin(MaiBotPlugin):
         以满足下游空检查；store 层选定 / @<名字...> 单次覆盖、controlnet / character_references
         组装等逻辑全部复用 handle_named_reference_draw 已有路径。
         """
-        raw_tags = str((matched_groups or {}).get("tags", "") or "").strip()
-        at_names_str = str((matched_groups or {}).get("at_names", "") or "")
-        explicit_names_list = re.findall(r"@(\S+)", at_names_str)
-        explicit_names = explicit_names_list or None
+        async def _prepare() -> tuple[bool, str | None, bool]:
+            raw_tags = str((matched_groups or {}).get("tags", "") or "").strip()
+            at_names_str = str((matched_groups or {}).get("at_names", "") or "")
+            explicit_names = re.findall(r"@(\S+)", at_names_str) or None
 
-        invocation = await self._create_invocation(
-            stream_id,
-            group_id=group_id,
-            user_id=user_id,
-            matched_groups=matched_groups,
+            invocation = await self._create_invocation(
+                stream_id,
+                group_id=group_id,
+                user_id=user_id,
+                matched_groups=matched_groups,
+            )
+            try:
+                if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
+                    self._close_invocation(invocation)
+                    return False, "没有管理员权限", True
+                if not await invocation.ensure_generation_permission():
+                    self._close_invocation(invocation)
+                    return False, "没有权限", True
+            except BaseException:
+                self._close_invocation(invocation)
+                raise
+
+            if not await self._start_command_image_generation(
+                stream_id,
+                lambda: invocation.handle_named_reference_draw(
+                    scope=scope,
+                    description=raw_tags,
+                    explicit_names=explicit_names,
+                    raw_prompt=raw_tags,
+                ),
+                invocation=invocation,
+            ):
+                return False, "", True
+            return True, "已开始生成图片", True
+
+        return await self._background_tasks.run(
+            _prepare,
+            name=f"nai0-{scope}-draw-submission",
         )
-        # 先过管理员鉴权，避免非管理员看到"收到，正在生成图片"再被拒绝的误导
-        if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
-            self._close_invocation(invocation)
-            return False, "没有管理员权限", True
-        if not await invocation.ensure_generation_permission():
-            self._close_invocation(invocation)
-            return False, "没有权限", True
-
-        if not await self._start_command_image_generation(
-            stream_id,
-            lambda: invocation.handle_named_reference_draw(
-                scope=scope,
-                description=raw_tags,
-                explicit_names=explicit_names,
-                raw_prompt=raw_tags,
-            ),
-            invocation=invocation,
-        ):
-            return False, "", True
-        return True, "已开始生成图片", True
 
     @Action(
         "nai_web_draw",
@@ -1623,39 +1650,54 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str]:
         """处理自动生图 Action。"""
         del kwargs
-        invocation = await self._create_invocation(
-            stream_id,
-            user_id=user_id,
-            group_id=group_id,
-            action_data=action_data,
-            reasoning=reasoning,
-            source="action",
-        )
-        if not await invocation.ensure_user_not_blacklisted():
-            self._close_invocation(invocation)
-            return False, "黑名单用户"
 
-        # Action Guard 同步预检：让 Planner 第一时间拿到拦截原因，避免后台默默吞掉
-        # 评估结果会缓存到 invocation，后台 handle_action 复用同一次结论，不会重复读消息库
-        guard_state = await invocation.preflight_action_guard()
-        if guard_state is not None and not guard_state.should_generate:
-            self._close_invocation(invocation)
-            return False, guard_state.detail
-
-        if not self._start_image_generation_in_background(
-            stream_id,
-            invocation.handle_action,
-            invocation=invocation,
-            name="nai-action-generation",
-        ):
-            return False, (
-                "同会话已有图片任务在后台进行中，本轮跳过出图、按文字回复推进；"
-                "请不要调用 send_image 或 wait，正在生成的那张图会自行送达"
+        async def _prepare() -> tuple[bool, str]:
+            invocation = await self._create_invocation(
+                stream_id,
+                user_id=user_id,
+                group_id=group_id,
+                action_data=action_data,
+                reasoning=reasoning,
+                source="action",
             )
-        return True, (
-            "图片任务已提交后台，图片由插件异步发送到会话，本次 tool_result 不包含 image 内容；"
-            "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可"
-        )
+            try:
+                if not await invocation.ensure_user_not_blacklisted():
+                    self._close_invocation(invocation)
+                    return False, "黑名单用户"
+
+                guard_state = await invocation.preflight_action_guard()
+                if guard_state is not None and not guard_state.should_generate:
+                    self._close_invocation(invocation)
+                    return False, guard_state.detail
+            except BaseException:
+                self._close_invocation(invocation)
+                raise
+
+            if not self._start_image_generation_in_background(
+                stream_id,
+                invocation.handle_action,
+                invocation=invocation,
+                name="nai-action-generation",
+                on_failure=(
+                    lambda _exc: self.ctx.send.text(
+                        "图片生成任务意外中断，请稍后重试。",
+                        stream_id,
+                        storage_message=False,
+                    )
+                    if stream_id
+                    else None
+                ),
+            ):
+                return False, (
+                    "同会话已有图片任务在后台进行中，本轮跳过出图、按文字回复推进；"
+                    "请不要调用 send_image 或 wait，正在生成的那张图会自行送达"
+                )
+            return True, (
+                "图片任务已提交后台，图片由插件异步发送到会话，本次 tool_result 不包含 image 内容；"
+                "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可"
+            )
+
+        return await self._background_tasks.run(_prepare, name="nai-action-submission")
 
 
 def create_plugin():

@@ -221,6 +221,7 @@ def test_reply_hook_uses_admission_description_for_background_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin_config = {
         "auto_draw_on_reply": {"enabled": True, "score_threshold": 0.6},
         "action_guard": {"enabled": True},
@@ -311,6 +312,7 @@ def test_reply_hook_rejection_does_not_create_invocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     create_calls = 0
 
     class _Policy:
@@ -339,6 +341,43 @@ def test_reply_hook_rejection_does_not_create_invocation(
     assert create_calls == 0
 
 
+def test_reply_hook_config_load_is_cancelled_before_invocation_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._generation_admission_policy = types.SimpleNamespace()
+    load_started = asyncio.Event()
+    create_calls = 0
+
+    async def load_config() -> dict[str, object]:
+        load_started.set()
+        await asyncio.Event().wait()
+        return {}
+
+    async def create_invocation(*_args: object, **_kwargs: object) -> None:
+        nonlocal create_calls
+        create_calls += 1
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
+    monkeypatch.setattr(plugin, "_create_invocation", create_invocation)
+
+    async def scenario() -> None:
+        hook = asyncio.create_task(
+            plugin.handle_replyer_after_response_for_auto_draw(
+                session_id="stream-unload-reply",
+                response="我刚洗完澡靠在窗边发呆，有点累",
+            )
+        )
+        await load_started.wait()
+        await plugin._background_tasks.shutdown()
+        assert hook.cancelled()
+
+    asyncio.run(scenario())
+
+    assert create_calls == 0
+
+
 class _DummySend:
     def __init__(self) -> None:
         self.text_calls: list[tuple[str, str, bool]] = []
@@ -359,6 +398,17 @@ class _RejectedSend(_DummySend):
         return False
 
 
+class _BlockingSend(_DummySend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def text(self, text: str, stream_id: str, storage_message: bool = True) -> bool:
+        self.started.set()
+        await asyncio.Event().wait()
+        return True
+
+
 class _DummyInvocation:
     def __init__(self, *, generation_allowed: bool = True) -> None:
         self.draw_calls: list[str] = []
@@ -369,6 +419,12 @@ class _DummyInvocation:
     async def ensure_generation_permission(self) -> bool:
         return self.generation_allowed
 
+    async def ensure_user_not_blacklisted(self) -> bool:
+        return True
+
+    async def preflight_action_guard(self) -> AdmissionDecision | None:
+        return None
+
     async def handle_nai_draw(self, description: str) -> tuple[bool, str | None, bool]:
         self.draw_calls.append(description)
         return True, description, True
@@ -376,6 +432,9 @@ class _DummyInvocation:
     async def handle_nai0_draw(self, tags: str) -> tuple[bool, str | None, bool]:
         self.nai0_calls.append(tags)
         return True, tags, True
+
+    async def handle_action(self) -> tuple[bool, str]:
+        raise RuntimeError("unexpected action failure")
 
     async def handle_admin_command(
         self,
@@ -386,6 +445,17 @@ class _DummyInvocation:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class _BlockingPreflightInvocation(_DummyInvocation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.preflight_started = asyncio.Event()
+
+    async def preflight_action_guard(self) -> AdmissionDecision | None:
+        self.preflight_started.set()
+        await asyncio.Event().wait()
+        return None
 
 
 def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -529,6 +599,7 @@ def test_generation_permission_rejection_closes_invocation_without_ack(
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
     invocation = _DummyInvocation(generation_allowed=False)
 
@@ -558,7 +629,6 @@ def test_foreground_command_uses_managed_invocation_lifecycle(
     plugin = object.__new__(NaiPicPlugin)
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
-    plugin._foreground_tasks = set()
     invocation = _DummyInvocation()
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
@@ -659,6 +729,132 @@ def test_command_rejected_ack_does_not_start_job_and_closes_invocation() -> None
     assert invocation.close_calls == 1
 
 
+def test_command_ack_is_cancelled_by_shutdown_before_job_can_start() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    blocking_send = _BlockingSend()
+    plugin.ctx = types.SimpleNamespace(send=blocking_send)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+    job_calls = 0
+
+    async def generation() -> None:
+        nonlocal job_calls
+        job_calls += 1
+
+    async def scenario() -> bool:
+        submission = asyncio.create_task(
+            plugin._start_command_image_generation(
+                "stream-ack-shutdown",
+                generation,
+                invocation=invocation,
+            )
+        )
+        await blocking_send.started.wait()
+        await plugin._background_tasks.shutdown()
+        return await submission
+
+    assert asyncio.run(scenario()) is False
+    assert job_calls == 0
+    assert invocation.close_calls == 1
+
+
+def test_action_background_failure_reports_once_and_releases_invocation() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+    stream_id = "stream-action-failure"
+    plugin_module.session_state.clear_pending_image_generation(stream_id)
+
+    async def fake_create_invocation(*_args: Any, **_kwargs: Any) -> _DummyInvocation:
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    plugin._create_invocation = fake_create_invocation
+
+    async def scenario() -> tuple[bool, str]:
+        result = await plugin.handle_nai_web_draw(stream_id=stream_id)
+        await asyncio.sleep(0)
+        await plugin._background_tasks.shutdown()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result[0] is True
+    assert plugin.ctx.send.text_calls == [
+        ("图片生成任务意外中断，请稍后重试。", stream_id, False)
+    ]
+    assert invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []
+    assert plugin_module.session_state.get_pending_image_generation_started_at(stream_id) is None
+
+
+def test_action_preflight_is_cancelled_by_shutdown_and_closes_invocation() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    invocation = _BlockingPreflightInvocation()
+
+    async def create_invocation(*_args: object, **_kwargs: object) -> _DummyInvocation:
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    plugin._create_invocation = create_invocation
+
+    async def scenario() -> None:
+        action = asyncio.create_task(
+            plugin.handle_nai_web_draw(stream_id="stream-preflight-shutdown")
+        )
+        await invocation.preflight_started.wait()
+        await plugin._background_tasks.shutdown()
+        assert action.cancelled()
+
+    asyncio.run(scenario())
+
+    assert invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []
+
+
+def test_create_invocation_rechecks_shutdown_after_config_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    load_started = asyncio.Event()
+    release_load = asyncio.Event()
+    constructor_calls = 0
+
+    async def load_config() -> dict[str, object]:
+        load_started.set()
+        await release_load.wait()
+        return {}
+
+    class _Invocation:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            nonlocal constructor_calls
+            constructor_calls += 1
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
+    monkeypatch.setattr(plugin_module, "NaiInvocation", _Invocation)
+
+    async def scenario() -> None:
+        creation = asyncio.create_task(plugin._create_invocation("stream-config-race"))
+        await load_started.wait()
+        await plugin._background_tasks.shutdown()
+        release_load.set()
+        with pytest.raises(RuntimeError, match="正在卸载"):
+            await creation
+
+    asyncio.run(scenario())
+
+    assert constructor_calls == 0
+    assert list(plugin._active_invocations) == []
+
+
 def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -667,7 +863,6 @@ def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
     plugin._wd14_io = types.SimpleNamespace(close=lambda: None)
     plugin._http_io = types.SimpleNamespace(close=lambda: None)
     plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
-    plugin._foreground_tasks = set()
     plugin._active_invocations = WeakSet()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
     admission_clear_calls: list[bool] = []
@@ -736,7 +931,6 @@ def test_foreground_invocation_closes_after_success_and_failure(
     plugin = object.__new__(NaiPicPlugin)
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
-    plugin._foreground_tasks = set()
     invocations = [_DummyInvocation(), _DummyInvocation(), _DummyInvocation()]
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
@@ -778,7 +972,6 @@ def test_unload_cancels_foreground_before_closing_http_runner(
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
     plugin._active_invocations = WeakSet()
-    plugin._foreground_tasks = set()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
     plugin._generation_admission_policy = types.SimpleNamespace(clear=lambda: None)
     events: list[str] = []
@@ -786,6 +979,7 @@ def test_unload_cancels_foreground_before_closing_http_runner(
     plugin._http_io = types.SimpleNamespace(close=lambda: events.append("http-close"))
     monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
     invocation = _DummyInvocation()
+    started = asyncio.Event()
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
         plugin._active_invocations.add(invocation)
@@ -793,6 +987,7 @@ def test_unload_cancels_foreground_before_closing_http_runner(
 
     async def foreground_operation(_invocation: _DummyInvocation) -> None:
         try:
+            started.set()
             await asyncio.Event().wait()
         finally:
             events.append("foreground-finalize")
@@ -803,8 +998,7 @@ def test_unload_cancels_foreground_before_closing_http_runner(
         task = asyncio.create_task(
             plugin._run_foreground_invocation("stream-foreground", foreground_operation)
         )
-        while not plugin._foreground_tasks:
-            await asyncio.sleep(0)
+        await started.wait()
         await plugin.on_unload()
         assert task.cancelled()
 
@@ -812,7 +1006,6 @@ def test_unload_cancels_foreground_before_closing_http_runner(
 
     assert events == ["foreground-finalize", "wd14-close", "http-close"]
     assert invocation.close_calls == 1
-    assert plugin._foreground_tasks == set()
     assert list(plugin._active_invocations) == []
 
 
@@ -824,15 +1017,16 @@ def test_unload_cancels_retag_before_closing_wd14_runner(
     plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
     plugin._http_io = types.SimpleNamespace(close=lambda: None)
     plugin._active_invocations = WeakSet()
-    plugin._foreground_tasks = set()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
     plugin._generation_admission_policy = types.SimpleNamespace(clear=lambda: None)
     events: list[str] = []
     plugin._wd14_io = types.SimpleNamespace(close=lambda: events.append("wd14-close"))
     monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
+    started = asyncio.Event()
 
     async def blocking_retag(**_kwargs: Any) -> tuple[bool, str | None, bool]:
         try:
+            started.set()
             await asyncio.Event().wait()
         finally:
             events.append("retag-finalize")
@@ -843,12 +1037,10 @@ def test_unload_cancels_retag_before_closing_wd14_runner(
         task = asyncio.create_task(
             plugin.handle_nai_retag_command(stream_id="stream-retag", user_id="user-retag")
         )
-        while not plugin._foreground_tasks:
-            await asyncio.sleep(0)
+        await started.wait()
         await plugin.on_unload()
         assert task.cancelled()
 
     asyncio.run(scenario())
 
     assert events == ["retag-finalize", "wd14-close"]
-    assert plugin._foreground_tasks == set()

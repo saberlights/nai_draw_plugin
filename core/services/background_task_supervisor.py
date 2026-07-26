@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable
 
 
 JobFactory = Callable[[], Awaitable[Any]]
+BeforeStart = Callable[[], Awaitable[bool] | bool]
 FailureCallback = Callable[[Exception], Any]
 Finalizer = Callable[[], Any]
 
@@ -58,6 +59,75 @@ class BackgroundTaskSupervisor:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
+
+    async def run(self, job_factory: JobFactory, *, name: str) -> Any:
+        """在当前 Task 中运行前台工作，并纳入卸载取消范围。"""
+        if self._closing:
+            raise RuntimeError("插件正在卸载，拒绝新的前台调用")
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("前台工作必须运行在 asyncio Task 中")
+        self._tasks.add(task)
+        try:
+            return await job_factory()
+        finally:
+            self._tasks.discard(task)
+
+    async def submit(
+        self,
+        job_factory: JobFactory,
+        *,
+        before_start: BeforeStart,
+        name: str,
+        on_failure: FailureCallback | None = None,
+        finalize: Finalizer | None = None,
+    ) -> bool:
+        """先登记提交任务，再执行确认步骤；确认成功后在同一任务中运行 job。"""
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[bool] = loop.create_future()
+        confirmed = False
+
+        async def _submission() -> None:
+            nonlocal confirmed
+            try:
+                result = before_start()
+                accepted = await result if inspect.isawaitable(result) else result
+                if not accepted:
+                    ready.set_result(False)
+                    return
+                confirmed = True
+                ready.set_result(True)
+                await job_factory()
+            except asyncio.CancelledError:
+                if not ready.done():
+                    ready.set_result(False)
+                raise
+            except Exception as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+
+        async def _on_failure(exc: Exception) -> None:
+            if confirmed:
+                await self._invoke_failure_callback(on_failure, exc, name)
+
+        task = self.start(
+            _submission,
+            name=name,
+            on_failure=_on_failure,
+            finalize=finalize,
+        )
+        if task is None:
+            await self._invoke_finalizer(finalize, name)
+            return False
+        try:
+            accepted = await ready
+        except BaseException:
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        if not accepted:
+            await asyncio.gather(task, return_exceptions=True)
+        return accepted
 
     async def shutdown(self) -> None:
         """停止接单，取消并等待所有已登记任务终态清理。"""

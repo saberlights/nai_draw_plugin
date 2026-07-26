@@ -140,3 +140,102 @@ def test_finalizer_cancellation_does_not_leave_shutdown_waiting_forever() -> Non
         return finalized
 
     assert asyncio.run(scenario()) == 1
+
+
+def test_run_rejects_after_shutdown_and_cancels_registered_foreground_work() -> None:
+    async def scenario() -> tuple[bool, int]:
+        supervisor = BackgroundTaskSupervisor(logger=_Logger())
+        started = asyncio.Event()
+        finalized = 0
+
+        async def foreground() -> None:
+            nonlocal finalized
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized += 1
+
+        task = asyncio.create_task(supervisor.run(foreground, name="foreground"))
+        await started.wait()
+        await supervisor.shutdown()
+        assert task.cancelled()
+
+        rejected_calls = 0
+
+        async def rejected() -> None:
+            nonlocal rejected_calls
+            rejected_calls += 1
+
+        try:
+            await supervisor.run(rejected, name="late-foreground")
+        except RuntimeError as exc:
+            rejected = "正在卸载" in str(exc)
+        else:
+            rejected = False
+        return rejected, finalized + rejected_calls
+
+    assert asyncio.run(scenario()) == (True, 1)
+
+
+def test_submit_registers_before_confirmation_and_shutdown_aborts_job() -> None:
+    async def scenario() -> tuple[bool, int, int]:
+        supervisor = BackgroundTaskSupervisor(logger=_Logger())
+        confirmation_started = asyncio.Event()
+        job_calls = 0
+        finalizer_calls = 0
+
+        async def confirm() -> bool:
+            confirmation_started.set()
+            await asyncio.Event().wait()
+            return True
+
+        async def job() -> None:
+            nonlocal job_calls
+            job_calls += 1
+
+        def finalize() -> None:
+            nonlocal finalizer_calls
+            finalizer_calls += 1
+
+        submission = asyncio.create_task(
+            supervisor.submit(
+                job,
+                before_start=confirm,
+                name="confirmed-job",
+                finalize=finalize,
+            )
+        )
+        await confirmation_started.wait()
+        await supervisor.shutdown()
+        submitted = await submission
+        return submitted, job_calls, finalizer_calls
+
+    assert asyncio.run(scenario()) == (False, 0, 1)
+
+
+def test_submit_runs_job_only_after_successful_confirmation() -> None:
+    async def scenario() -> tuple[bool, list[str]]:
+        supervisor = BackgroundTaskSupervisor(logger=_Logger())
+        events: list[str] = []
+
+        async def confirm() -> bool:
+            events.append("confirmed")
+            return True
+
+        async def job() -> None:
+            events.append("job")
+
+        submitted = await supervisor.submit(
+            job,
+            before_start=confirm,
+            name="confirmed-job",
+            finalize=lambda: events.append("finalized"),
+        )
+        await asyncio.sleep(0)
+        return submitted, events
+
+    assert asyncio.run(scenario()) == (
+        True,
+        ["confirmed", "job", "finalized"],
+    )
