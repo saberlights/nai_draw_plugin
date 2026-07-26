@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, Awaitable, Callable, List, TypeVar
 from weakref import WeakSet
 
 import inspect
@@ -30,6 +30,7 @@ from .sdk_runtime import NaiInvocation
 
 
 logger = get_logger("nai_draw_plugin")
+InvocationResultT = TypeVar("InvocationResultT")
 
 
 def _load_online_retriever_api() -> tuple[Any, Any] | None:
@@ -608,6 +609,19 @@ class NaiPicPlugin(MaiBotPlugin):
         self._active_invocations.add(invocation)
         return invocation
 
+    async def _run_foreground_invocation(
+        self,
+        stream_id: str,
+        operation: Callable[[NaiInvocation], Awaitable[InvocationResultT]],
+        **invocation_kwargs: Any,
+    ) -> InvocationResultT:
+        """执行前台 Invocation，并在任意终态释放其资源。"""
+        invocation = await self._create_invocation(stream_id, **invocation_kwargs)
+        try:
+            return await operation(invocation)
+        finally:
+            self._close_invocation(invocation)
+
     @Command(
         "nai_admin_control_command",
         description="NAI 管理命令：/nai <st|sp|set|art|size|ban|unban|banlist|help>",
@@ -623,15 +637,15 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai st|sp|set|art|size|help`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        action = str((matched_groups or {}).get("action", "") or "").strip()
+        param = str((matched_groups or {}).get("param", "") or "").strip()
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_admin_command(action, param),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        action = str((matched_groups or {}).get("action", "") or "").strip()
-        param = str((matched_groups or {}).get("param", "") or "").strip()
-        return await invocation.handle_admin_command(action, param)
 
     @Command(
         "nai_recall_control_command",
@@ -648,14 +662,14 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai on|off`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_recall_switch(action),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
-        return await invocation.handle_recall_switch(action)
 
     @Command(
         "nai_nsfw_control_command",
@@ -672,14 +686,14 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai nsfw`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_nsfw_command(action),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
-        return await invocation.handle_nsfw_command(action)
 
     @Command(
         "nai_manual_recall_command",
@@ -696,13 +710,13 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai 撤回`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.manual_recall(),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.manual_recall()
 
     @Command(
         "nai_retag_command",
@@ -751,6 +765,7 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         description = str((matched_groups or {}).get("description", "") or "").strip()
         if not await invocation.ensure_generation_permission():
+            self._close_invocation(invocation)
             return False, "没有权限", True
         if not await self._start_command_image_generation(
             stream_id,
@@ -786,6 +801,7 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         tags = str((matched_groups or {}).get("tags", "") or "").strip()
         if not await invocation.ensure_generation_permission():
+            self._close_invocation(invocation)
             return False, "没有权限", True
         if not await self._start_command_image_generation(
             stream_id,
@@ -857,14 +873,14 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai pt on|off`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_prompt_show_command(action),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
-        return await invocation.handle_prompt_show_command(action)
 
     @Command(
         "nai_tag_retriever_show_command",
@@ -881,14 +897,14 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai tag on|off`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_tag_retriever_show_command(action),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
-        return await invocation.handle_tag_retriever_show_command(action)
 
     @Command(
         "nai_models_command",
@@ -905,16 +921,13 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """处理 `/nai models`。"""
         del kwargs
-        invocation = await self._create_invocation(
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_models_command(),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        try:
-            return await invocation.handle_models_command()
-        finally:
-            self._close_invocation(invocation)
 
     @Command(
         "nai_i2i_command",
@@ -1230,14 +1243,14 @@ class NaiPicPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> tuple[bool, str | None, bool]:
         del kwargs
-        invocation = await self._create_invocation(
+        value = str((matched_groups or {}).get("value", "") or "").strip()
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_ref_type_command(value),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        value = str((matched_groups or {}).get("value", "") or "").strip()
-        return await invocation.handle_ref_type_command(value)
 
     async def _run_image_to_image_command(
         self,
@@ -1269,6 +1282,7 @@ class NaiPicPlugin(MaiBotPlugin):
             matched_groups=matched_groups,
         )
         if not await invocation.ensure_generation_permission():
+            self._close_invocation(invocation)
             return False, "没有权限", True
 
         if not await self._start_command_image_generation(
@@ -1310,8 +1324,10 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         # 先过管理员鉴权，避免非管理员看到"收到，正在生成图片"再被拒绝的误导
         if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
+            self._close_invocation(invocation)
             return False, "没有管理员权限", True
         if not await invocation.ensure_generation_permission():
+            self._close_invocation(invocation)
             return False, "没有权限", True
 
         if not await self._start_command_image_generation(
@@ -1337,32 +1353,38 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """/nai vibe存 / /nai ref存：取引用图存入对应命名图库。"""
         name = str((matched_groups or {}).get("name", "") or "").strip()
-        invocation = await self._create_invocation(
+
+        async def _operation(invocation: NaiInvocation) -> tuple[bool, str | None, bool]:
+            # 先过管理员鉴权再做图片查找，避免非管理员收到“未找到参考图”误导提示。
+            if not await invocation._ensure_named_reference_admin(scope=scope, action="save"):
+                return False, "没有管理员权限", True
+
+            image_base64 = self._image_cache_service.resolve_image_base64(
+                stream_id=stream_id,
+                user_id=user_id,
+            )
+            if not image_base64:
+                scope_cmd = "vibe存" if scope == "vibe" else "ref存"
+                await self.ctx.send.text(
+                    f"❌ 未找到参考图\n请引用回复一张图后再发送 /nai {scope_cmd} <名字>，"
+                    "或在同一条消息内附图加命令",
+                    stream_id,
+                    storage_message=False,
+                )
+                return False, "未找到图片", True
+
+            return await invocation.handle_named_reference_save(
+                scope=scope,
+                name=name,
+                image_base64=image_base64,
+            )
+
+        return await self._run_foreground_invocation(
             stream_id,
+            _operation,
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
-        )
-        # 先过管理员鉴权再做图片查找，避免非管理员收到"未找到参考图"误导提示
-        if not await invocation._ensure_named_reference_admin(scope=scope, action="save"):
-            return False, "没有管理员权限", True
-
-        image_base64 = self._image_cache_service.resolve_image_base64(
-            stream_id=stream_id,
-            user_id=user_id,
-        )
-        if not image_base64:
-            scope_cmd = "vibe存" if scope == "vibe" else "ref存"
-            await self.ctx.send.text(
-                f"❌ 未找到参考图\n请引用回复一张图后再发送 /nai {scope_cmd} <名字>，"
-                "或在同一条消息内附图加命令",
-                stream_id,
-                storage_message=False,
-            )
-            return False, "未找到图片", True
-
-        return await invocation.handle_named_reference_save(
-            scope=scope, name=name, image_base64=image_base64
         )
 
     async def _run_named_reference_list_command(
@@ -1375,13 +1397,13 @@ class NaiPicPlugin(MaiBotPlugin):
         scope: str,
     ) -> tuple[bool, str | None, bool]:
         """/nai vibe图库 / /nai ref图库。"""
-        invocation = await self._create_invocation(
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_named_reference_list(scope=scope),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.handle_named_reference_list(scope=scope)
 
     async def _run_named_reference_delete_command(
         self,
@@ -1394,13 +1416,16 @@ class NaiPicPlugin(MaiBotPlugin):
     ) -> tuple[bool, str | None, bool]:
         """/nai vibe删 / /nai ref删。"""
         name = str((matched_groups or {}).get("name", "") or "").strip()
-        invocation = await self._create_invocation(
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_named_reference_delete(
+                scope=scope,
+                name=name,
+            ),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.handle_named_reference_delete(scope=scope, name=name)
 
     async def _run_named_reference_select_command(
         self,
@@ -1418,13 +1443,16 @@ class NaiPicPlugin(MaiBotPlugin):
         """
         names_str = str((matched_groups or {}).get("names", "") or "").strip()
         names = [token for token in names_str.split() if token]
-        invocation = await self._create_invocation(
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_named_reference_select(
+                scope=scope,
+                names=names,
+            ),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.handle_named_reference_select(scope=scope, names=names)
 
     async def _run_named_reference_clear_command(
         self,
@@ -1436,13 +1464,13 @@ class NaiPicPlugin(MaiBotPlugin):
         scope: str,
     ) -> tuple[bool, str | None, bool]:
         """/nai vibe清空 / /nai ref清空：一键清空当前用户该 scope 的全部图 + 选定。"""
-        invocation = await self._create_invocation(
+        return await self._run_foreground_invocation(
             stream_id,
+            lambda invocation: invocation.handle_named_reference_clear_all(scope=scope),
             group_id=group_id,
             user_id=user_id,
             matched_groups=matched_groups,
         )
-        return await invocation.handle_named_reference_clear_all(scope=scope)
 
     async def _run_named_reference_draw_raw_command(
         self,
@@ -1472,8 +1500,10 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         # 先过管理员鉴权，避免非管理员看到"收到，正在生成图片"再被拒绝的误导
         if not await invocation._ensure_named_reference_admin(scope=scope, action="draw"):
+            self._close_invocation(invocation)
             return False, "没有管理员权限", True
         if not await invocation.ensure_generation_permission():
+            self._close_invocation(invocation)
             return False, "没有权限", True
 
         if not await self._start_command_image_generation(

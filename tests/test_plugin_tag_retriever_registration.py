@@ -208,13 +208,14 @@ class _RejectedSend(_DummySend):
 
 
 class _DummyInvocation:
-    def __init__(self) -> None:
+    def __init__(self, *, generation_allowed: bool = True) -> None:
         self.draw_calls: list[str] = []
         self.nai0_calls: list[str] = []
         self.close_calls = 0
+        self.generation_allowed = generation_allowed
 
     async def ensure_generation_permission(self) -> bool:
-        return True
+        return self.generation_allowed
 
     async def handle_nai_draw(self, description: str) -> tuple[bool, str | None, bool]:
         self.draw_calls.append(description)
@@ -223,6 +224,13 @@ class _DummyInvocation:
     async def handle_nai0_draw(self, tags: str) -> tuple[bool, str | None, bool]:
         self.nai0_calls.append(tags)
         return True, tags, True
+
+    async def handle_admin_command(
+        self,
+        action: str,
+        param: str,
+    ) -> tuple[bool, str | None, bool]:
+        return True, f"{action}:{param}", True
 
     def close(self) -> None:
         self.close_calls += 1
@@ -362,6 +370,59 @@ def test_duplicate_generation_closes_rejected_invocation_without_starting_it() -
     assert started is False
     assert job_calls == 0
     assert invocation.close_calls == 1
+
+
+def test_generation_permission_rejection_closes_invocation_without_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation(generation_allowed=False)
+
+    async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    result = asyncio.run(
+        plugin.handle_nai_draw(
+            stream_id="stream-permission-rejected",
+            matched_groups={"description": "初音未来"},
+        )
+    )
+
+    assert result == (False, "没有权限", True)
+    assert plugin.ctx.send.text_calls == []
+    assert invocation.draw_calls == []
+    assert invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []
+
+
+def test_foreground_command_uses_managed_invocation_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._active_invocations = WeakSet()
+    invocation = _DummyInvocation()
+
+    async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    result = asyncio.run(
+        plugin.handle_nai_admin_control_command(
+            stream_id="stream-admin",
+            matched_groups={"action": "size", "param": "1024x1024"},
+        )
+    )
+
+    assert result == (True, "size:1024x1024", True)
+    assert invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []
 
 
 def test_command_background_failure_reports_once_and_closes_invocation() -> None:
@@ -505,3 +566,42 @@ def test_closing_supervisor_rejects_generation_and_releases_acquired_lease() -> 
     assert job_calls == 0
     assert invocation.close_calls == 1
     assert session_state.get_pending_image_generation_started_at(stream_id) is None
+
+
+def test_foreground_invocation_closes_after_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._active_invocations = WeakSet()
+    invocations = [_DummyInvocation(), _DummyInvocation(), _DummyInvocation()]
+
+    async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
+        invocation = invocations.pop(0)
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    async def succeed(invocation: _DummyInvocation) -> str:
+        return "success"
+
+    async def reject(invocation: _DummyInvocation) -> tuple[bool, str]:
+        return False, "rejected"
+
+    async def fail(invocation: _DummyInvocation) -> str:
+        raise RuntimeError("foreground failure")
+
+    first_invocation, second_invocation, third_invocation = invocations
+
+    async def scenario() -> tuple[str, tuple[bool, str]]:
+        result = await plugin._run_foreground_invocation("stream-success", succeed)
+        rejected = await plugin._run_foreground_invocation("stream-rejected", reject)
+        with pytest.raises(RuntimeError, match="foreground failure"):
+            await plugin._run_foreground_invocation("stream-failure", fail)
+        return result, rejected
+
+    assert asyncio.run(scenario()) == ("success", (False, "rejected"))
+    assert first_invocation.close_calls == 1
+    assert second_invocation.close_calls == 1
+    assert third_invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []
