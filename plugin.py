@@ -425,10 +425,6 @@ class NaiPicPlugin(MaiBotPlugin):
             self._image_cache_service.remember_command_message(message)
         return {"action": "continue"}
 
-    def _is_image_generation_pending(self, stream_id: str) -> bool:
-        """检查当前会话是否已有进行中的图片任务。"""
-        return bool(stream_id and session_state.get_pending_image_generation_started_at(stream_id) is not None)
-
     def _start_image_generation_in_background(
         self,
         stream_id: str,
@@ -439,10 +435,9 @@ class NaiPicPlugin(MaiBotPlugin):
             self._run_invocation_in_background(coroutine_factory())
             return True
 
-        if self._is_image_generation_pending(stream_id):
+        pending_owner = session_state.acquire_pending_image_generation(stream_id)
+        if pending_owner is None:
             return False
-
-        session_state.set_pending_image_generation(stream_id)
 
         async def _runner() -> None:
             try:
@@ -450,7 +445,7 @@ class NaiPicPlugin(MaiBotPlugin):
             except Exception:
                 return
             finally:
-                session_state.clear_pending_image_generation(stream_id)
+                session_state.release_pending_image_generation(stream_id, pending_owner)
 
         self._track_task(asyncio.create_task(_runner()))
         return True

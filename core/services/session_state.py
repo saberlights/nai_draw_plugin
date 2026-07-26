@@ -14,11 +14,12 @@
 
 替代原来分散在各个 Command 类中的状态字典
 """
-import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from src.common.logger import get_logger
 
 from .nsfw_state_store import nsfw_state_store
+from .session_preferences import SessionPreferences
+from .transient_generation_state import TransientGenerationState
 
 logger = get_logger("nai_draw_plugin")
 
@@ -46,52 +47,9 @@ class SessionStateManager:
         return cls._instance
 
     def _init_state(self):
-        """初始化所有状态字典"""
-        # 管理员模式：{chat_key: bool}
-        self._admin_mode: Dict[str, bool] = {}
-
-        # 模型选择：{chat_key: model_name}
-        self._selected_models: Dict[str, str] = {}
-
-        # 画师串选择：{chat_key: index}（索引从1开始）
-        self._selected_artists: Dict[str, int] = {}
-
-        # 尺寸选择：{chat_key: size_string}
-        self._selected_sizes: Dict[str, str] = {}
-
-        # 自动撤回：{chat_key: bool}
-        self._recall_enabled: Dict[str, bool] = {}
-
-        # NSFW过滤：{chat_key: bool}
-        self._nsfw_filter: Dict[str, bool] = {}
-
-        # 提示词显示：{chat_key: bool}
-        self._prompt_show: Dict[str, bool] = {}
-
-        # Danbooru 检索结果显示：{chat_key: bool}
-        self._tag_retriever_show: Dict[str, bool] = {}
-
-        # 角色参考提取目标：{chat_key: "character" / "style" / "character&style"}
-        # 缺省回退 character_reference.type 配置；仅 /nai ref 路径生效
-        self._character_reference_type: Dict[str, str] = {}
-
-        # 上一轮 LLM 生成的正向提示词（用于 action 生图上下文继承）
-        # key 使用 chat_stream.stream_id（BaseAction.chat_id），天然实现”全群共享”
-        # value = (prompt, request, timestamp)
-        self._last_nai_context: Dict[str, Tuple[str, str, float]] = {}
-
-        # 上一轮自拍场景上下文（仅用于 bot 自拍/展示照连续性）
-        # value = (prompt, request, scene_summary, anchor_data, timestamp)
-        self._last_selfie_context: Dict[str, Tuple[str, str, str, Dict[str, List[str]], float]] = {}
-
-        # 最近一次自动出图时间（用于 Action 节流，避免连续频繁发图）
-        self._last_action_image_sent_at: Dict[str, float] = {}
-
-        # 最近一次 reply-hook 自动跟图发送时间（独立间隔门，避免与 explicit/proactive 互相冻结）
-        self._last_auto_draw_sent_at: Dict[str, float] = {}
-
-        # 当前仍在生成中的图片任务（用于拦截同会话重复启动）
-        self._pending_image_generation_started_at: Dict[str, float] = {}
+        """初始化偏好与瞬态生成状态 Module。"""
+        self._preferences = SessionPreferences()
+        self._transient = TransientGenerationState()
 
     @staticmethod
     def _make_key(platform: str, chat_id: str) -> str:
@@ -118,14 +76,15 @@ class SessionStateManager:
             bool: 是否启用管理员模式
         """
         key = self._make_key(platform, chat_id)
-        if key in self._admin_mode:
-            return self._admin_mode[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.admin_mode is not None:
+            return preference.admin_mode
         return get_config("admin.default_admin_mode", False)
 
     def set_admin_mode(self, platform: str, chat_id: str, enabled: bool):
         """设置管理员模式"""
         key = self._make_key(platform, chat_id)
-        self._admin_mode[key] = enabled
+        self._preferences.update(key, admin_mode=bool(enabled))
         logger.info(f"[nai_pic] 会话 {key} 管理员模式已{'开启' if enabled else '关闭'}")
 
     def check_user_permission(
@@ -179,12 +138,13 @@ class SessionStateManager:
     def get_selected_model(self, platform: str, chat_id: str) -> Optional[str]:
         """获取指定会话选定的模型"""
         key = self._make_key(platform, chat_id)
-        return self._selected_models.get(key)
+        preference = self._preferences.get(key)
+        return preference.selected_model if preference is not None else None
 
     def set_selected_model(self, platform: str, chat_id: str, model: str):
         """设置模型"""
         key = self._make_key(platform, chat_id)
-        self._selected_models[key] = model
+        self._preferences.update(key, selected_model=model)
         logger.info(f"[nai_pic] 会话 {key} 已切换模型: {model}")
 
     # ==================== 画师串选择 ====================
@@ -192,7 +152,10 @@ class SessionStateManager:
     def get_selected_artist_index(self, platform: str, chat_id: str) -> int:
         """获取指定会话选定的画师串索引（从1开始）"""
         key = self._make_key(platform, chat_id)
-        return self._selected_artists.get(key, 1)
+        preference = self._preferences.get(key)
+        if preference is None or preference.selected_artist_index is None:
+            return 1
+        return preference.selected_artist_index
 
     def get_effective_artist_index(
         self,
@@ -216,8 +179,9 @@ class SessionStateManager:
             return 1
 
         key = self._make_key(platform, chat_id)
-        if key in self._selected_artists:
-            selected_index = self._selected_artists[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.selected_artist_index is not None:
+            selected_index = preference.selected_artist_index
             return selected_index if 1 <= selected_index <= len(artist_presets) else 1
 
         return self._resolve_default_artist_index(config_section, artist_presets, get_config)
@@ -225,7 +189,7 @@ class SessionStateManager:
     def set_selected_artist_index(self, platform: str, chat_id: str, index: int):
         """设置画师串索引"""
         key = self._make_key(platform, chat_id)
-        self._selected_artists[key] = index
+        self._preferences.update(key, selected_artist_index=index)
         logger.info(f"[nai_pic] 会话 {key} 已切换画师串: #{index}")
 
     def get_selected_artist_preset(
@@ -276,8 +240,9 @@ class SessionStateManager:
 
         # 优先使用会话中手动切换的画师串
         key = self._make_key(platform, chat_id)
-        if key in self._selected_artists:
-            selected_index = self._selected_artists[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.selected_artist_index is not None:
+            selected_index = preference.selected_artist_index
         else:
             selected_index = self._resolve_default_artist_index(config_section, artist_presets, get_config)
 
@@ -364,12 +329,13 @@ class SessionStateManager:
     def get_selected_size(self, platform: str, chat_id: str) -> Optional[str]:
         """获取指定会话选定的尺寸"""
         key = self._make_key(platform, chat_id)
-        return self._selected_sizes.get(key)
+        preference = self._preferences.get(key)
+        return preference.selected_size if preference is not None else None
 
     def set_selected_size(self, platform: str, chat_id: str, size: str):
         """设置尺寸"""
         key = self._make_key(platform, chat_id)
-        self._selected_sizes[key] = size
+        self._preferences.update(key, selected_size=size)
         logger.info(f"[nai_pic] 会话 {key} 已切换尺寸: {size}")
 
     # ==================== 自动撤回 ====================
@@ -382,14 +348,15 @@ class SessionStateManager:
     ) -> bool:
         """检查是否启用自动撤回"""
         key = self._make_key(platform, chat_id)
-        if key in self._recall_enabled:
-            return self._recall_enabled[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.recall_enabled is not None:
+            return preference.recall_enabled
         return get_config("auto_recall.enabled", False)
 
     def set_recall_enabled(self, platform: str, chat_id: str, enabled: bool):
         """设置自动撤回"""
         key = self._make_key(platform, chat_id)
-        self._recall_enabled[key] = enabled
+        self._preferences.update(key, recall_enabled=bool(enabled))
         logger.info(f"[nai_pic] 会话 {key} 自动撤回已{'开启' if enabled else '关闭'}")
 
     # ==================== NSFW过滤 ====================
@@ -402,22 +369,18 @@ class SessionStateManager:
     ) -> bool:
         """检查是否启用NSFW过滤。
 
-        优先级：持久化 store（含跨重启状态） > 进程内显式 set（本次启动） > 配置默认。
+        优先级：持久化 store（含跨重启状态） > 配置默认。
         store 命中即返回，让重启后的实例继续沿用上次会话的开关。
         """
         persisted = nsfw_state_store.get(platform, chat_id)
         if persisted is not None:
             return persisted
-        key = self._make_key(platform, chat_id)
-        if key in self._nsfw_filter:
-            return self._nsfw_filter[key]
         return get_config("nsfw_filter.enabled", False)
 
     def set_nsfw_filter_enabled(self, platform: str, chat_id: str, enabled: bool):
         """设置NSFW过滤并落盘，跨重启保留。"""
-        key = self._make_key(platform, chat_id)
-        self._nsfw_filter[key] = enabled
         nsfw_state_store.set(platform, chat_id, enabled)
+        key = self._make_key(platform, chat_id)
         logger.info(f"[nai_pic] 会话 {key} NSFW过滤已{'开启' if enabled else '关闭'}")
 
     # ==================== 提示词显示 ====================
@@ -430,8 +393,9 @@ class SessionStateManager:
     ) -> bool:
         """检查是否启用提示词显示"""
         key = self._make_key(platform, chat_id)
-        if key in self._prompt_show:
-            return self._prompt_show[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.prompt_show_enabled is not None:
+            return preference.prompt_show_enabled
         default_enabled = get_config("prompt_show.enabled", None)
         if default_enabled is not None:
             return bool(default_enabled)
@@ -442,7 +406,7 @@ class SessionStateManager:
     def set_prompt_show_enabled(self, platform: str, chat_id: str, enabled: bool):
         """设置提示词显示"""
         key = self._make_key(platform, chat_id)
-        self._prompt_show[key] = enabled
+        self._preferences.update(key, prompt_show_enabled=bool(enabled))
         logger.info(f"[nai_pic] 会话 {key} 提示词显示已{'开启' if enabled else '关闭'}")
 
     def is_tag_retriever_show_enabled(
@@ -453,14 +417,15 @@ class SessionStateManager:
     ) -> bool:
         """检查是否启用 Danbooru 检索结果显示。"""
         key = self._make_key(platform, chat_id)
-        if key in self._tag_retriever_show:
-            return self._tag_retriever_show[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.tag_retriever_show_enabled is not None:
+            return preference.tag_retriever_show_enabled
         return bool(get_config("tag_retriever.show_result", False))
 
     def set_tag_retriever_show_enabled(self, platform: str, chat_id: str, enabled: bool) -> None:
         """设置 Danbooru 检索结果显示。"""
         key = self._make_key(platform, chat_id)
-        self._tag_retriever_show[key] = enabled
+        self._preferences.update(key, tag_retriever_show_enabled=bool(enabled))
         logger.info(f"[nai_pic] 会话 {key} Danbooru 检索结果显示已{'开启' if enabled else '关闭'}")
 
     # ==================== 角色参考提取目标（/nai ref） ====================
@@ -477,8 +442,9 @@ class SessionStateManager:
     ) -> str:
         """读取本会话的 character_references.type，缺省回退 config / API 默认。"""
         key = self._make_key(platform, chat_id)
-        if key in self._character_reference_type:
-            return self._character_reference_type[key]
+        preference = self._preferences.get(key)
+        if preference is not None and preference.character_reference_type is not None:
+            return preference.character_reference_type
         raw = str(get_config("character_reference.type", "character&style") or "").strip()
         if raw not in self._ALLOWED_CHARACTER_REFERENCE_TYPES:
             return "character&style"
@@ -493,7 +459,7 @@ class SessionStateManager:
                 f"{self._ALLOWED_CHARACTER_REFERENCE_TYPES}"
             )
         key = self._make_key(platform, chat_id)
-        self._character_reference_type[key] = normalized
+        self._preferences.update(key, character_reference_type=normalized)
         logger.info(f"[nai_pic] 会话 {key} 角色参考类型已切换: {normalized}")
 
     # ==================== 调试/管理 ====================
@@ -503,31 +469,20 @@ class SessionStateManager:
         key = self._make_key(platform, chat_id)
         return {
             "key": key,
-            "admin_mode": self._admin_mode.get(key),
-            "model": self._selected_models.get(key),
-            "artist_index": self._selected_artists.get(key),
-            "size": self._selected_sizes.get(key),
-            "recall": self._recall_enabled.get(key),
+            **self._preferences.summary(key),
             "nsfw_filter": nsfw_state_store.get(platform, chat_id),
-            "prompt_show": self._prompt_show.get(key),
-            "tag_retriever_show": self._tag_retriever_show.get(key),
-            "character_reference_type": self._character_reference_type.get(key),
         }
 
     def clear_session_state(self, platform: str, chat_id: str):
         """清除指定会话的所有状态（含 NSFW 持久化条目）。"""
         key = self._make_key(platform, chat_id)
-        self._admin_mode.pop(key, None)
-        self._selected_models.pop(key, None)
-        self._selected_artists.pop(key, None)
-        self._selected_sizes.pop(key, None)
-        self._recall_enabled.pop(key, None)
-        self._nsfw_filter.pop(key, None)
+        self._preferences.clear(key)
         nsfw_state_store.clear(platform, chat_id)
-        self._prompt_show.pop(key, None)
-        self._tag_retriever_show.pop(key, None)
-        self._character_reference_type.pop(key, None)
         logger.info(f"[nai_pic] 会话 {key} 状态已清除")
+
+    def clear_transient_generation_state(self, chat_stream_id: str) -> None:
+        """清除一个聊天流的生成上下文、冷却与 pending 状态。"""
+        self._transient.clear_session(chat_stream_id)
 
     # ==================== 上一轮提示词（Action 专用） ====================
 
@@ -543,33 +498,20 @@ class SessionStateManager:
         Returns:
             (prompt, request)；无数据或已过期时返回 (None, None)
         """
-        if not chat_stream_id:
-            return None, None
-        entry = self._last_nai_context.get(chat_stream_id)
-        if entry is None:
-            return None, None
-        prompt, request, ts = entry
-        if ttl > 0 and (time.time() - ts) > ttl:
-            self._last_nai_context.pop(chat_stream_id, None)
-            return None, None
-        return prompt, request or None
+        return self._transient.get_last_nai_context(chat_stream_id, ttl)
 
     def set_last_nai_context(
-        self, chat_stream_id: str, prompt: str, request: str = ""
+        self,
+        chat_stream_id: str,
+        prompt: str,
+        request: str = "",
+        ttl: float = 0,
     ) -> None:
         """设置指定聊天流的上一轮 LLM 提示词及用户请求。
 
         自动附带当前时间戳。
         """
-        if not chat_stream_id:
-            return
-        if not isinstance(prompt, str) or not prompt.strip():
-            return
-        self._last_nai_context[chat_stream_id] = (
-            prompt.strip(),
-            (request or "").strip(),
-            time.time(),
-        )
+        self._transient.set_last_nai_context(chat_stream_id, prompt, request, ttl)
 
     # ==================== 上一轮自拍场景（Action 自拍专用） ====================
 
@@ -577,16 +519,7 @@ class SessionStateManager:
         self, chat_stream_id: str, ttl: float = 0
     ) -> Tuple[Optional[str], Optional[str], Optional[str], Dict[str, List[str]]]:
         """获取指定聊天流的上一轮自拍提示词、请求、场景摘要与结构化锚点。"""
-        if not chat_stream_id:
-            return None, None, None, {}
-        entry = self._last_selfie_context.get(chat_stream_id)
-        if entry is None:
-            return None, None, None, {}
-        prompt, request, scene_summary, anchor_data, ts = entry
-        if ttl > 0 and (time.time() - ts) > ttl:
-            self._last_selfie_context.pop(chat_stream_id, None)
-            return None, None, None, {}
-        return prompt or None, request or None, scene_summary or None, dict(anchor_data or {})
+        return self._transient.get_last_selfie_context(chat_stream_id, ttl)
 
     def set_last_selfie_context(
         self,
@@ -595,71 +528,57 @@ class SessionStateManager:
         request: str = "",
         scene_summary: str = "",
         anchor_data: Optional[Dict[str, List[str]]] = None,
+        ttl: float = 0,
     ) -> None:
         """设置指定聊天流的上一轮自拍提示词、请求、场景摘要与结构化锚点。"""
-        if not chat_stream_id:
-            return
-        prompt_text = (prompt or "").strip()
-        scene_text = (scene_summary or "").strip()
-        normalized_anchor_data = dict(anchor_data or {})
-        if not prompt_text and not scene_text and not normalized_anchor_data:
-            return
-        self._last_selfie_context[chat_stream_id] = (
-            prompt_text,
-            (request or "").strip(),
-            scene_text,
-            normalized_anchor_data,
-            time.time(),
+        self._transient.set_last_selfie_context(
+            chat_stream_id,
+            prompt,
+            request,
+            scene_summary,
+            anchor_data,
+            ttl,
         )
 
     # ==================== Action 最近出图时间 ====================
 
     def get_last_action_image_sent_at(self, chat_stream_id: str) -> Optional[float]:
         """获取指定聊天流最近一次自动出图成功发送时间。"""
-        if not chat_stream_id:
-            return None
-        return self._last_action_image_sent_at.get(chat_stream_id)
+        return self._transient.get_last_action_image_sent_at(chat_stream_id)
 
     def set_last_action_image_sent_at(self, chat_stream_id: str, sent_at: Optional[float] = None) -> None:
         """记录指定聊天流最近一次自动出图成功发送时间。"""
-        if not chat_stream_id:
-            return
-        timestamp = float(sent_at if sent_at is not None else time.time())
-        self._last_action_image_sent_at[chat_stream_id] = timestamp
+        self._transient.set_last_action_image_sent_at(chat_stream_id, sent_at)
 
     def get_last_auto_draw_sent_at(self, chat_stream_id: str) -> Optional[float]:
         """获取指定聊天流最近一次 reply-hook 自动跟图发送时间。"""
-        if not chat_stream_id:
-            return None
-        return self._last_auto_draw_sent_at.get(chat_stream_id)
+        return self._transient.get_last_auto_draw_sent_at(chat_stream_id)
 
     def set_last_auto_draw_sent_at(self, chat_stream_id: str, sent_at: Optional[float] = None) -> None:
         """记录指定聊天流最近一次 reply-hook 自动跟图发送时间。"""
-        if not chat_stream_id:
-            return
-        timestamp = float(sent_at if sent_at is not None else time.time())
-        self._last_auto_draw_sent_at[chat_stream_id] = timestamp
+        self._transient.set_last_auto_draw_sent_at(chat_stream_id, sent_at)
 
     # ==================== 图片生成中状态 ====================
 
     def get_pending_image_generation_started_at(self, chat_stream_id: str) -> Optional[float]:
         """获取指定聊天流当前生成中的图片任务开始时间。"""
-        if not chat_stream_id:
-            return None
-        return self._pending_image_generation_started_at.get(chat_stream_id)
+        return self._transient.get_pending_image_generation_started_at(chat_stream_id)
+
+    def acquire_pending_image_generation(self, chat_stream_id: str) -> Optional[str]:
+        """原子获取当前聊天流的生成 lease。"""
+        return self._transient.acquire_pending_image_generation(chat_stream_id)
+
+    def release_pending_image_generation(self, chat_stream_id: str, owner: str) -> bool:
+        """仅由 lease owner 清除当前聊天流的 pending 状态。"""
+        return self._transient.release_pending_image_generation(chat_stream_id, owner)
 
     def set_pending_image_generation(self, chat_stream_id: str, started_at: Optional[float] = None) -> None:
         """标记指定聊天流存在进行中的图片任务。"""
-        if not chat_stream_id:
-            return
-        timestamp = float(started_at if started_at is not None else time.time())
-        self._pending_image_generation_started_at[chat_stream_id] = timestamp
+        self._transient.set_pending_image_generation(chat_stream_id, started_at)
 
     def clear_pending_image_generation(self, chat_stream_id: str) -> None:
         """清除指定聊天流的图片生成中状态。"""
-        if not chat_stream_id:
-            return
-        self._pending_image_generation_started_at.pop(chat_stream_id, None)
+        self._transient.clear_pending_image_generation(chat_stream_id)
 
 
 # 全局单例实例

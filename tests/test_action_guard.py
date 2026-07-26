@@ -115,8 +115,7 @@ def _build_invocation(*, stream_id: str = "test-stream") -> NaiInvocation:
 
 
 def _reset_interval_state(stream_id: str) -> None:
-    session_state._last_action_image_sent_at.pop(stream_id, None)
-    session_state._last_auto_draw_sent_at.pop(stream_id, None)
+    session_state.clear_transient_generation_state(stream_id)
 
 
 def _wrap_aged(text_fetcher):

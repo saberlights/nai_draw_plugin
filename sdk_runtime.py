@@ -2019,6 +2019,7 @@ class NaiInvocation(ModelConfigMixin):
                 self.stream_id,
                 description,
                 raw_description,
+                ttl=float(self.get_config("prompt_generator.inherit_ttl", 0) or 0),
             )
             structured_payload = None
 
@@ -2149,6 +2150,7 @@ class NaiInvocation(ModelConfigMixin):
                 self.stream_id,
                 description,
                 raw_description,
+                ttl=float(self.get_config("prompt_generator.inherit_ttl", 0) or 0),
             )
             structured_payload = None
 

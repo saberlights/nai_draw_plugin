@@ -104,11 +104,11 @@ class PromptGenerationWorkflow:
         previous_request = ""
         last_selfie_prompt = ""
         last_selfie_request = ""
+        inherit_ttl = self._as_float(
+            self._get_config("prompt_generator.inherit_ttl", 0),
+            0.0,
+        )
         if allow_inherit and self._stream_id:
-            inherit_ttl = self._as_float(
-                self._get_config("prompt_generator.inherit_ttl", 0),
-                0.0,
-            )
             previous_prompt, previous_request = session_state.get_last_nai_context(
                 self._stream_id,
                 ttl=inherit_ttl,
@@ -164,6 +164,7 @@ class PromptGenerationWorkflow:
                 self._stream_id,
                 cleaned_prompt,
                 request_text,
+                inherit_ttl,
             )
         return PromptGenerationResult(cleaned_prompt, structured_payload)
 
