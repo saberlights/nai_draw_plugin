@@ -1,4 +1,4 @@
-"""WD14 Tagger 客户端 - 多 Space 并发轮询负载均衡。
+"""WD14 Tagger 客户端 - 多 Space 串行轮询。
 
 从 prompt_generator_plugin 移植，关键差异：gradio_client 改为软依赖，
 缺失时构造不抛、调用时返回 WD14ClientError，让 PNG 元数据反推可独立运行。
@@ -34,7 +34,7 @@ class WD14ClientError(Exception):
 
 
 class WD14Client:
-    """WD14 Tagger 客户端 - 多 Space 轮询负载均衡"""
+    """WD14 Tagger 客户端 - 多 Space 串行轮询。"""
 
     # 实测 1~2MB 大图在 HF Space 上推理耗时 16~23s（含队列等待 + 推理 + 上传），
     # 但 PixAI-Tagger-v0.9-ONNX 等冷启动后首次跑常常远超 35s，把单 Space 上限抬到
@@ -402,7 +402,6 @@ class WD14Client:
     ) -> Dict[str, Any]:
         """处理官方 WD14 Space 的返回结果"""
         # 新 API 返回 4 个值：output_string, rating, output_characters, output_tags
-        output_string = result[0] if len(result) > 0 else ""
         rating = result[1] if len(result) > 1 else {}
         output_characters = result[2] if len(result) > 2 else {}
         output_tags = result[3] if len(result) > 3 else {}
@@ -475,10 +474,6 @@ class WD14Client:
     ) -> Dict[str, Any]:
         """处理 PixAI Tagger Space 的返回结果"""
         # PixAI API 返回 6 个值：general_tags, character_tags, ip_tags, combined_tags, timings, raw_json
-        general_tags_str = result[0] if len(result) > 0 else ""
-        character_tags_str = result[1] if len(result) > 1 else ""
-        ip_tags_str = result[2] if len(result) > 2 else ""
-        combined_tags_str = result[3] if len(result) > 3 else ""
         raw_json = result[5] if len(result) > 5 else {}
 
         self.logger.debug(f"PixAI API 返回长度: {len(result)}")
@@ -618,7 +613,6 @@ class WD14Client:
     ) -> Dict[str, Any]:
         """处理 Danbooru V4 Space 的返回结果"""
         # Danbooru V4 API 返回 5 个值：output_string, general_dict, artist_dict, character_dict, rating_dict
-        output_string = result[0] if len(result) > 0 else ""
         general_dict = result[1] if len(result) > 1 else {}
         artist_dict = result[2] if len(result) > 2 else {}
         character_dict = result[3] if len(result) > 3 else {}
