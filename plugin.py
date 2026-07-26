@@ -1,4 +1,4 @@
-from typing import Any, Awaitable, Callable, List, TypeVar
+from typing import Any, Awaitable, Callable, TypeVar
 from weakref import WeakSet
 
 import asyncio
@@ -51,8 +51,8 @@ class NaiPicPlugin(MaiBotPlugin):
     plugin_version = PLUGIN_CONFIG.plugin_version
     plugin_author = PLUGIN_CONFIG.plugin_author
     enable_plugin = True
-    dependencies: List[str] = []
-    python_dependencies: List[str] = ["httpx", "requests"]
+    dependencies: list[str] = []
+    python_dependencies: list[str] = ["httpx", "requests"]
     config_file_name = "config.toml"
 
     # MaiBot SDK 通过这些类属性发现配置；定义与渲染由同一个配置 Module 驱动。
