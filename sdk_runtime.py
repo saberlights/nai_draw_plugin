@@ -8,9 +8,6 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
-import json
-import tomllib
-from uuid import uuid4
 from typing import Any, Dict, List, Optional
 
 import asyncio
@@ -20,25 +17,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
-from aiohttp import ClientSession, ClientTimeout
 
 from src.common.logger import get_logger
 
 from .runtime_recall import (
-    MANUAL_RECALL_TTL_SECONDS,
     discard_pending_plugin_image_send,
-    extract_plugin_row_message_id,
-    is_napcat_action_accepted,
-    load_recent_plugin_image_rows,
-    load_recent_session_image_rows,
-    load_recent_tracked_plugin_image_rows,
     normalize_db_timestamp,
-    prune_recent_ids,
     remember_pending_plugin_image_send,
-    remember_recent_id,
-    resolve_db_path,
-    select_recent_plugin_image_row,
-    wait_for_formal_message_id,
 )
 
 from .core.clients.nai_web_client import NaiWebClient
@@ -54,6 +39,7 @@ from .core.rules.selfie_rules import (
 from .core.services.llm_text_generator import MaiBotLLMTextGenerator
 from .core.services.prompt_generation_workflow import PromptGenerationWorkflow
 from .core.services.random_scene_planner import RandomScenePlanner
+from .core.services.recall_workflow import RecallWorkflow
 from .core.services.session_state import session_state
 from .core.services.user_blacklist import user_blacklist
 from .core.services.named_reference_store import (
@@ -91,9 +77,6 @@ from .core.utils.prompt_postprocessor import (
 from .core.utils.random_scene_description import parse_random_scene_request
 
 logger = get_logger("nai_draw_plugin")
-_DB_PATH = resolve_db_path(__file__)
-_RECENT_MANUAL_RECALL_IDS: dict[str, dict[str, float]] = {}
-_NAPCAT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "MaiBot-Napcat-Adapter" / "config.toml"
 
 
 def _scope_label(scope: str) -> str:
@@ -103,96 +86,6 @@ def _scope_label(scope: str) -> str:
     if scope == _NAMED_SCOPE_REF:
         return "角色参考"
     return scope
-
-
-def _load_napcat_server_config() -> dict[str, Any] | None:
-    """读取 Napcat 连接配置，供撤回动作直连使用。"""
-    if not _NAPCAT_CONFIG_PATH.is_file():
-        return None
-
-    try:
-        with _NAPCAT_CONFIG_PATH.open("rb") as fp:
-            config_data = tomllib.load(fp)
-    except Exception as exc:
-        logger.warning("[nai_low] 读取 Napcat 配置失败: %r", exc)
-        return None
-
-    server_config = config_data.get("napcat_server")
-    if not isinstance(server_config, dict):
-        return None
-
-    host = str(server_config.get("host") or "").strip()
-    port = server_config.get("port")
-    token = str(server_config.get("token") or "").strip()
-    timeout = server_config.get("action_timeout_sec", 15.0)
-
-    try:
-        normalized_port = int(port)
-    except (TypeError, ValueError):
-        return None
-
-    try:
-        action_timeout = max(1.0, float(timeout))
-    except (TypeError, ValueError):
-        action_timeout = 15.0
-
-    if not host or normalized_port <= 0:
-        return None
-
-    return {
-        "ws_url": f"ws://{host}:{normalized_port}",
-        "token": token,
-        "action_timeout_sec": action_timeout,
-    }
-
-
-async def _find_last_plugin_image_row(
-    invocation: "NaiInvocation",
-    *,
-    limit: int = 120,
-    target_send_timestamp: float | None = None,
-    exclude_message_ids: set[str] | None = None,
-) -> dict[str, Any] | None:
-    """从宿主消息库中读取最近一条本插件图片消息。"""
-    if not getattr(invocation, "stream_id", ""):
-        return None
-
-    tracked_rows = load_recent_tracked_plugin_image_rows(
-        invocation.stream_id,
-        limit=limit,
-    )
-    tracked_row = select_recent_plugin_image_row(
-        tracked_rows,
-        target_send_timestamp=target_send_timestamp,
-        exclude_message_ids=exclude_message_ids,
-    )
-    if tracked_row is not None:
-        return tracked_row
-
-    marked_rows = load_recent_plugin_image_rows(
-        _DB_PATH,
-        invocation.stream_id,
-        NAI_PIC_IMAGE_DISPLAY_MARKER,
-        limit=limit,
-    )
-    marked_row = select_recent_plugin_image_row(
-        marked_rows,
-        target_send_timestamp=target_send_timestamp,
-        exclude_message_ids=exclude_message_ids,
-    )
-    if marked_row is not None:
-        return marked_row
-
-    fallback_rows = load_recent_session_image_rows(
-        _DB_PATH,
-        invocation.stream_id,
-        limit=limit,
-    )
-    return select_recent_plugin_image_row(
-        fallback_rows,
-        target_send_timestamp=target_send_timestamp,
-        exclude_message_ids=exclude_message_ids,
-    )
 
 
 def _get_nested_config_value(config_data: dict[str, Any], key: str, default: Any = None) -> Any:
@@ -459,6 +352,14 @@ class NaiInvocation(ModelConfigMixin):
         self._random_scene_planner = RandomScenePlanner(
             config=random_scene_config if isinstance(random_scene_config, dict) else {},
             text_generator=text_generator,
+            log_prefix=self.log_prefix,
+        )
+        self._recall_workflow = RecallWorkflow(
+            config=self.plugin_config,
+            stream_id=self.stream_id,
+            context=self.ctx,
+            send_text=self.send_text,
+            track_task=self.plugin._track_task,
             log_prefix=self.log_prefix,
         )
         self._last_send_timestamp: float | None = None
@@ -786,224 +687,16 @@ class NaiInvocation(ModelConfigMixin):
                         return text, _row_age_seconds(row)
         return "", None
 
-    async def _find_last_plugin_image_message_id(
-        self,
-        *,
-        limit: int = 120,
-        target_send_timestamp: float | None = None,
-        exclude_message_ids: Optional[set[str]] = None,
-    ) -> str | None:
-        """查找最近一条本插件发送的图片消息。"""
-        try:
-            row = await _find_last_plugin_image_row(
-                self,
-                limit=limit,
-                target_send_timestamp=target_send_timestamp,
-                exclude_message_ids=exclude_message_ids,
-            )
-        except Exception as exc:
-            logger.warning("%s 读取本地消息库失败: %r", self.log_prefix, exc)
-            row = None
-
-        if row:
-            message_id = extract_plugin_row_message_id(row)
-            if message_id:
-                return message_id
-
-        return None
-
-    def _get_recent_manual_recall_ids(self) -> set[str]:
-        """获取当前会话最近已经尝试手动撤回过的消息 ID。"""
-        return prune_recent_ids(
-            _RECENT_MANUAL_RECALL_IDS,
-            getattr(self, "stream_id", ""),
-            ttl_seconds=MANUAL_RECALL_TTL_SECONDS,
-        )
-
-    def _remember_recent_manual_recall_id(self, message_id: str) -> None:
-        """记录当前会话刚尝试手动撤回过的消息 ID。"""
-        remember_recent_id(
-            _RECENT_MANUAL_RECALL_IDS,
-            getattr(self, "stream_id", ""),
-            message_id,
-        )
-
-    def _get_manual_recall_max_age_seconds(self) -> float:
-        """读取手动撤回允许命中的最老图片年龄。"""
-        try:
-            raw_value = self.get_config("auto_recall.manual_max_age_seconds", 3600)
-        except Exception:
-            raw_value = 3600
-
-        try:
-            max_age_seconds = float(raw_value)
-        except (TypeError, ValueError):
-            return 3600.0
-
-        return max(0.0, max_age_seconds)
-
-    async def _resolve_local_plugin_image_message_id(
-        self,
-        *,
-        limit: int = 120,
-        target_send_timestamp: float | None = None,
-        exclude_message_ids: set[str] | None = None,
-        initial_row: dict[str, Any] | None = None,
-        id_wait_seconds: float | None = None,
-    ) -> str | None:
-        """围绕目标时间轮询本地消息库，等待占位 ID 变为正式 ID。"""
-        if id_wait_seconds is None:
-            try:
-                id_wait_seconds = max(0.0, float(self.get_config("auto_recall.id_wait_seconds", 15) or 15))
-            except (TypeError, ValueError):
-                id_wait_seconds = 15.0
-        else:
-            id_wait_seconds = max(0.0, float(id_wait_seconds))
-
-        async def _row_loader() -> dict[str, Any] | None:
-            try:
-                return await _find_last_plugin_image_row(
-                    self,
-                    limit=limit,
-                    target_send_timestamp=target_send_timestamp,
-                    exclude_message_ids=exclude_message_ids,
-                )
-            except Exception as exc:
-                logger.warning("%s 轮询本地消息库失败: %r", self.log_prefix, exc)
-                return None
-
-        return await wait_for_formal_message_id(
-            _row_loader,
-            initial_row=initial_row,
-            id_wait_seconds=id_wait_seconds,
-        )
-
-    async def _try_recall_message(self, message_id: str) -> bool:
-        """优先使用 Napcat API 撤回消息。"""
-        normalized_message_id = str(message_id or "").strip()
-        if not normalized_message_id or not getattr(self, "stream_id", ""):
-            return False
-
-        async def _try_direct_napcat_action() -> bool:
-            if not normalized_message_id.isdigit():
-                logger.warning("%s 撤回失败：消息ID不是纯数字: %s", self.log_prefix, normalized_message_id)
-                return False
-
-            server_config = _load_napcat_server_config()
-            if server_config is None:
-                logger.warning("%s 未找到可用的 Napcat 连接配置，无法直连撤回", self.log_prefix)
-                return False
-
-            headers = {"Authorization": f"Bearer {server_config['token']}"} if server_config.get("token") else {}
-            timeout = float(server_config.get("action_timeout_sec", 15.0))
-            echo_id = uuid4().hex
-            payload = {
-                "action": "delete_msg",
-                "params": {"message_id": int(normalized_message_id)},
-                "echo": echo_id,
-            }
-
-            try:
-                async with ClientSession(headers=headers, timeout=ClientTimeout(total=None, connect=10)) as session:
-                    async with session.ws_connect(
-                        str(server_config["ws_url"]),
-                        heartbeat=None,
-                    ) as ws:
-                        await ws.send_str(json.dumps(payload, ensure_ascii=False))
-
-                        deadline = asyncio.get_running_loop().time() + timeout
-                        while True:
-                            remaining = deadline - asyncio.get_running_loop().time()
-                            if remaining <= 0:
-                                raise TimeoutError(f"Napcat delete_msg 超时 ({timeout}s)")
-
-                            message = await asyncio.wait_for(ws.receive(), timeout=remaining)
-                            if message.type.name != "TEXT":
-                                continue
-
-                            response = json.loads(message.data)
-                            if str(response.get("echo") or "").strip() != echo_id:
-                                continue
-
-                            logger.debug("%s 撤回(napcat-ws) 结果: %r", self.log_prefix, response)
-                            return is_napcat_action_accepted(response)
-            except Exception as exc:
-                logger.warning("%s 撤回(napcat-ws) 失败: %r", self.log_prefix, exc)
-                return False
-
-        async def _capability_api_call(api_name: str, **api_args: Any) -> Any:
-            api_proxy = getattr(self.ctx, "api", None)
-            if api_proxy is not None and hasattr(api_proxy, "call"):
-                return await api_proxy.call(api_name, **api_args)
-
-            call_capability = getattr(self.ctx, "call_capability", None)
-            if callable(call_capability):
-                return await call_capability("api.call", api_name=api_name, args=api_args)
-
-            raise AttributeError("当前上下文不支持 API 能力调用")
-
-        async def _try_napcat_delete_api() -> bool:
-            if not normalized_message_id.isdigit():
-                logger.warning(
-                    "%s 撤回失败：消息ID不是纯数字，无法调用 napcat 删除 API: %s",
-                    self.log_prefix,
-                    normalized_message_id,
-                )
-                return False
-
-            try:
-                result = await _capability_api_call(
-                    "adapter.napcat.message.delete_msg",
-                    message_id=int(normalized_message_id),
-                )
-                logger.debug("%s 撤回(napcat-api) 结果: %r", self.log_prefix, result)
-                if not is_napcat_action_accepted(result):
-                    return False
-                return True
-            except Exception as exc:
-                logger.warning("%s 撤回(napcat-api) 失败: %r", self.log_prefix, exc)
-                return False
-
-        if await _try_direct_napcat_action():
-            return True
-        return await _try_napcat_delete_api()
-
     async def _schedule_auto_recall(self) -> None:
-        """调度自动撤回。"""
+        """把图片发送结果适配到召回工作流。"""
         platform, chat_id, _ = self._get_chat_identity()
-        if not chat_id:
-            return
-        if not session_state.is_recall_enabled(platform, chat_id, self.get_config):
-            return
-
-        try:
-            delay_seconds = max(0.0, float(self.get_config("auto_recall.delay_seconds", 5) or 5))
-        except (TypeError, ValueError):
-            delay_seconds = 5.0
-        try:
-            id_wait_seconds = max(0.0, float(self.get_config("auto_recall.id_wait_seconds", 15) or 15))
-        except (TypeError, ValueError):
-            id_wait_seconds = 15.0
-
-        target_send_timestamp = getattr(self, "_last_send_timestamp", None)
-
-        async def _job() -> None:
-            await asyncio.sleep(delay_seconds)
-            message_id = await self._resolve_local_plugin_image_message_id(
-                limit=120,
-                target_send_timestamp=target_send_timestamp,
-                id_wait_seconds=id_wait_seconds,
-            )
-            if not message_id:
-                logger.warning("%s 自动撤回未命中消息", self.log_prefix)
-                return
-            success = await self._try_recall_message(message_id)
-            if success:
-                logger.info("%s 已自动撤回消息 %s", self.log_prefix, message_id)
-            else:
-                logger.warning("%s 自动撤回失败: %s", self.log_prefix, message_id)
-
-        self.plugin._track_task(asyncio.create_task(_job()))
+        enabled = bool(
+            chat_id and session_state.is_recall_enabled(platform, chat_id, self.get_config)
+        )
+        await self._recall_workflow.schedule_auto_recall(
+            enabled=enabled,
+            send_timestamp=self._last_send_timestamp,
+        )
 
     async def _download_remote_image_as_base64(self, url: str) -> str | None:
         """下载远程图片并转为 Base64。"""
@@ -1213,96 +906,14 @@ class NaiInvocation(ModelConfigMixin):
         if not await self.ensure_user_not_blacklisted():
             return False, "黑名单用户", True
         try:
-            return await self._do_manual_recall()
+            return await self._recall_workflow.execute_manual_recall()
         except Exception as exc:
             logger.error("%s [手动撤回] 未预期异常: %r", self.log_prefix, exc, exc_info=True)
             try:
                 await self.send_text("❌ 撤回过程出现内部错误", storage_message=False)
-            except Exception:
-                pass
+            except Exception as send_exc:
+                logger.warning("%s [手动撤回] 内部错误提示发送失败: %r", self.log_prefix, send_exc)
             return False, "撤回内部错误", True
-
-    async def _do_manual_recall(self) -> tuple[bool, str | None, bool]:
-        """手动撤回的核心逻辑。"""
-        recent_excludes = self._get_recent_manual_recall_ids()
-        attempted_ids: set[str] = set(recent_excludes)
-        max_attempts = 5
-        max_age_seconds = self._get_manual_recall_max_age_seconds()
-        current_time = time.time()
-        skipped_stale_rows = False
-        attempted_recall = False
-
-        for _ in range(max_attempts):
-            row = await _find_last_plugin_image_row(
-                self,
-                limit=300,
-                exclude_message_ids=attempted_ids,
-            )
-            initial_message_id = extract_plugin_row_message_id(row)
-            if not initial_message_id:
-                break
-
-            target_send_timestamp = normalize_db_timestamp(row.get("timestamp")) if row else None
-            if (
-                max_age_seconds > 0
-                and target_send_timestamp is not None
-                and current_time - target_send_timestamp > max_age_seconds
-            ):
-                skipped_stale_rows = True
-                attempted_ids.add(initial_message_id)
-                logger.info(
-                    "%s [手动撤回] 跳过超出撤回窗口的图片: %s age=%.1fs",
-                    self.log_prefix,
-                    initial_message_id,
-                    current_time - target_send_timestamp,
-                )
-                continue
-
-            resolved_message_id = await self._resolve_local_plugin_image_message_id(
-                limit=300,
-                target_send_timestamp=target_send_timestamp,
-                exclude_message_ids=attempted_ids,
-                initial_row=row,
-            )
-            message_id = str(resolved_message_id or initial_message_id).strip()
-
-            current_attempt_ids = {
-                str(initial_message_id or "").strip(),
-                str(message_id or "").strip(),
-            }
-            current_attempt_ids.discard("")
-            attempted_ids.update(current_attempt_ids)
-
-            logger.info("%s [手动撤回] 准备撤回消息: %s", self.log_prefix, message_id)
-            attempted_recall = True
-            success = await self._try_recall_message(message_id)
-            if success:
-                for recent_id in current_attempt_ids:
-                    self._remember_recent_manual_recall_id(recent_id)
-                await self.send_text("✅ 已撤回", storage_message=False)
-                return True, "手动撤回成功", True
-
-            logger.warning("%s [手动撤回] 撤回失败，尝试上一条图片", self.log_prefix)
-
-        for recent_id in attempted_ids:
-            self._remember_recent_manual_recall_id(recent_id)
-
-        if attempted_ids == recent_excludes or (skipped_stale_rows and not attempted_recall):
-            logger.info("%s [手动撤回] 未找到可撤回的图片消息", self.log_prefix)
-            not_found_text = "❌ 找不到可撤回的图片（直接发送 /nai 撤回 即可按顺序撤回最近一张）"
-            if skipped_stale_rows:
-                not_found_text = "❌ 找不到近期可撤回的图片（图片可能已超过平台撤回时限）"
-            await self.send_text(
-                not_found_text,
-                storage_message=False,
-            )
-            return False, "找不到可撤回的消息", True
-
-        await self.send_text(
-            "❌ 撤回失败（可能消息已被删除、超过撤回时限、或 bot 无权撤回）",
-            storage_message=False,
-        )
-        return False, "手动撤回失败", True
 
     async def _send_image_result(
         self,

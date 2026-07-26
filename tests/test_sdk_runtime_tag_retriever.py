@@ -643,44 +643,6 @@ def test_send_image_result_falls_back_to_base64_after_remote_url_exception(
     assert len(session_marks) == 1
 
 
-def test_manual_recall_skips_stale_images_without_attempting_recall(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    invocation = _build_image_send_invocation()
-    invocation.stream_id = "stream-1"
-    invocation.get_config = lambda key, default=None: 3600 if key == "auto_recall.manual_max_age_seconds" else default
-
-    sent_texts: list[str] = []
-
-    async def fake_send_text(text: str, storage_message: bool = True) -> bool:
-        sent_texts.append(text)
-        return True
-
-    async def fake_find_last_plugin_image_row(*_args, **kwargs):
-        exclude_ids = set(kwargs.get("exclude_message_ids") or set())
-        if "old-image-id" in exclude_ids:
-            return None
-        return {
-            "message_id": "old-image-id",
-            "timestamp": "2024-05-11 12:00:00",
-            "is_picture": 1,
-        }
-
-    async def fake_try_recall_message(_message_id: str) -> bool:
-        pytest.fail("stale image should not trigger recall attempt")
-
-    monkeypatch.setattr(sdk_runtime_module, "_find_last_plugin_image_row", fake_find_last_plugin_image_row)
-    monkeypatch.setattr(sdk_runtime_module.time, "time", lambda: 1746954000.0)
-
-    invocation.send_text = fake_send_text
-    invocation._try_recall_message = fake_try_recall_message
-
-    result = asyncio.run(invocation._do_manual_recall())
-
-    assert result == (False, "找不到可撤回的消息", True)
-    assert sent_texts == ["❌ 找不到近期可撤回的图片（图片可能已超过平台撤回时限）"]
-
-
 def test_send_base64_image_result_sends_image_segment_directly() -> None:
     """_send_base64_image_result 始终以 image 段直发 base64，不依赖本地文件路径。"""
     invocation = _build_image_send_invocation()
