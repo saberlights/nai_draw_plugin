@@ -78,7 +78,6 @@ class NaiWebClient:
     _PROTECTION_RETRY_DELAY_SECONDS = 6.0
 
     def __init__(self, action_instance):
-        self.action = action_instance
         self.log_prefix = action_instance.log_prefix
         self.session: requests.Session = self._create_session(trust_env=True)
         self.direct_session: requests.Session = self._create_session(trust_env=False)
