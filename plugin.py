@@ -346,17 +346,14 @@ class NaiPicPlugin(MaiBotPlugin):
             source="reply_auto_draw",
         )
 
-        async def _runner() -> None:
-            try:
-                await invocation.handle_auto_draw_from_reply(
-                    description,
-                    reply_context_text=reply_text,
-                )
-            except Exception:
-                pass
-
         # 走通用后台启动：同 session 已有生成任务则丢弃这次跟图（避免叠加）
-        self._start_image_generation_in_background(normalized_session, _runner)
+        self._start_image_generation_in_background(
+            normalized_session,
+            lambda: invocation.handle_auto_draw_from_reply(
+                description,
+                reply_context_text=reply_text,
+            ),
+        )
 
     @HookHandler(
         "chat.receive.before_process",
