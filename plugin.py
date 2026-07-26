@@ -1,6 +1,7 @@
 from typing import Any, Awaitable, Callable, List, TypeVar
 from weakref import WeakSet
 
+import asyncio
 import inspect
 import os
 import re
@@ -88,6 +89,11 @@ class NaiPicPlugin(MaiBotPlugin):
         super().__init__()
         self._background_tasks = BackgroundTaskSupervisor(logger=logger)
         self._blocking_io = BlockingIORunner(thread_name_prefix="nai-plugin-io")
+        self._http_io = BlockingIORunner(
+            thread_name_prefix="nai-http-io",
+            max_workers=4,
+        )
+        self._foreground_tasks: set[asyncio.Task[Any]] = set()
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
         # reply 自动跟图：同一 session 在同一 reply 链路里只触发一次，避免 retry 重复出图。
         # key=session_id, value=已触发的 reply 文本哈希集合
@@ -111,6 +117,12 @@ class NaiPicPlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         """处理插件卸载。"""
         await self._background_tasks.shutdown()
+        foreground_tasks = list(self._foreground_tasks)
+        for task in foreground_tasks:
+            task.cancel()
+        if foreground_tasks:
+            await asyncio.gather(*foreground_tasks, return_exceptions=True)
+        self._http_io.close()
         self._blocking_io.close()
         for invocation in list(self._active_invocations):
             invocation.close()
@@ -616,11 +628,20 @@ class NaiPicPlugin(MaiBotPlugin):
         **invocation_kwargs: Any,
     ) -> InvocationResultT:
         """执行前台 Invocation，并在任意终态释放其资源。"""
-        invocation = await self._create_invocation(stream_id, **invocation_kwargs)
+        if self._background_tasks.is_closing:
+            raise RuntimeError("插件正在卸载，拒绝新的前台调用")
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._foreground_tasks.add(current_task)
         try:
-            return await operation(invocation)
+            invocation = await self._create_invocation(stream_id, **invocation_kwargs)
+            try:
+                return await operation(invocation)
+            finally:
+                self._close_invocation(invocation)
         finally:
-            self._close_invocation(invocation)
+            if current_task is not None:
+                self._foreground_tasks.discard(current_task)
 
     @Command(
         "nai_admin_control_command",

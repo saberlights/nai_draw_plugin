@@ -337,7 +337,10 @@ class NaiInvocation(ModelConfigMixin):
         self.text = str(text or "")
         self.source = source
         self.log_prefix = "nai_draw_plugin"
-        self.api_client = NaiWebClient(self)
+        self.api_client = NaiWebClient(
+            log_prefix=self.log_prefix,
+            run_blocking=self.plugin._http_io.run,
+        )
         text_generator = MaiBotLLMTextGenerator(self.log_prefix)
         self._prompt_generation_workflow = PromptGenerationWorkflow(
             config=self.plugin_config,

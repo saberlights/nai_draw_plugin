@@ -2,7 +2,7 @@ import asyncio
 import base64
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -77,8 +77,14 @@ class NaiWebClient:
     _RETRY_DELAY_SECONDS = 1.5
     _PROTECTION_RETRY_DELAY_SECONDS = 6.0
 
-    def __init__(self, action_instance):
-        self.log_prefix = action_instance.log_prefix
+    def __init__(
+        self,
+        *,
+        log_prefix: str,
+        run_blocking: Callable[..., Awaitable[Any]],
+    ) -> None:
+        self.log_prefix = log_prefix
+        self._run_blocking = run_blocking
         self.session: requests.Session | None = None
         self.direct_session: requests.Session | None = None
         # 上一次 _parse_response 提取出的 vibe cache 注释（文档 §20.3.1）；
@@ -96,6 +102,10 @@ class NaiWebClient:
                 continue
         self.session = None
         self.direct_session = None
+
+    @staticmethod
+    def _close_response(response: requests.Response) -> None:
+        response.close()
 
     # ========== Session 与配置解析 ==========
 
@@ -1095,12 +1105,13 @@ class NaiWebClient:
             # 模型列表请求轻量，给一个较短的固定超时
             request_timeout = min(self._resolve_request_timeout(model_config), 30.0)
 
-            response = await asyncio.to_thread(
+            response = await self._run_blocking(
                 self._send_get_request,
                 url,
                 headers,
                 proxy_mode,
                 request_timeout,
+                cancel_result=self._close_response,
             )
         except requests.RequestException as exc:
             logger.error(f"{self.log_prefix} (NewAPI) /v1/models 网络异常: {exc}")
@@ -1129,12 +1140,13 @@ class NaiWebClient:
         headers = self._build_image_request_headers(api_key)
         proxy_mode = self._resolve_proxy_mode(model_config)
         request_timeout = self._resolve_request_timeout(model_config)
-        response = await asyncio.to_thread(
+        response = await self._run_blocking(
             self._send_get_request,
             url,
             headers,
             proxy_mode,
             request_timeout,
+            cancel_result=self._close_response,
         )
         try:
             if response.status_code != 200:
@@ -1234,13 +1246,14 @@ class NaiWebClient:
         response: Optional[requests.Response] = None
         for attempt in range(1, self._MAX_TRANSPORT_RETRY_ATTEMPTS + 1):
             try:
-                response = await asyncio.to_thread(
+                response = await self._run_blocking(
                     self._send_request,
                     url,
                     body,
                     headers,
                     proxy_mode,
                     request_timeout,
+                    cancel_result=self._close_response,
                 )
             except requests.RequestException as exc:
                 if (

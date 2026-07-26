@@ -404,7 +404,9 @@ def test_foreground_command_uses_managed_invocation_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
+    plugin._foreground_tasks = set()
     invocation = _DummyInvocation()
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
@@ -510,7 +512,9 @@ def test_unload_cancels_generation_releases_lease_and_closes_invocation_once(
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._http_io = types.SimpleNamespace(close=lambda: None)
     plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
+    plugin._foreground_tasks = set()
     plugin._active_invocations = WeakSet()
     plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
     monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
@@ -572,7 +576,9 @@ def test_foreground_invocation_closes_after_success_and_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
+    plugin._foreground_tasks = set()
     invocations = [_DummyInvocation(), _DummyInvocation(), _DummyInvocation()]
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
@@ -604,4 +610,47 @@ def test_foreground_invocation_closes_after_success_and_failure(
     assert first_invocation.close_calls == 1
     assert second_invocation.close_calls == 1
     assert third_invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []
+
+
+def test_unload_cancels_foreground_before_closing_http_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._blocking_io = types.SimpleNamespace(close=lambda: None)
+    plugin._active_invocations = WeakSet()
+    plugin._foreground_tasks = set()
+    plugin._image_cache_service = types.SimpleNamespace(clear=lambda: None)
+    events: list[str] = []
+    plugin._http_io = types.SimpleNamespace(close=lambda: events.append("http-close"))
+    monkeypatch.setattr(plugin, "_refresh_runtime_singletons", lambda **_kwargs: None)
+    invocation = _DummyInvocation()
+
+    async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    async def foreground_operation(_invocation: _DummyInvocation) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            events.append("foreground-finalize")
+
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            plugin._run_foreground_invocation("stream-foreground", foreground_operation)
+        )
+        while not plugin._foreground_tasks:
+            await asyncio.sleep(0)
+        await plugin.on_unload()
+        assert task.cancelled()
+
+    asyncio.run(scenario())
+
+    assert events == ["foreground-finalize", "http-close"]
+    assert invocation.close_calls == 1
+    assert plugin._foreground_tasks == set()
     assert list(plugin._active_invocations) == []

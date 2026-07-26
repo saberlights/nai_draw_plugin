@@ -8,6 +8,7 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import requests
 
 MAIBOT_ROOT = Path(__file__).resolve().parents[3]
@@ -47,7 +48,14 @@ def test_http_sessions_are_created_lazily_and_closed_when_initialized(monkeypatc
         return session
 
     monkeypatch.setattr(NaiWebClient, "_create_session", staticmethod(create_session))
-    client = NaiWebClient(types.SimpleNamespace(log_prefix="test"))
+
+    async def run_inline(function, *args, **_kwargs):
+        return function(*args)
+
+    client = NaiWebClient(
+        log_prefix="test",
+        run_blocking=run_inline,
+    )
 
     assert created == []
     assert client._get_session(False) is created[0][1]
@@ -60,6 +68,35 @@ def test_http_sessions_are_created_lazily_and_closed_when_initialized(monkeypatc
         (False, 1),
         (True, 1),
     ]
+
+
+def test_client_uses_injected_blocking_runner_instead_of_default_executor(monkeypatch) -> None:
+    calls: list[tuple[object, ...]] = []
+    response = types.SimpleNamespace(
+        status_code=200,
+        text="",
+        close=lambda: None,
+        json=lambda: {"data": [{"id": "nai-diffusion-4-5-full"}]},
+    )
+
+    async def run_inline(function, *args, **_kwargs):
+        calls.append((function, *args))
+        return function(*args)
+
+    async def fail_to_thread(*_args, **_kwargs):
+        pytest.fail("NaiWebClient 不应使用 asyncio 默认执行器")
+
+    client = NaiWebClient(
+        log_prefix="test",
+        run_blocking=run_inline,
+    )
+    monkeypatch.setattr(client, "_send_get_request", lambda *_args: response)
+    monkeypatch.setattr(asyncio, "to_thread", fail_to_thread)
+
+    result = asyncio.run(client.list_models({"base_url": "https://gateway.example.com"}))
+
+    assert result == (True, ["nai-diffusion-4-5-full"])
+    assert len(calls) == 1
 
 
 def test_build_inner_draw_params_uses_integer_array_size_and_omits_random_seed() -> None:
@@ -419,7 +456,13 @@ def _make_response(status_code: int, json_body: object | None = None, text: str 
 
 def _make_client_stub() -> NaiWebClient:
     """绕过 __init__ 的 Session 创建，只测纯解析逻辑。"""
-    return NaiWebClient.__new__(NaiWebClient)
+    client = NaiWebClient.__new__(NaiWebClient)
+
+    async def run_inline(function, *args, **_kwargs):
+        return function(*args)
+
+    client._run_blocking = run_inline
+    return client
 
 
 class _RecordingSession:
@@ -570,11 +613,11 @@ def test_download_image_bytes_uses_get_and_closes_response(monkeypatch) -> None:
         calls.append(args)
         return response
 
-    async def run_inline(function, *args):
+    async def run_inline(function, *args, **_kwargs):
         return function(*args)
 
     monkeypatch.setattr(client, "_send_get_request", send_get)
-    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    client._run_blocking = run_inline
 
     content = asyncio.run(
         client.download_image_bytes(
@@ -616,11 +659,11 @@ def test_download_image_bytes_does_not_forward_api_key_cross_origin(monkeypatch)
         calls.append(args)
         return response
 
-    async def run_inline(function, *args):
+    async def run_inline(function, *args, **_kwargs):
         return function(*args)
 
     monkeypatch.setattr(client, "_send_get_request", send_get)
-    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    client._run_blocking = run_inline
 
     api_key = secrets.token_hex(16)
     content = asyncio.run(
@@ -690,11 +733,11 @@ def test_download_image_bytes_rejects_http_error_non_image_and_empty_content(mon
     def send_get(*_args):
         return responses.pop(0)
 
-    async def run_inline(function, *args):
+    async def run_inline(function, *args, **_kwargs):
         return function(*args)
 
     monkeypatch.setattr(client, "_send_get_request", send_get)
-    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    client._run_blocking = run_inline
     model_config = {"nai_proxy_mode": "direct", "nai_request_timeout": 8.0}
     error_response, json_response, empty_response = list(responses)
 
@@ -717,10 +760,10 @@ def test_list_models_closes_response_after_parsing(monkeypatch) -> None:
     )
     response.close = lambda: setattr(response, "close_calls", response.close_calls + 1)
 
-    async def run_inline(function, *args):
+    async def run_inline(function, *args, **_kwargs):
         return response
 
-    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    client._run_blocking = run_inline
 
     result = asyncio.run(client.list_models({"base_url": "https://gateway.example.com"}))
 
@@ -771,14 +814,14 @@ def test_request_retry_closes_intermediate_response(monkeypatch) -> None:
     def send_request(*_args):
         return responses.pop(0)
 
-    async def run_inline(function, *args):
+    async def run_inline(function, *args, **_kwargs):
         return function(*args)
 
     async def no_sleep(_delay):
         return None
 
     monkeypatch.setattr(client, "_send_request", send_request)
-    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    client._run_blocking = run_inline
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
     response = asyncio.run(

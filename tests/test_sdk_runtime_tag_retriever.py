@@ -173,6 +173,35 @@ def _build_image_send_invocation() -> NaiInvocation:
     return invocation
 
 
+def test_invocation_injects_plugin_http_runner_into_web_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _CapturingWebClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    async def run_blocking(function, *args, **kwargs):
+        return function(*args)
+
+    monkeypatch.setattr(sdk_runtime_module, "NaiWebClient", _CapturingWebClient)
+    monkeypatch.setattr(NaiInvocation, "_is_tag_retriever_show_enabled", lambda self: False)
+    plugin = types.SimpleNamespace(
+        ctx=object(),
+        _http_io=types.SimpleNamespace(run=run_blocking),
+        _background_tasks=types.SimpleNamespace(start=lambda *_args, **_kwargs: None),
+    )
+
+    invocation = NaiInvocation(plugin, {}, "stream-http-runner")
+
+    assert invocation.api_client.__class__ is _CapturingWebClient
+    assert captured == {
+        "log_prefix": "nai_draw_plugin",
+        "run_blocking": run_blocking,
+    }
+
+
 def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     retriever_config = {
         "enabled": True,
