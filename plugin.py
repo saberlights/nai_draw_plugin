@@ -230,12 +230,11 @@ def _webui_section_title(section_name: str, group_headers: dict[str, Any]) -> st
 
 def _dump_scalar_kv(key: str, value: Any) -> str:
     """用 tomlkit 序列化单个 key=value 行，确保字符串转义、数字格式等正确。"""
-    import tomlkit as _tomlkit
     try:
-        snippet = _tomlkit.dumps({key: value}).rstrip("\n")
+        snippet = tomlkit.dumps({key: value}).rstrip("\n")
     except Exception:
         # 兜底：value 不被 tomlkit 接受时，转字符串重试
-        snippet = _tomlkit.dumps({key: str(value)}).rstrip("\n")
+        snippet = tomlkit.dumps({key: str(value)}).rstrip("\n")
     return snippet
 
 
@@ -466,10 +465,6 @@ class NaiPicPlugin(MaiBotPlugin):
         "model_nai4": "----- NAI V4 -----",
         "model_nai3": "----- NAI V3 / V3 Furry -----",
     }
-
-    # 配置节描述（兼容老逻辑用，新渲染不会再把它单独输出为 section 上方注释；
-    # 仅为 schema 内联 dict 字段做兜底，避免删后老代码崩）。
-    config_section_descriptions: dict[str, str] = {}
 
     # 不渲染到 config.toml 的字段（schema 仍保留以便高级用户手动覆盖；默认值在代码层走兜底）。
     # 结构：{section_name: {field_name, ...}}
@@ -1390,15 +1385,8 @@ class NaiPicPlugin(MaiBotPlugin):
         """
         if isinstance(scope, dict):
             _scope = "self"
-            _config_data = scope
-            _version = str(config_data or version or "")
         else:
             _scope = scope
-            _config_data = config_data if isinstance(config_data, dict) else {}
-            _version = version
-
-        del _config_data
-        del _version
 
         if _scope == "self":
             self._refresh_runtime_singletons()
