@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import asyncio
 import json
+import secrets
 import sys
 import types
 from pathlib import Path
@@ -549,3 +551,246 @@ def test_parse_models_response_rejects_missing_data_array() -> None:
     success, payload = client._parse_models_response(response)
     assert success is False
     assert "data" in payload  # type: ignore[operator]
+
+
+def test_download_image_bytes_uses_get_and_closes_response(monkeypatch) -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    response = types.SimpleNamespace(
+        status_code=200,
+        headers={"content-type": "image/png"},
+        content=b"png-bytes",
+        text="",
+        close_calls=0,
+    )
+    response.close = lambda: setattr(response, "close_calls", response.close_calls + 1)
+    calls: list[tuple[object, ...]] = []
+
+    def send_get(*args):
+        calls.append(args)
+        return response
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(client, "_send_get_request", send_get)
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    content = asyncio.run(
+        client.download_image_bytes(
+            "https://cdn.example.com/image.png",
+            {
+                "base_url": "https://cdn.example.com/v1",
+                "api_key": "secret",
+                "nai_proxy_mode": "auto",
+                "nai_request_timeout": 12.5,
+            },
+        )
+    )
+
+    assert content == b"png-bytes"
+    assert calls == [
+        (
+            "https://cdn.example.com/image.png",
+            {"Accept": "image/*", "Authorization": "Bearer secret"},
+            "auto",
+            12.5,
+        )
+    ]
+    assert response.close_calls == 1
+
+
+def test_download_image_bytes_does_not_forward_api_key_cross_origin(monkeypatch) -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    response = types.SimpleNamespace(
+        status_code=200,
+        headers={"content-type": "image/png"},
+        content=b"png-bytes",
+        close_calls=0,
+    )
+    response.close = lambda: setattr(response, "close_calls", response.close_calls + 1)
+    calls: list[tuple[object, ...]] = []
+
+    def send_get(*args):
+        calls.append(args)
+        return response
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(client, "_send_get_request", send_get)
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    api_key = secrets.token_hex(16)
+    content = asyncio.run(
+        client.download_image_bytes(
+            "https://cdn.example.com/image.png",
+            {
+                "base_url": "https://gateway.example.com/v1",
+                "api_key": api_key,
+            },
+        )
+    )
+
+    assert content == b"png-bytes"
+    assert calls[0][1] == {"Accept": "image/*"}
+    assert api_key not in str(calls[0][1])
+    assert response.close_calls == 1
+
+
+def test_same_origin_normalizes_default_ports_and_rejects_scheme_changes() -> None:
+    assert NaiWebClient._same_origin(
+        "https://gateway.example.com/image.png",
+        "https://gateway.example.com:443/v1",
+    )
+    assert not NaiWebClient._same_origin(
+        "http://gateway.example.com/image.png",
+        "https://gateway.example.com/v1",
+    )
+    assert not NaiWebClient._same_origin(
+        "https://gateway.example.com:444/image.png",
+        "https://gateway.example.com/v1",
+    )
+
+
+def test_download_image_bytes_rejects_http_error_non_image_and_empty_content(monkeypatch) -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    responses = [
+        types.SimpleNamespace(
+            status_code=404,
+            headers={"content-type": "text/plain"},
+            content=b"not found",
+            text="not found",
+            close_calls=0,
+        ),
+        types.SimpleNamespace(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            content=b'{"error":"not an image"}',
+            text='{"error":"not an image"}',
+            close_calls=0,
+        ),
+        types.SimpleNamespace(
+            status_code=200,
+            headers={"content-type": "image/png"},
+            content=b"",
+            text="",
+            close_calls=0,
+        ),
+    ]
+    for response in responses:
+        response.close = lambda response=response: setattr(
+            response,
+            "close_calls",
+            response.close_calls + 1,
+        )
+
+    def send_get(*_args):
+        return responses.pop(0)
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    monkeypatch.setattr(client, "_send_get_request", send_get)
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    model_config = {"nai_proxy_mode": "direct", "nai_request_timeout": 8.0}
+    error_response, json_response, empty_response = list(responses)
+
+    assert asyncio.run(client.download_image_bytes("https://cdn.example.com/missing", model_config)) is None
+    assert asyncio.run(client.download_image_bytes("https://cdn.example.com/error", model_config)) is None
+    assert asyncio.run(client.download_image_bytes("https://cdn.example.com/empty", model_config)) is None
+    assert error_response.close_calls == 1
+    assert json_response.close_calls == 1
+    assert empty_response.close_calls == 1
+
+
+def test_list_models_closes_response_after_parsing(monkeypatch) -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    response = types.SimpleNamespace(
+        status_code=200,
+        text="",
+        close_calls=0,
+        json=lambda: {"data": [{"id": "nai-diffusion-4-5-full"}]},
+    )
+    response.close = lambda: setattr(response, "close_calls", response.close_calls + 1)
+
+    async def run_inline(function, *args):
+        return response
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    result = asyncio.run(client.list_models({"base_url": "https://gateway.example.com"}))
+
+    assert result == (True, ["nai-diffusion-4-5-full"])
+    assert response.close_calls == 1
+
+
+def test_generate_image_closes_response_after_parsing(monkeypatch) -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    client._last_response_vibe_cache_ids = []
+    response = types.SimpleNamespace(close_calls=0)
+    response.close = lambda: setattr(response, "close_calls", response.close_calls + 1)
+
+    async def send_request(**_kwargs):
+        return response
+
+    monkeypatch.setattr(client, "_send_request_with_retry", send_request)
+    monkeypatch.setattr(client, "_parse_response", lambda _response: (True, "image-base64"))
+
+    result = asyncio.run(
+        client.generate_image(
+            "1girl",
+            {
+                "base_url": "https://gateway.example.com",
+                "default_model": "nai-diffusion-4-5-full",
+            },
+        )
+    )
+
+    assert result == (True, "image-base64")
+    assert response.close_calls == 1
+
+
+def test_request_retry_closes_intermediate_response(monkeypatch) -> None:
+    client = _make_client_stub()
+    client.log_prefix = "test"
+    first = types.SimpleNamespace(status_code=503, close_calls=0)
+    final = types.SimpleNamespace(status_code=200, close_calls=0)
+    for response in (first, final):
+        response.close = lambda response=response: setattr(
+            response,
+            "close_calls",
+            response.close_calls + 1,
+        )
+    responses = [first, final]
+
+    def send_request(*_args):
+        return responses.pop(0)
+
+    async def run_inline(function, *args):
+        return function(*args)
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(client, "_send_request", send_request)
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    response = asyncio.run(
+        client._send_request_with_retry(
+            "https://gateway.example.com/v1/chat/completions",
+            {},
+            {},
+            "direct",
+            10.0,
+        )
+    )
+
+    assert response is final
+    assert first.close_calls == 1
+    assert final.close_calls == 0

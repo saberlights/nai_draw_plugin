@@ -707,28 +707,7 @@ class NaiInvocation(ModelConfigMixin):
             model_config = self._get_model_config()
             if not isinstance(model_config, dict):
                 model_config = {}
-
-            parsed_url = urlsplit(url)
-            request_base_url = ""
-            if parsed_url.scheme and parsed_url.netloc:
-                request_base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-            elif isinstance(model_config.get("base_url"), str):
-                request_base_url = str(model_config.get("base_url") or "").strip()
-
-            request_headers = (
-                NaiWebClient._build_request_headers(request_base_url)
-                if request_base_url
-                else dict(NaiWebClient._DEFAULT_REQUEST_HEADERS)
-            )
-            request_timeout = NaiWebClient._resolve_request_timeout(model_config)
-            proxy_mode = NaiWebClient._resolve_proxy_mode(model_config)
-            response = await self.api_client._send_request_with_retry(
-                url,
-                {},
-                proxy_mode,
-                request_timeout,
-                request_headers,
-            )
+            content = await self.api_client.download_image_bytes(url, model_config)
         except requests.RequestException as exc:
             logger.error("%s 下载远程图片失败: %r", self.log_prefix, exc, exc_info=True)
             return None
@@ -736,23 +715,7 @@ class NaiInvocation(ModelConfigMixin):
             logger.error("%s 下载远程图片异常: %r", self.log_prefix, exc, exc_info=True)
             return None
 
-        if response.status_code != 200:
-            logger.warning("%s 下载远程图片返回 HTTP %s", self.log_prefix, response.status_code)
-            return None
-
-        content_type = str(response.headers.get("content-type") or "").lower()
-        if not content_type.startswith("image/"):
-            response_text = NaiWebClient._get_response_text(response)
-            if "application/json" in content_type or NaiWebClient._looks_like_html_response(
-                content_type,
-                response_text,
-            ):
-                logger.warning("%s 下载远程图片收到非图片响应: %s", self.log_prefix, content_type or "unknown")
-                return None
-
-        content = response.content
         if not content:
-            logger.warning("%s 下载远程图片内容为空", self.log_prefix)
             return None
 
         return base64.b64encode(content).decode("utf-8")

@@ -692,11 +692,34 @@ def test_send_base64_image_result_propagates_send_failure() -> None:
 def test_download_remote_image_as_base64_skips_generation_request_url() -> None:
     invocation = _build_image_send_invocation()
 
-    async def fail_send_request_with_retry(*_args, **_kwargs):
+    async def fail_download_image_bytes(*_args, **_kwargs):
         pytest.fail("generation request URL 不应再次发起下载请求")
 
-    invocation.api_client = types.SimpleNamespace(_send_request_with_retry=fail_send_request_with_retry)
+    invocation.api_client = types.SimpleNamespace(download_image_bytes=fail_download_image_bytes)
 
     result = asyncio.run(invocation._download_remote_image_as_base64("https://cdn.example.com/generate?tag=test"))
 
     assert result is None
+
+
+def test_download_remote_image_as_base64_uses_public_client_interface() -> None:
+    invocation = _build_image_send_invocation()
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def download_image_bytes(url: str, model_config: dict[str, object]) -> bytes:
+        calls.append((url, model_config))
+        return b"remote-image"
+
+    invocation.api_client = types.SimpleNamespace(download_image_bytes=download_image_bytes)
+
+    result = asyncio.run(
+        invocation._download_remote_image_as_base64("https://cdn.example.com/image.png")
+    )
+
+    assert result == "cmVtb3RlLWltYWdl"
+    assert calls == [
+        (
+            "https://cdn.example.com/image.png",
+            invocation.plugin_config["model"],
+        )
+    ]

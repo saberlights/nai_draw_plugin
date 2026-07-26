@@ -3,7 +3,7 @@ import base64
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from requests.exceptions import ProxyError
@@ -749,6 +749,33 @@ class NaiWebClient:
             headers["Authorization"] = f"Bearer {token}"
         return headers
 
+    @staticmethod
+    def _build_image_request_headers(api_key: str) -> Dict[str, str]:
+        headers = {"Accept": "image/*"}
+        token = (api_key or "").strip()
+        if token:
+            if token.lower().startswith("bearer "):
+                token = token.split(" ", 1)[1].strip()
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    @staticmethod
+    def _same_origin(first_url: str, second_url: str) -> bool:
+        def _origin(url: str) -> tuple[str, str, int] | None:
+            parsed = urlsplit(url)
+            scheme = parsed.scheme.lower()
+            if scheme not in {"http", "https"} or not parsed.hostname:
+                return None
+            port = parsed.port or (443 if scheme == "https" else 80)
+            return scheme, parsed.hostname, port
+
+        try:
+            first = _origin(first_url)
+            second = _origin(second_url)
+            return first is not None and first == second
+        except ValueError:
+            return False
+
     # ========== Vibe cache 协同（文档 §20.3.1 / §20.3.2） ==========
 
     def _apply_vibe_cache_to_controlnet(
@@ -1018,23 +1045,26 @@ class NaiWebClient:
                 proxy_mode=proxy_mode,
                 request_timeout=request_timeout,
             )
-            success, result = self._parse_response(response)
-            if success:
-                if vibe_persist_plan:
-                    self._persist_vibe_cache(model_name, vibe_persist_plan)
-                return success, result
+            try:
+                success, result = self._parse_response(response)
+                if success:
+                    if vibe_persist_plan:
+                        self._persist_vibe_cache(model_name, vibe_persist_plan)
+                    return success, result
 
-            # 失败兜底：§20.3.1 规定服务端 cache_id 未命中 → 400 不静默回退；
-            # 若本次确有命中态条目且错误形态像 cache_id 失效，就清掉对应本地缓存，
-            # 让用户重试时自然回到字节态重新编码并重新落库
-            if vibe_hit_plan and self._looks_like_stale_vibe_cache_error(result):
-                purged = self._purge_vibe_cache_hits(model_name, vibe_hit_plan)
-                if purged:
-                    return (
-                        False,
-                        f"{result}（已清掉 {purged} 条本地 stale vibe 缓存，请重试）",
-                    )
-            return success, result
+                # 失败兜底：§20.3.1 规定服务端 cache_id 未命中 → 400 不静默回退；
+                # 若本次确有命中态条目且错误形态像 cache_id 失效，就清掉对应本地缓存，
+                # 让用户重试时自然回到字节态重新编码并重新落库
+                if vibe_hit_plan and self._looks_like_stale_vibe_cache_error(result):
+                    purged = self._purge_vibe_cache_hits(model_name, vibe_hit_plan)
+                    if purged:
+                        return (
+                            False,
+                            f"{result}（已清掉 {purged} 条本地 stale vibe 缓存，请重试）",
+                        )
+                return success, result
+            finally:
+                response.close()
 
         except requests.RequestException as exc:
             logger.error(f"{self.log_prefix} (NewAPI) 网络异常: {exc}")
@@ -1081,7 +1111,56 @@ class NaiWebClient:
             )
             return False, f"NewAPI 请求失败: {str(exc)[:160]}"
 
-        return self._parse_models_response(response)
+        try:
+            return self._parse_models_response(response)
+        finally:
+            response.close()
+
+    async def download_image_bytes(
+        self,
+        url: str,
+        model_config: Dict[str, Any],
+    ) -> bytes | None:
+        """通过 GET 下载远程图片，且不向调用方暴露 HTTP Response 所有权。"""
+        base_url = str(model_config.get("base_url") or "").strip()
+        api_key = model_config.get("api_key") or ""
+        if not self._same_origin(url, base_url):
+            api_key = ""
+        headers = self._build_image_request_headers(api_key)
+        proxy_mode = self._resolve_proxy_mode(model_config)
+        request_timeout = self._resolve_request_timeout(model_config)
+        response = await asyncio.to_thread(
+            self._send_get_request,
+            url,
+            headers,
+            proxy_mode,
+            request_timeout,
+        )
+        try:
+            if response.status_code != 200:
+                logger.warning(
+                    "%s 下载远程图片返回 HTTP %s",
+                    self.log_prefix,
+                    response.status_code,
+                )
+                return None
+
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if content_type and not content_type.startswith("image/"):
+                logger.warning(
+                    "%s 下载远程图片收到非图片响应: %s",
+                    self.log_prefix,
+                    content_type,
+                )
+                return None
+
+            content = bytes(response.content or b"")
+            if not content:
+                logger.warning("%s 下载远程图片内容为空", self.log_prefix)
+                return None
+            return content
+        finally:
+            response.close()
 
     def _send_get_request(
         self,
@@ -1191,6 +1270,7 @@ class NaiWebClient:
                 f"{self.log_prefix} (NewAPI) 第{attempt}次请求返回可重试 HTTP {response.status_code}，"
                 f"{retry_delay:.1f}s 后重试"
             )
+            response.close()
             await asyncio.sleep(retry_delay)
 
         assert response is not None
