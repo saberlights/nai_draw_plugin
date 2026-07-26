@@ -571,17 +571,6 @@ class SessionStateManager:
             time.time(),
         )
 
-    # ---- 兼容包装器（旧调用方仍可使用） ----
-
-    def get_last_nai_prompt(self, chat_stream_id: str) -> Optional[str]:
-        """获取指定聊天流的上一轮 LLM 提示词（仅 action 生图使用）"""
-        prompt, _ = self.get_last_nai_context(chat_stream_id)
-        return prompt
-
-    def set_last_nai_prompt(self, chat_stream_id: str, prompt: str) -> None:
-        """设置指定聊天流的上一轮 LLM 提示词（仅 action 生图使用）"""
-        self.set_last_nai_context(chat_stream_id, prompt)
-
     # ==================== 上一轮自拍场景（Action 自拍专用） ====================
 
     def get_last_selfie_context(
