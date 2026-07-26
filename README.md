@@ -12,8 +12,9 @@
 - Planner Action 主动出图、reply 后置自动跟图
 - 自拍模式（24 关键词、5 类型）、Tag 检索增强、NSFW 过滤、自动撤回、管理员模式
 
-Vibe / 角色参考的命名图库按 `user_id` 隔离、文件系统存储（图片原始字节落盘可直接查看），
-本会话默认选定跨重启保留。Vibe Transfer 还自带本地 `cache_id` 复用：同图同 `info_extracted`
+Vibe / 角色参考的命名图库在群聊按 `group_id` 共享、私聊按 `user_id` 隔离，并使用文件系统
+存储（图片原始字节落盘可直接查看）；本会话默认选定跨重启保留。Vibe Transfer 还自带本地
+`cache_id` 复用：同图同 `info_extracted`
 重复请求会自动改写成 `cache_id` 复用态，省图片传输 + 编码计费，全量命中还能省 1 anlas 流量
 附加费（文档 §20.3.1 / §20.3.2）。
 
@@ -118,8 +119,9 @@ default_model = "nai-diffusion-4-5-full"
 **vibe / ref** 都走「**命名图库**」：先用 `/nai vibe存 <名字>` 引用一张图入库，再用
 `/nai vibe选 <名字1> [<名字2>...]` 设定本会话默认图（vibe 最多 4 张、ref 最多 1 张），
 之后 `/nai vibe <描述>` 直接用默认图；也可以 `/nai vibe @<名字1> [@<名字2>...] <描述>`
-单次指定。图库按 `user_id` 隔离（跨群可用、群间不互相看），默认每库 20 张上限。物理图片
-落在 `data/named_refs/users/<sha256>/(vibe|ref)/<名字>.<ext>`，
+单次指定。群聊按 `group_id` 共享群图库且群间隔离，私聊按 `user_id` 隔离；每个归属的单库
+默认上限为 20 张。物理图片分别落在
+`data/named_refs/(groups|users)/<sha256>/(vibe|ref)/<名字>.<ext>`，
 可以用文件管理器直接看；选定状态落在 `data/named_refs/selection.json`，跨重启保留。
 
 `vibe` 的 `cache_id` 缓存落在 `data/vibe_cache.db`，同图同 info_extracted 重发会改写
