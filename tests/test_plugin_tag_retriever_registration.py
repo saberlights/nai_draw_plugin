@@ -237,7 +237,7 @@ def test_reply_hook_uses_admission_description_for_background_generation(
                 should_generate=True,
                 category="auto_draw",
                 detail="准入",
-                seed_description="一女 自拍 近景 窗边",
+                seed_description="一女 自拍 窗边",
             )
 
     class _Invocation:
@@ -299,12 +299,12 @@ def test_reply_hook_uses_admission_description_for_background_generation(
     assert create_calls == [
         (
             "stream-1",
-            {"description": "一女 自拍 近景 窗边"},
+            {"description": "一女 自拍 窗边"},
             "reply_auto_draw",
         )
     ]
     assert start_calls == [
-        ("一女 自拍 近景 窗边", "我刚洗完澡靠在窗边发呆，有点累", invocation)
+        ("一女 自拍 窗边", "我刚洗完澡靠在窗边发呆，有点累", invocation)
     ]
 
 

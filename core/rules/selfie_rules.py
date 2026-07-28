@@ -38,40 +38,34 @@ SELFIE_HINT_FOR_LLM = """
 
 | 意图 | 触发线索 | 输出特征 |
 |------|----------|----------|
-| **肖像/生活照（portrait）** | 用户输入含：肖像 / portrait / 肖像照 | 必含 `portrait photo` 或 `candid photo` 作为肖像意图标记；framing tag（`upper body` / `full body`）独立选择并紧邻其前。**绝对禁止**写矛盾合体 `full body portrait` / `upper body portrait`（NAI 把 portrait 与 full body/upper body 视为同类对立 framing tag，叠加会让构图回退到中间档）；**绝对禁止** `selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` |
-| **自拍（selfie）** | 用户输入含：自拍 / selfie / 自拍照 | 必含 `selfie` 或 `mirror selfie` 或 `group selfie`，并按下方"自拍类型"选择对应必须标签 |
+| **肖像/生活照（portrait）** | 用户输入含：肖像 / portrait / 肖像照 | 只表示 bot 本人出镜的普通展示照，不需要任何肖像意图前缀；按用户重点自由选择普通 framing tag |
+| **自拍（selfie）** | 用户输入含：自拍 / selfie / 自拍照 | 必含 `selfie` / `mirror selfie` / `group selfie` 之一；除用户或场景明确要求外，不固定视角、景别或手机动作 |
 | **普通画图（normal）** | 用户明确要"画一个 X"，与 bot 本人无关 | 按场景生成普通 tag，不加 selfie/portrait 类标签；可补 `solo, 1girl/1boy` |
 
 **【最高优先级】** 用户输入只要含肖像类关键词（肖像/portrait/肖像照），**强制走肖像路径**，禁止输出任何 `selfie` 系标签，即使下方"自拍意图"也匹配。
 
 **【画指定角色优先级 > 肖像/自拍】** 用户输入含具体二次元角色名（如"初音未来"/"蕾姆"/"芙兰朵露"）或前缀 `画指定角色`，**强制走普通画图路径**，本轮主体是角色而非 bot：
 - 禁止输出任何 `selfie` / `mirror selfie` / `group selfie` / `portrait photo` / `candid photo` / `upper body portrait` / `full body portrait` 等"bot 出镜"语义 framing
-- 即使 description 同时含"肖像照 近景"等中文 framing 提示词也不要翻译成上述 tag——这些是上游为 bot 出镜准备的兜底，与本轮角色主体冲突
+- 即使 description 同时含"肖像照"等 bot 出镜提示词也不要翻译成上述 tag——这些是上游为 bot 出镜准备的兜底，与本轮角色主体冲突
 - 需要构图时改用纯 framing tag：`close-up` / `upper body` / `cowboy shot` / `full body`
 
 ## 肖像路径输出规则
 
 肖像意图时：
-- 必含一个肖像意图标记标签：`portrait photo` / `candid photo`
-- Framing tag（紧邻意图标记前，独立选择）：看脸/气质 → `upper body, portrait photo`；看穿搭/全身 → `full body, portrait photo`；自然抓拍感 → `candid photo`（candid 默认半身取景，必要时再叠加 `full body`）
-- **禁止矛盾合体**：不要写 `full body portrait` / `upper body portrait`，必须拆成两个独立 tag（如 `full body, portrait photo`）。NAI 官方文档把 `portrait` / `upper body` / `full body` 列为同类对立 framing tag，合体写会让构图回退到中间档
-- 可加：`looking at viewer`（直视镜头）、自然光线、合理背景、姿态/动作
-- **禁止**：`selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` / `selfie stick`
+- 不要输出固定肖像意图标签：禁止把"肖像/portrait/肖像照"机械翻译成 `portrait photo` / `candid photo` / `headshot`。
+- 不要固定图片架构：不因"肖像"默认加 `upper body`、`close-up`、`pov`、`female pov`、`from above`、`from below` 等额外视角或景别。
+- 只在用户明确要求时选择 framing：看脸/头像 → `close-up` 或 `upper body`；看穿搭/全身/腿/鞋 → `full body`；用户没指定时保持普通展示照，由动作、服装、场景和情绪承载画面。
+- 若用户要求全身，必须只选全身档 `full body`，禁止同段再出现 `portrait` / `close-up` / `upper body` / `cowboy shot`。
+- 可加：`looking at viewer`（直视镜头）、自然光线、合理背景、姿态/动作。
+- **禁止**：`selfie` / `mirror selfie` / `group selfie` / `holding phone` / `pov` / `female pov` / `selfie stick`。
 
-## 自拍路径类型选择（5 选 1）
+## 自拍路径输出规则
 
-| 类型 | 必须标签 | 适用场景 |
-|------|----------|----------|
-| 1. 手机前置自拍 | `selfie, pov, looking at viewer` | 默认；近景/半身；手机在画面外 |
-| 2. 镜子自拍 | `mirror selfie, holding phone, looking at viewer` | 浴室/卧室/穿衣镜前；可全身可半身 |
-| 3. 高角度俯拍自拍 | `selfie, from above, pov, looking up` | 显脸小大眼可爱；**禁止用于展示下半身/腿/鞋** |
-| 4. 低角度仰拍自拍 | `selfie, from below, pov, looking down` | 显腿长酷飒；适合展示全身/腿/鞋 |
-| 5. 合照自拍 | `group selfie, pov, looking at viewer` | 明确多人合照 |
-
-类型选择优先级：
-1. 用户场景线索：浴室/卧室/穿衣镜 → 类型 2；和朋友/合照 → 类型 5；显腿/全身穿搭 → 类型 4
-2. 上下文推断：上一轮在洗澡/试衣 → 类型 2
-3. 无线索时：从类型 1/2/3/4 随机选一种避免重复
+- 自拍意图必须含一个自拍语义 tag：默认 `selfie`；用户明确镜子/穿衣镜/对镜 → `mirror selfie`；用户明确合照/多人 → `group selfie`。
+- 不要因为自拍默认加 `pov` / `female pov` / `from above` / `from below` / `close-up` / `upper body` / `holding phone`。这些只在用户明确要求、或镜子自拍确实需要手机入镜时使用。
+- 用户说全身/全身照/全身穿搭/腿/鞋/袜子时：必须在人数之后立即写 `full body`，且同段禁止 `close-up` / `portrait` / `upper body` / `cowboy shot`；优先补 `standing`、能看清腿脚的服装和背景，而不是切成半身自拍。
+- 镜子自拍只有在用户说镜子/对镜/穿衣镜，或上下文明确是镜前场景时才用；此时可写 `mirror selfie, holding phone`，但全身请求仍必须保留 `full body`。
+- 高低角度只响应明确角度词；展示下半身/腿/鞋时禁止 `from above`。
 
 ## 自拍 + 肖像通用要求
 - 默认是 bot 本人出镜（非二创角色），所以默认**不要补充角色名/作品名/版权 tag**（`character (series)`、cosplay 名等）
@@ -82,19 +76,19 @@ SELFIE_HINT_FOR_LLM = """
   - cosplay 时出镜的是 bot 本人，只是穿着该角色的服装/发型，不要补充该角色的默认外貌特征
 - **不要输出 `selfie stick` / `holding selfie stick`**
 - **不要输出 `arm up`**（自拍是手臂前伸而非向上举）
-- 前置自拍（类型 1/3/4）手机在画面外，不加 `holding phone` / `smartphone`；只有镜子自拍（类型 2）才加 `holding phone`
+- 前置自拍手机默认在画面外，不加 `holding phone` / `smartphone`；只有镜子自拍才加 `holding phone`
 - 不重复表达同一概念（`mirror selfie` 已含镜子，不再加 `mirror`/`reflection`）
 
 ## 服装与连续性（与主模板 _HARD_RULES.6 保持一致）
-- 没有上下文 → 按场景合理补具体款式 + 颜色，不要写 `casual wear` 这类宽泛词
+- 没有上下文 → 默认不凭空补服装；只有用户描述或场景逻辑明确需要时，才补最少且具体的款式、颜色或材质，禁止 `casual wear` 这类宽泛词
 - 有连续性上下文且用户没说要换装 → 延续上一轮的服装款式、主色、材质
-- 看腿/袜子/鞋/全身穿搭 → 必须用能看清重点的全身构图（自拍走类型 2/4，肖像走 `full body, portrait photo`）
+- 看腿/袜子/鞋/全身穿搭 → 必须用 `full body`，不要切到近景、半身或固定角度
 
 ## 类型连续性（避免跳变）
 当用户说"再来一张/换个姿势/继续/还是这个/这身/这套"等连续请求时，**默认延续上一轮的图片类型**，仅修改用户明确指定的部分：
 
-- 上一轮是**自拍**（输出含 `selfie` / `mirror selfie` / `group selfie`）→ 本轮默认仍是自拍，并且沿用同一种自拍类型（上轮镜子自拍 → 本轮仍镜子自拍；上轮俯拍 → 本轮仍俯拍）
-- 上一轮是**肖像**（输出含 `portrait photo` / `candid photo`，或旧格式 `upper body portrait` / `full body portrait`）→ 本轮默认仍是肖像，并且沿用同一种肖像构图（看脸 → `upper body, portrait photo`；看穿搭 → `full body, portrait photo`）
+- 上一轮是**自拍**（输出含 `selfie` / `mirror selfie` / `group selfie`）→ 本轮默认仍是自拍，并沿用用户明确指定过的自拍语义；不要自动改角度或景别
+- 上一轮是**肖像**（用户原话或上下文指向肖像/生活照）→ 本轮默认仍是肖像/生活照，并沿用用户明确指定过的构图重点；不要补 `portrait photo` / `candid photo`
 - 上一轮是**普通画图**（无自拍/肖像标签）→ 本轮默认仍是普通画图，不强加 selfie/portrait 类标签
 
 **只有以下情况才允许切换类型**：
@@ -228,17 +222,17 @@ def get_selfie_hint() -> str:
 
 def get_portrait_enforcement_hint() -> str:
     """
-    肖像意图触发时追加的硬指令，强制 LLM 不输出 selfie 系标签。
+    肖像意图触发时追加的硬指令，保证 LLM 不把展示照固化成自拍或肖像前缀。
 
     应在 prompt 渲染时拼接到 user_request 段附近。
     """
     return (
         "<portrait_enforcement>\n"
         "【本轮强制约束】用户请求肖像/portrait 类图片，输出必须满足：\n"
-        "- 必含一个肖像意图标记：portrait photo / candid photo\n"
-        "- Framing tag（upper body / full body）独立选择并紧邻其前；禁止矛盾合体 `full body portrait` / `upper body portrait`，必须拆成两个独立 tag\n"
-        "- 绝对禁止输出：selfie / mirror selfie / group selfie / holding phone / pov / female pov / selfie stick\n"
-        "- 不要使用第一人称视角，使用第三人称镜头\n"
+        "- 不添加 `portrait photo` / `candid photo` / `headshot` 等固定肖像前缀\n"
+        "- 不默认添加 `close-up` / `upper body` / `pov` / `female pov` 或高低角度；仅响应用户明确指定的构图和视角\n"
+        "- 用户要求全身/穿搭/腿/鞋时只用 `full body`，不得叠加其它 framing\n"
+        "- 绝对禁止输出：`selfie` / `mirror selfie` / `group selfie` / `holding phone` / `selfie stick`\n"
         "</portrait_enforcement>"
     )
 

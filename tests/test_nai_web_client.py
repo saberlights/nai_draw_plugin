@@ -37,6 +37,16 @@ sys.modules["src.common.logger"] = dummy_logger_module
 from plugins.nai_draw_plugin.core.clients.nai_web_client import NaiWebClient
 
 
+def test_prompt_merge_keeps_rating_before_configured_prefixes() -> None:
+    prompt = NaiWebClient._merge_artist_into_prompt(
+        "rating:general, solo, 1girl, smile",
+        "artist:example",
+        "best quality",
+    )
+
+    assert prompt == "rating:general, best quality, artist:example, solo, 1girl, smile"
+
+
 def test_http_sessions_are_created_lazily_and_closed_when_initialized(monkeypatch) -> None:
     created: list[tuple[bool, _RecordingSession]] = []
 

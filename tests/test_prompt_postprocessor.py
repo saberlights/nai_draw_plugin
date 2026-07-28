@@ -56,6 +56,11 @@ class PromptPostprocessorTest(unittest.TestCase):
         out = normalize_prompt_order(s)
         self.assertEqual(out, "pov, solo, 1girl, smile, year 2024")
 
+    def test_normalize_prompt_order_keeps_rating_first(self):
+        s = "rating:general, smile, solo, full body, 1girl"
+        out = normalize_prompt_order(s)
+        self.assertEqual(out, "rating:general, full body, solo, 1girl, smile")
+
     def test_normalize_prompt_order_multi_single_line_pipe(self):
         s = "2girls, year 2024, street | smile, black hair | looking at viewer, blue eyes"
         out = normalize_prompt_order(s)

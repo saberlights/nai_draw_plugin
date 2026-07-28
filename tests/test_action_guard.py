@@ -164,10 +164,11 @@ def test_fetch_last_user_text_returns_empty_when_no_user_message(monkeypatch: py
 
 
 def test_inject_self_image_hint_adds_prefix_when_no_persona() -> None:
-    out = sdk_runtime_module._inject_self_image_hint("窗边 慵懒 近景", mode="portrait")
+    out = sdk_runtime_module._inject_self_image_hint("窗边 慵懒", mode="portrait")
     assert out.startswith("一女")
     assert "肖像照" in out
     assert "窗边" in out
+    assert not out.endswith("近景")
 
 
 def test_inject_self_image_hint_keeps_existing_persona() -> None:
@@ -186,3 +187,58 @@ def test_inject_self_image_hint_empty_description() -> None:
     out = sdk_runtime_module._inject_self_image_hint("", mode="portrait")
     assert "肖像照" in out
     assert "一女" in out
+    assert "近景" not in out
+
+
+def test_auto_draw_uses_raw_portrait_intent_when_llm_has_no_portrait_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation = _build_invocation()
+    processed_prompts: list[str] = []
+
+    async def allowed() -> bool:
+        return True
+
+    async def approved_trigger():
+        return types.SimpleNamespace(should_generate=True)
+
+    async def generated_prompt(*_args, **_kwargs):
+        return "rating:general, solo, 1girl, standing", None
+
+    async def generated_image(**_kwargs):
+        return True, "image-data"
+
+    async def sent_image(*_args, **_kwargs):
+        return True, "sent", True
+
+    def process_selfie(description: str, *_args, **_kwargs) -> str:
+        processed_prompts.append(description)
+        return f"{description}, bot appearance"
+
+    invocation.ensure_user_not_blacklisted = allowed
+    invocation.ensure_generation_permission = allowed
+    invocation._assess_auto_draw_trigger = approved_trigger
+    invocation._generate_prompt_with_llm = generated_prompt
+    invocation._process_selfie_prompt = process_selfie
+    invocation._sanitize_prompt_for_sfw_mode = lambda text: text
+    invocation._sanitize_structured_for_sfw_mode = lambda payload: payload
+    invocation._select_send_payload = lambda prompt, payload: (prompt, None)
+    invocation._get_model_config = lambda **_kwargs: {"base_url": "https://example.invalid"}
+    invocation._send_image_result = sent_image
+    invocation.get_config = lambda key, default=None: {
+        "auto_draw_on_reply.self_image_boost": False,
+        "prompt_generator.enforce_tag_order": False,
+    }.get(key, default)
+    invocation.api_client = types.SimpleNamespace(generate_image=generated_image)
+    monkeypatch.setattr(
+        sdk_runtime_module.session_state,
+        "set_last_selfie_context",
+        lambda *_args, **_kwargs: None,
+    )
+
+    ok, detail = asyncio.run(
+        invocation.handle_auto_draw_from_reply("肖像照，窗边", reply_context_text="")
+    )
+
+    assert (ok, detail) == (True, "sent")
+    assert processed_prompts == ["rating:general, solo, 1girl, standing"]

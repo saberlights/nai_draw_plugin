@@ -95,7 +95,8 @@ def test_compose_description_selfie() -> None:
     signal = ReplyDrawSignal(score=0.7, mode="selfie", hits=("刚洗完",))
     desc = compose_description_from_reply("我刚洗完澡靠窗", signal)
     assert "一女" in desc
-    assert "自拍 近景" in desc
+    assert "自拍" in desc
+    assert "近景" not in desc
     assert "刚洗完" in desc
 
 
@@ -104,6 +105,7 @@ def test_compose_description_portrait_drops_action_hits() -> None:
     desc = compose_description_from_reply("晚安啦", signal)
     assert "一女" in desc
     assert "肖像照" in desc
+    assert "近景" not in desc
     assert "晚安" in desc  # 情感词允许保留
 
 

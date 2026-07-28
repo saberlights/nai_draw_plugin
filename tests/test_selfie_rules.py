@@ -4,12 +4,28 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from plugins.nai_draw_plugin.core.rules.selfie_rules import (
+    SELFIE_HINT_FOR_LLM,
     detect_bot_self_image_intent,
     detect_explicit_image_request,
     detect_negative_image_intent,
     detect_selfie_from_output,
+    get_portrait_enforcement_hint,
     merge_selfie_prompt,
 )
+
+
+def test_selfie_portrait_rules_do_not_force_portrait_prefix_or_camera() -> None:
+    assert "不需要任何肖像意图前缀" in SELFIE_HINT_FOR_LLM
+    assert "不要因为自拍默认加 `pov`" in SELFIE_HINT_FOR_LLM
+    assert "必须在人数之后立即写 `full body`" in SELFIE_HINT_FOR_LLM
+
+
+def test_portrait_enforcement_does_not_reintroduce_a_fixed_camera() -> None:
+    hint = get_portrait_enforcement_hint()
+
+    assert "不添加 `portrait photo`" in hint
+    assert "不默认添加 `close-up`" in hint
+    assert "只用 `full body`" in hint
 
 
 def test_merge_selfie_prompt_appends_selfie_tags_after_main_prompt() -> None:

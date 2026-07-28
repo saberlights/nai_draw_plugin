@@ -164,9 +164,10 @@ class NaiWebClient:
 
     @staticmethod
     def _merge_artist_into_prompt(prompt: str, artist_prompt: str, custom_prompt_add: str = "") -> str:
-        """按 质量词 → 画师串 → 用户词 顺序拼接，与 NovelAI 推荐顺序保持一致。
+        """按 Rating → 质量词 → 画师串 → 用户词顺序拼接。
 
-        - 质量词（custom_prompt_add）置首，建立整体画质基调
+        - 用户 prompt 以合法 rating 开头时，必须保留其首位
+        - 质量词（custom_prompt_add）紧随 rating，建立整体画质基调
         - 画师串紧随其后，定义风格
         - 用户词最后，承载本次具体描述
         - 去重：用户词若已以画师串开头，跳过画师以免重复
@@ -174,6 +175,16 @@ class NaiWebClient:
         normalized_user = str(prompt or "").strip()
         normalized_artist = str(artist_prompt or "").strip().strip(",")
         normalized_quality = str(custom_prompt_add or "").strip().strip(",")
+        rating = ""
+        user_head, separator, user_tail = normalized_user.partition(",")
+        if user_head.strip().lower() in {
+            "rating:general",
+            "rating:sensitive",
+            "rating:questionable",
+            "rating:explicit",
+        }:
+            rating = user_head.strip()
+            normalized_user = user_tail.strip() if separator else ""
 
         if normalized_artist and normalized_user:
             lowered_user = normalized_user.lower()
@@ -181,7 +192,11 @@ class NaiWebClient:
             if lowered_user == lowered_artist or lowered_user.startswith(f"{lowered_artist},"):
                 normalized_artist = ""
 
-        parts = [p for p in (normalized_quality, normalized_artist, normalized_user) if p]
+        parts = [
+            p
+            for p in (rating, normalized_quality, normalized_artist, normalized_user)
+            if p
+        ]
         return ", ".join(parts)
 
     @staticmethod

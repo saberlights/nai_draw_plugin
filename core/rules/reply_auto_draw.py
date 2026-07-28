@@ -51,7 +51,7 @@ def score_reply_for_auto_draw(reply_text: str) -> ReplyDrawSignal:
     评分规则（设计目标：保守，宁可不出也别错出）：
 
     - 强自指（"我穿/我刚/刚洗完"等）单条命中即 +0.5，多条加成更明显，mode=selfie。
-    - 情感节点（"晚安/想你了"）单条 +0.3，mode=portrait（贴近"近照"）。
+    - 情感节点（"晚安/想你了"）单条 +0.3，mode=portrait（bot 本人展示照）。
     - 场景词（"窗边/便利店"）单条 +0.3，单纯场景命中走 mode=scene；与自指叠加时仍走 selfie。
     - 强负向（代码块、列点、技术词）直接清零，无论其他信号多强。
     - 弱负向（"你觉得呢/我不太懂"）一处扣 0.15。
@@ -122,9 +122,9 @@ def compose_description_from_reply(
 
     pieces: list[str] = ["一女"]
     if signal.mode == "selfie":
-        pieces.append("自拍 近景")
+        pieces.append("自拍")
     elif signal.mode == "portrait":
-        pieces.append("肖像照 近景")
+        pieces.append("肖像照")
     elif signal.mode == "scene":
         pieces.append("生活照")
 

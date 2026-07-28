@@ -188,11 +188,11 @@ def _row_age_seconds(row: Any) -> float | None:
     return max(0.0, time.time() - float(normalized))
 
 
-# 主动出图时往 description 前置的自指标签。selfie 偏镜头近、肖像偏室内近景、
-# 场景偏生活照——目的都是让生成的图像感觉像"bot 在分享自己"而不是"画了张陌生人"。
+# 主动出图时往 description 前置的自指标签。这里只声明 bot 本人出镜意图，
+# 景别和视角交由提示词规则及用户请求决定，避免把全身请求预先压成近景。
 _SELF_IMAGE_HINT_BY_MODE: dict[str, str] = {
-    "selfie": "一女 自拍 近景",
-    "portrait": "一女 肖像照 近景",
+    "selfie": "一女 自拍",
+    "portrait": "一女 肖像照",
     "scene": "一女 生活照",
 }
 
@@ -1922,7 +1922,7 @@ class NaiInvocation(ModelConfigMixin):
 
         # 主动出图自动 self-image 增强：bot 自己想发图时，让出来的图更像"她给你看一眼自己"
         # 而不是"画了一张陌生女孩"。explicit 路径不动，保持用户原意。
-        # 画指定角色路径不注入：本轮主体是指定角色而非 bot，加"肖像照 近景"会把角色洗成 bot 肖像。
+        # 画指定角色路径不注入：本轮主体是指定角色而非 bot，加"肖像照"会把角色洗成 bot 肖像。
         if (
             trigger_assessment.category == "proactive"
             and bool(self.get_config("action_guard.proactive_self_image_boost", True))
@@ -2084,7 +2084,9 @@ class NaiInvocation(ModelConfigMixin):
         elif not description:
             return False, "图片描述为空"
 
-        is_selfie = detect_selfie_from_output(description)
+        # 肖像规则不再要求 portrait photo/candid photo；因此这里必须依赖 LLM 前已经
+        # 注入的 bot 本人意图，不能反推最终标签，否则会漏掉自拍外貌串。
+        is_selfie = detect_bot_self_image_intent(raw_description)
         if is_selfie:
             description = self._process_selfie_prompt(
                 description,
