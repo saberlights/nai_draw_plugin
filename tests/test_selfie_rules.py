@@ -18,6 +18,7 @@ def test_selfie_portrait_rules_do_not_force_portrait_prefix_or_camera() -> None:
     assert "不需要任何肖像意图前缀" in SELFIE_HINT_FOR_LLM
     assert "不要因为自拍默认加 `pov`" in SELFIE_HINT_FOR_LLM
     assert "必须在人数之后立即写 `full body`" in SELFIE_HINT_FOR_LLM
+    assert "LLM 不得生成、猜测、复述或从历史提示词延续发色、发型、瞳色 tag" in SELFIE_HINT_FOR_LLM
 
 
 def test_portrait_enforcement_does_not_reintroduce_a_fixed_camera() -> None:
@@ -26,6 +27,7 @@ def test_portrait_enforcement_does_not_reintroduce_a_fixed_camera() -> None:
     assert "不添加 `portrait photo`" in hint
     assert "不默认添加 `close-up`" in hint
     assert "只用 `full body`" in hint
+    assert "不得生成、复述或延续任何发色、发型、瞳色 tag" in hint
 
 
 def test_merge_selfie_prompt_appends_selfie_tags_after_main_prompt() -> None:

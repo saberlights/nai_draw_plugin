@@ -38,10 +38,153 @@ _WEBUI_TEXTAREA_FIELDS = {
     "selfie_prompt_add",
     "selfie_negative_prompt_add",
     "nai_artist_prompt",
+    "filter_tags",
     "prompt_template",
     "system_prompt",
 }
-_WEBUI_PASSWORD_FIELD_TOKENS = ("api_key", "password", "secret", "token")
+_WEBUI_PASSWORD_FIELDS = {"api_key"}
+_WEBUI_SAMPLER_CHOICES = [
+    "k_euler",
+    "k_euler_ancestral",
+    "k_dpm_2",
+    "k_dpm_2_ancestral",
+    "k_dpmpp_2m",
+    "k_dpmpp_2s_ancestral",
+    "k_dpmpp_sde",
+    "ddim",
+]
+_WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS = {
+    "model_list": "候选模型列表；填系统模型配置中已定义的模型名称",
+    "max_tokens": "单次响应的最大 token 数；可填正整数",
+    "temperature": "生成温度；可填非负浮点数，越高越发散",
+    "slow_threshold": "慢请求判定阈值；单位秒，可填正数",
+}
+_WEBUI_SLIDER_0_1 = {
+    "input_type": "slider",
+    "ui_type": "slider",
+    "min": 0.0,
+    "max": 1.0,
+    "step": 0.01,
+}
+_WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
+    "plugin.config_version": {"disabled": True},
+    "model.nai_proxy_mode": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["direct", "inherit", "auto"],
+    },
+    "prompt_generator.output_format": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["json", "text"],
+    },
+    "prompt_generator.selfie_appearance_policy": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["auto", "never", "keep"],
+    },
+    "tag_retriever.mode": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["online", "local"],
+    },
+    "character_reference.type": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["character", "style", "character&style"],
+    },
+    "model_nai4_5.sampler": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": _WEBUI_SAMPLER_CHOICES,
+    },
+    "model_nai4.sampler": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": _WEBUI_SAMPLER_CHOICES,
+    },
+    "model_nai3.sampler": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": _WEBUI_SAMPLER_CHOICES,
+    },
+    "model_nai4_5.image_format": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["png", "webp"],
+    },
+    "model_nai4.image_format": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["png", "webp"],
+    },
+    "model_nai3.image_format": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["png", "webp"],
+    },
+    "auto_draw_on_reply.score_threshold": {
+        **_WEBUI_SLIDER_0_1,
+        "step": 0.05,
+    },
+    "tag_retriever.popularity_weight": _WEBUI_SLIDER_0_1,
+    "tag_retriever.min_score": _WEBUI_SLIDER_0_1,
+    "retag.wd14_threshold": _WEBUI_SLIDER_0_1,
+    "retag.wd14_character_threshold": _WEBUI_SLIDER_0_1,
+    "i2i.strength": {
+        **_WEBUI_SLIDER_0_1,
+        "min": 0.01,
+        "max": 0.99,
+    },
+    "i2i.noise": {
+        **_WEBUI_SLIDER_0_1,
+        "max": 0.99,
+    },
+    "vibe.info_extracted": {
+        **_WEBUI_SLIDER_0_1,
+        "min": 0.01,
+    },
+    "vibe.reference_strength": {
+        **_WEBUI_SLIDER_0_1,
+        "min": 0.01,
+    },
+    "vibe.overall_strength": _WEBUI_SLIDER_0_1,
+    "character_reference.fidelity": _WEBUI_SLIDER_0_1,
+    "character_reference.strength": _WEBUI_SLIDER_0_1,
+    "model_nai4_5.num_inference_steps": {
+        "input_type": "slider",
+        "ui_type": "slider",
+        "min": 1,
+        "max": 28,
+        "step": 1,
+    },
+    "model_nai4.num_inference_steps": {
+        "input_type": "slider",
+        "ui_type": "slider",
+        "min": 1,
+        "max": 28,
+        "step": 1,
+    },
+    "model_nai3.num_inference_steps": {
+        "input_type": "slider",
+        "ui_type": "slider",
+        "min": 1,
+        "max": 28,
+        "step": 1,
+    },
+    "model_nai4_5.cfg_rescale": {
+        **_WEBUI_SLIDER_0_1,
+        "step": 0.05,
+    },
+    "model_nai4.cfg_rescale": {
+        **_WEBUI_SLIDER_0_1,
+        "step": 0.05,
+    },
+    "model_nai3.cfg_rescale": {
+        **_WEBUI_SLIDER_0_1,
+        "step": 0.05,
+    },
+}
 
 
 def _resolve_existing_config_value(
@@ -95,8 +238,7 @@ def _webui_ui_type(field_name: str, field_def: ConfigField) -> str:
     """补齐 WebUI 控件类型；密钥和长 prompt 字段用更合适的控件。"""
     if field_def.input_type:
         return field_def.input_type
-    lowered = field_name.lower()
-    if any(token in lowered for token in _WEBUI_PASSWORD_FIELD_TOKENS):
+    if field_name.lower() in _WEBUI_PASSWORD_FIELDS:
         return "password"
     if field_def.type is str and (
         field_name in _WEBUI_TEXTAREA_FIELDS
@@ -157,6 +299,7 @@ def _webui_field_schema(
             "name": field_name,
             "type": _webui_field_type(field_def),
             "label": _webui_label(field_name, field_def),
+            "hint": field_def.hint or field_def.description,
             "hidden": bool(hidden or field_def.hidden),
             "order": field_def.order or order,
             "input_type": field_def.input_type or ("password" if ui_type == "password" else None),
@@ -176,6 +319,11 @@ def _webui_field_schema(
             field_schema["item_type"] = "number"
         else:
             field_schema["item_type"] = "string"
+    if field_def.type is int and field_schema.get("step") is None:
+        field_schema["step"] = 1
+    elif field_def.type is float and field_schema.get("step") is None:
+        field_schema["step"] = 0.1
+    field_schema.update(_WEBUI_FIELD_OVERRIDES.get(f"{section_name}.{field_name}", {}))
     field_schema.setdefault("depends_on", None)
     field_schema.setdefault("depends_value", None)
     field_schema["section"] = section_name
@@ -206,6 +354,19 @@ def _webui_section_title(section_name: str, group_headers: dict[str, Any]) -> st
             if title:
                 return title
     return section_name
+
+
+def _webui_section_description(section_name: str, group_headers: dict[str, Any]) -> str | None:
+    """保留 TOML 分组标题中的说明行，丢弃只用于源码排版的装饰行。"""
+    raw = group_headers.get(section_name)
+    if not isinstance(raw, str):
+        return None
+    lines = [
+        line.strip()
+        for line in raw.splitlines()
+        if line.strip() and not line.strip().startswith(("=", "-"))
+    ]
+    return "\n".join(lines) or None
 
 
 def _dump_scalar_kv(key: str, value: Any) -> str:
@@ -429,6 +590,105 @@ class PluginConfigDefinition:
         ),
         "model_nai4": "----- NAI V4 -----",
         "model_nai3": "----- NAI V3 / V3 Furry -----",
+    }
+
+    # TOML 分组标题面向源码阅读；WebUI 使用独立标题与标签页，避免把装饰性标题
+    # 直接当成导航文案，并保证当前默认的 V4.5 配置进入首屏。
+    config_webui_section_titles = {
+        "auto_draw_on_reply": "回复后自动跟图",
+        "prompt_show": "提示词显示",
+        "nsfw_filter": "NSFW 过滤",
+        "auto_recall": "自动撤回",
+        "admin": "管理员权限",
+        "tag_retriever": "Danbooru Tag 检索",
+        "model_nai4_5": "NAI V4.5 生图参数",
+    }
+    config_webui_tabs = [
+        {
+            "id": "generation",
+            "title": "生图配置",
+            "sections": [
+                "model",
+                "model_nai4_5",
+                "model_nai4_5.artist_presets",
+                "i2i",
+                "vibe",
+                "character_reference",
+            ],
+        },
+        {
+            "id": "prompting",
+            "title": "提示词",
+            "sections": [
+                "prompt_generator",
+                "prompt_generator.custom_model",
+                "random_scene",
+                "random_scene.custom_model",
+                "custom_prompt",
+            ],
+        },
+        {
+            "id": "models",
+            "title": "其他模型",
+            "sections": [
+                "model_nai4",
+                "model_nai4.artist_presets",
+                "model_nai3",
+                "model_nai3.artist_presets",
+            ],
+        },
+        {
+            "id": "automation",
+            "title": "自动化与权限",
+            "sections": [
+                "plugin",
+                "action_guard",
+                "auto_draw_on_reply",
+                "components",
+                "prompt_show",
+                "nsfw_filter",
+                "auto_recall",
+                "admin",
+            ],
+        },
+        {
+            "id": "retrieval",
+            "title": "检索与反推",
+            "sections": ["tag_retriever", "retag"],
+        },
+    ]
+    config_webui_nested_sections = {
+        "prompt_generator.custom_model": {
+            "source_section": "prompt_generator",
+            "source_field": "custom_model",
+            "title": "提示词生成自定义模型",
+            "description": "覆盖提示词生成使用的模型列表与生成参数；模型名必须已在系统模型配置中定义。",
+            "field_descriptions": _WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS,
+        },
+        "random_scene.custom_model": {
+            "source_section": "random_scene",
+            "source_field": "custom_model",
+            "title": "随机场景自定义模型",
+            "description": "覆盖随机场景生成使用的模型列表与生成参数；留空模型列表时继承提示词生成配置。",
+            "field_descriptions": _WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS,
+        },
+    }
+    config_webui_detached_field_sections = {
+        "model_nai4_5.artist_presets": {
+            "source_section": "model_nai4_5",
+            "source_field": "artist_presets",
+            "title": "NAI V4.5 画师预设",
+        },
+        "model_nai4.artist_presets": {
+            "source_section": "model_nai4",
+            "source_field": "artist_presets",
+            "title": "NAI V4 画师预设",
+        },
+        "model_nai3.artist_presets": {
+            "source_section": "model_nai3",
+            "source_field": "artist_presets",
+            "title": "NAI V3 / Furry 画师预设",
+        },
     }
 
     # 不渲染到 config.toml 的字段（schema 仍保留以便高级用户手动覆盖；默认值在代码层走兜底）。
@@ -1246,6 +1506,10 @@ class PluginConfigDefinition:
     ) -> dict[str, Any]:
         """把同一 Schema 映射为 WebUI 可渲染的配置描述。"""
         sections: dict[str, Any] = {}
+        detached_fields = {
+            (meta["source_section"], meta["source_field"])
+            for meta in self.config_webui_detached_field_sections.values()
+        }
         for section_index, section_name in enumerate(
             _webui_ordered_sections(self.config_schema, self.config_section_order)
         ):
@@ -1261,20 +1525,107 @@ class PluginConfigDefinition:
                     section_name,
                     field_name,
                     field_def,
-                    hidden=field_name in hidden_fields,
+                    # Dashboard 当前没有 object/json 编辑器；固定结构对象在下方展开成
+                    # 点路径 section，任意对象保留给源码模式编辑。
+                    hidden=(
+                        field_name in hidden_fields
+                        or field_def.type is dict
+                        or (section_name, field_name) in detached_fields
+                    ),
                     order=field_index,
                 )
             sections[section_name] = {
                 "name": section_name,
-                "title": _webui_section_title(
+                "title": self.config_webui_section_titles.get(
+                    section_name,
+                    _webui_section_title(
+                        section_name,
+                        self.config_section_group_headers,
+                    ),
+                ),
+                "description": _webui_section_description(
                     section_name,
                     self.config_section_group_headers,
                 ),
-                "description": self.config_section_group_headers.get(section_name),
                 "icon": None,
                 "collapsed": False,
                 "order": section_index,
                 "fields": section_fields,
+            }
+
+        for nested_index, (nested_name, nested_meta) in enumerate(
+            self.config_webui_nested_sections.items(),
+            start=len(sections),
+        ):
+            source_section = self.config_schema.get(nested_meta["source_section"])
+            if not isinstance(source_section, dict):
+                continue
+            source_field = source_section.get(nested_meta["source_field"])
+            if not isinstance(source_field, ConfigField) or not isinstance(
+                source_field.default,
+                dict,
+            ):
+                continue
+
+            descriptions = nested_meta["field_descriptions"]
+            nested_fields: dict[str, Any] = {}
+            for field_index, (field_name, default) in enumerate(source_field.default.items()):
+                description = descriptions.get(field_name, field_name)
+                nested_fields[field_name] = _webui_field_schema(
+                    nested_name,
+                    field_name,
+                    ConfigField(
+                        type=type(default),
+                        default=default,
+                        description=description,
+                    ),
+                    hidden=False,
+                    order=field_index,
+                )
+            sections[nested_name] = {
+                "name": nested_name,
+                "title": nested_meta["title"],
+                "description": nested_meta["description"],
+                "icon": None,
+                "collapsed": False,
+                "order": nested_index,
+                "fields": nested_fields,
+            }
+
+        detached_description = (
+            "画师预设列表较长，默认折叠以保持页面整洁；需要换行阅读或编辑长画师串时，"
+            "请切换右上角“源代码”，编辑器会自动换行。"
+        )
+        for detached_index, (detached_name, detached_meta) in enumerate(
+            self.config_webui_detached_field_sections.items(),
+            start=len(sections),
+        ):
+            source_section_name = detached_meta["source_section"]
+            source_field_name = detached_meta["source_field"]
+            source_section = self.config_schema.get(source_section_name)
+            if not isinstance(source_section, dict):
+                continue
+            source_field = source_section.get(source_field_name)
+            if not isinstance(source_field, ConfigField):
+                continue
+
+            sections[detached_name] = {
+                # Dashboard 依赖 section.name 决定取值和保存路径；这里必须仍指向原配置节。
+                "name": source_section_name,
+                "title": detached_meta["title"],
+                "description": detached_description,
+                "icon": None,
+                "collapsed": True,
+                "order": detached_index,
+                "fields": {
+                    source_field_name: _webui_field_schema(
+                        source_section_name,
+                        source_field_name,
+                        source_field,
+                        hidden=False,
+                        order=0,
+                    )
+                },
             }
 
         return {
@@ -1286,7 +1637,7 @@ class PluginConfigDefinition:
                 "author": plugin_author or self.plugin_author,
             },
             "sections": sections,
-            "layout": {"type": "auto", "tabs": []},
+            "layout": {"type": "tabs", "tabs": self.config_webui_tabs},
         }
 
     @staticmethod

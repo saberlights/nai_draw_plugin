@@ -11,11 +11,9 @@
 """
 
 import re
-from typing import List, Tuple
 
 from .constants import (
     BOT_SELF_IMAGE_INTENT_KEYWORDS,
-    BOT_SELF_REFERENCE_KEYWORDS,
     EXPLICIT_IMAGE_REQUEST_KEYWORDS,
     EYE_COLOR_KEYWORDS,
     EYE_SPECIAL_TAGS,
@@ -25,7 +23,6 @@ from .constants import (
     NEGATIVE_IMAGE_INTENT_KEYWORDS_WEAK,
     PORTRAIT_OUTPUT_TAGS,
     PORTRAIT_TRIGGER_KEYWORDS,
-    SELFIE_OUTPUT_TAGS,
     SELFIE_TRIGGER_KEYWORDS,
 )
 
@@ -69,11 +66,12 @@ SELFIE_HINT_FOR_LLM = """
 
 ## 自拍 + 肖像通用要求
 - 默认是 bot 本人出镜（非二创角色），所以默认**不要补充角色名/作品名/版权 tag**（`character (series)`、cosplay 名等）
+- **外貌 tag 绝对禁止**：自拍和肖像时，LLM 不得生成、猜测、复述或从历史提示词延续发色、发型、瞳色 tag；例如 `black hair`、`long hair`、`twintails`、`blue eyes`。即使用户描述了这些特征，也不要写入输出，只生成服装、动作、表情、场景等本轮内容。
 - 仅当用户明确要求 cosplay/cos/扮演某角色时，才输出 cosplay 标签：
   - **格式**：`被 cosplay 的角色名_(cosplay)`，如 `shiranui_mai_(cosplay)`、`hatsune_miku_(cosplay)`、`rem_(cosplay)`
   - **禁止**使用 `角色名 (作品名)` 格式（如 `hatsune miku (vocaloid)`），那是画角色本人而非 cosplay
   - **禁止**单独输出 `cosplay` 标签，必须与角色名组合成 `角色名_(cosplay)` 形式
-  - cosplay 时出镜的是 bot 本人，只是穿着该角色的服装/发型，不要补充该角色的默认外貌特征
+  - cosplay 时出镜的是 bot 本人，只表现该角色的服装或配饰，不要补充该角色的默认外貌特征
 - **不要输出 `selfie stick` / `holding selfie stick`**
 - **不要输出 `arm up`**（自拍是手臂前伸而非向上举）
 - 前置自拍手机默认在画面外，不加 `holding phone` / `smartphone`；只有镜子自拍才加 `holding phone`
@@ -232,6 +230,7 @@ def get_portrait_enforcement_hint() -> str:
         "- 不添加 `portrait photo` / `candid photo` / `headshot` 等固定肖像前缀\n"
         "- 不默认添加 `close-up` / `upper body` / `pov` / `female pov` 或高低角度；仅响应用户明确指定的构图和视角\n"
         "- 用户要求全身/穿搭/腿/鞋时只用 `full body`，不得叠加其它 framing\n"
+        "- 不得生成、复述或延续任何发色、发型、瞳色 tag（包括用户或历史提示词中的此类内容）\n"
         "- 绝对禁止输出：`selfie` / `mirror selfie` / `group selfie` / `holding phone` / `selfie stick`\n"
         "</portrait_enforcement>"
     )

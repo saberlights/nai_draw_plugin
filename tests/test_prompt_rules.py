@@ -23,3 +23,5 @@ def test_prompt_templates_use_nai_weight_and_character_tag_rules() -> None:
     assert "`aris_(blue_archive)`" in PROMPT_GENERATOR_JSON_TEMPLATE
     assert "`alternate_costume`" in PROMPT_GENERATOR_JSON_TEMPLATE
     assert "视角减法" in PROMPT_GENERATOR_JSON_TEMPLATE
+    assert "被自拍/肖像规则识别为 bot 本人图片" in PROMPT_GENERATOR_JSON_TEMPLATE
+    assert "LLM 不得生成、复述或从上下文延续任何发色、发型或瞳色 tag" in PROMPT_GENERATOR_JSON_TEMPLATE
