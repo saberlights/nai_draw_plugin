@@ -13,7 +13,6 @@ from uuid import uuid4
 class _SessionEntry:
     last_accessed_at: float
     last_action_image_sent_at: float | None = None
-    last_auto_draw_sent_at: float | None = None
     pending_image_generation_started_at: float | None = None
     pending_image_generation_owner: str | None = None
     nai_context: tuple[str, str, float, float | None] | None = None
@@ -94,9 +93,11 @@ class TransientGenerationState:
                 continue
             if self._pending_is_active(entry, now):
                 continue
-            if entry.nai_context is not None or entry.selfie_context is not None:
+            if (
+                entry.nai_context is not None
+                or entry.selfie_context is not None
+            ):
                 entry.last_action_image_sent_at = None
-                entry.last_auto_draw_sent_at = None
                 entry.pending_image_generation_started_at = None
                 entry.pending_image_generation_owner = None
                 continue
@@ -207,21 +208,6 @@ class TransientGenerationState:
         entry = self._ensure_entry(stream_id)
         if entry is not None:
             entry.last_action_image_sent_at = float(
-                sent_at if sent_at is not None else self._clock()
-            )
-
-    def get_last_auto_draw_sent_at(self, stream_id: str) -> float | None:
-        entry = self._get_entry(stream_id)
-        return entry.last_auto_draw_sent_at if entry is not None else None
-
-    def set_last_auto_draw_sent_at(
-        self,
-        stream_id: str,
-        sent_at: float | None = None,
-    ) -> None:
-        entry = self._ensure_entry(stream_id)
-        if entry is not None:
-            entry.last_auto_draw_sent_at = float(
                 sent_at if sent_at is not None else self._clock()
             )
 

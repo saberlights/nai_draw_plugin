@@ -1,17 +1,11 @@
-"""集中图片生成准入、reply 去重、冷却判定与成功记账。"""
+"""集中 Planner Action 的图片生成准入、冷却判定与成功记账。"""
 
 from __future__ import annotations
 
-import hashlib
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from ..rules.reply_auto_draw import (
-    compose_description_from_reply,
-    score_reply_for_auto_draw,
-)
 from ..rules.selfie_rules import (
     detect_explicit_image_request,
     detect_negative_image_intent_strength,
@@ -43,11 +37,10 @@ class AdmissionDecision:
     explicit_request: bool = False
     signal_source: str = ""
     signal_text: str = ""
-    seed_description: str = ""
 
 
 class GenerationAdmissionPolicy:
-    """统一 Action 与 reply 自动跟图的准入状态机。"""
+    """Planner Action 的准入状态机。"""
 
     def __init__(
         self,
@@ -55,17 +48,10 @@ class GenerationAdmissionPolicy:
         state: Any,
         logger: Any,
         clock: Callable[[], float] = time.time,
-        max_reply_sessions: int = 2_000,
-        reply_claims_per_session: int = 16,
-        reply_claim_ttl_seconds: float = 86_400.0,
     ) -> None:
         self._state = state
         self._logger = logger
         self._clock = clock
-        self._max_reply_sessions = max(1, int(max_reply_sessions))
-        self._reply_claims_per_session = max(1, int(reply_claims_per_session))
-        self._reply_claim_ttl_seconds = max(0.0, float(reply_claim_ttl_seconds))
-        self._reply_claims: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
 
     def evaluate_action(
         self,
@@ -112,91 +98,15 @@ class GenerationAdmissionPolicy:
             signal_text=signal_text[:120],
         )
 
-    def evaluate_auto_draw(
-        self,
-        *,
-        stream_id: str,
-        config: dict[str, Any],
-        user_text: str = "",
-        user_text_age_seconds: float | None = None,
-    ) -> AdmissionDecision:
-        """评估 reply 自动跟图的用户否定意图与独立冷却。"""
-        normalized_user_text = str(user_text or "").strip()
-        blocked = self._negative_decision(
-            config=config,
-            user_text=normalized_user_text,
-            user_text_age_seconds=user_text_age_seconds,
-        )
-        if blocked is not None:
-            return blocked
-
-        allowed, detail = self._check_interval(
-            stream_id=stream_id,
-            config=config,
-            category="auto_draw",
-        )
-        return AdmissionDecision(
-            should_generate=allowed,
-            category="auto_draw",
-            detail=detail,
-            signal_source="user_text" if normalized_user_text else "none",
-            signal_text=normalized_user_text[:120],
-        )
-
-    def evaluate_reply_candidate(
-        self,
-        *,
-        stream_id: str,
-        reply_text: str,
-        config: dict[str, Any],
-    ) -> AdmissionDecision:
-        """评分并原子认领一条 reply，防止 hook retry 重复提交。"""
-        normalized_stream_id = str(stream_id or "").strip()
-        normalized_reply = str(reply_text or "").strip()
-        auto_config = self._get_config(config, "auto_draw_on_reply", {})
-        if not normalized_stream_id or not normalized_reply:
-            return AdmissionDecision(False, "blocked", "会话或 reply 为空")
-        if not isinstance(auto_config, dict) or not auto_config.get("enabled", True):
-            return AdmissionDecision(False, "blocked", "reply 自动跟图已关闭")
-
-        signal = score_reply_for_auto_draw(normalized_reply)
-        threshold = float(auto_config.get("score_threshold", 0.6))
-        if not signal.should_draw or signal.score < threshold:
-            return AdmissionDecision(False, "blocked", "reply 未达到自动跟图阈值")
-
-        description = compose_description_from_reply(normalized_reply, signal)
-        if not description:
-            return AdmissionDecision(False, "blocked", "reply 未生成有效图片描述")
-
-        if not self._claim_reply(normalized_stream_id, normalized_reply):
-            return AdmissionDecision(False, "blocked", "reply 已提交过自动跟图")
-
-        return AdmissionDecision(
-            should_generate=True,
-            category="auto_draw",
-            detail="reply 自动跟图准入",
-            signal_source="reply_text",
-            signal_text=normalized_reply[:120],
-            seed_description=description,
-        )
-
     def record_success(
         self,
         *,
         stream_id: str,
-        category: str,
         sent_at: float | None = None,
     ) -> None:
-        """图片成功交给发送 Adapter 后，按准入类别更新对应冷却。"""
+        """图片成功交给发送 Adapter 后更新 Action 冷却。"""
         timestamp = self._clock() if sent_at is None else float(sent_at)
-        if category == "auto_draw":
-            self._state.set_last_auto_draw_sent_at(stream_id, timestamp)
-            return
         self._state.set_last_action_image_sent_at(stream_id, timestamp)
-
-    def clear(self) -> None:
-        """清空本进程持有的 reply 去重状态。"""
-        self._reply_claims.clear()
 
     def _negative_decision(
         self,
@@ -248,20 +158,9 @@ class GenerationAdmissionPolicy:
             0,
             int(self._get_config(config, "action_guard.proactive_min_interval_seconds", 10)),
         )
-        auto_draw_interval = max(
-            0,
-            int(self._get_config(config, "auto_draw_on_reply.min_interval_seconds", 15)),
-        )
         last_action_at = self._state.get_last_action_image_sent_at(stream_id)
-        last_auto_draw_at = self._state.get_last_auto_draw_sent_at(stream_id)
 
-        if category == "auto_draw":
-            effective_last = max(
-                (value for value in (last_action_at, last_auto_draw_at) if value is not None),
-                default=None,
-            )
-            required_interval = auto_draw_interval
-        elif category == "explicit":
+        if category == "explicit":
             effective_last = last_action_at
             required_interval = explicit_interval
         else:
@@ -282,39 +181,6 @@ class GenerationAdmissionPolicy:
             remaining_seconds,
         )
         return False, _THROTTLED_DETAIL
-
-    def _claim_reply(self, stream_id: str, reply_text: str) -> bool:
-        now = self._clock()
-        self._prune_reply_claims(now)
-        signature = hashlib.sha256(reply_text.encode("utf-8")).hexdigest()
-        claims = self._reply_claims.get(stream_id)
-        if claims is None:
-            claims = OrderedDict()
-            self._reply_claims[stream_id] = claims
-        else:
-            self._reply_claims.move_to_end(stream_id)
-        if signature in claims:
-            return False
-
-        claims[signature] = now
-        while len(claims) > self._reply_claims_per_session:
-            claims.popitem(last=False)
-        while len(self._reply_claims) > self._max_reply_sessions:
-            self._reply_claims.popitem(last=False)
-        return True
-
-    def _prune_reply_claims(self, now: float) -> None:
-        if self._reply_claim_ttl_seconds <= 0:
-            self._reply_claims.clear()
-            return
-        for stream_id, claims in list(self._reply_claims.items()):
-            while claims:
-                _signature, claimed_at = next(iter(claims.items()))
-                if now - claimed_at <= self._reply_claim_ttl_seconds:
-                    break
-                claims.popitem(last=False)
-            if not claims:
-                self._reply_claims.pop(stream_id, None)
 
     @staticmethod
     def _get_config(config: dict[str, Any], path: str, default: Any) -> Any:

@@ -1,7 +1,6 @@
 from typing import Any, Awaitable, Callable, TypeVar
 from weakref import WeakSet
 
-import asyncio
 import inspect
 import os
 import re
@@ -121,7 +120,6 @@ class NaiPicPlugin(MaiBotPlugin):
         for invocation in list(self._active_invocations):
             invocation.close()
         reset_runtime_recall_tracking_state()
-        self._generation_admission_policy.clear()
         self._image_cache_service.clear()
         self._refresh_runtime_singletons(reset_only=True)
 
@@ -307,63 +305,6 @@ class NaiPicPlugin(MaiBotPlugin):
         if remember_sent_plugin_image_message(message, NAI_PIC_IMAGE_DISPLAY_MARKER):
             self._image_cache_service.cache_inbound_message(message)
         return None
-
-    @HookHandler(
-        "maisaka.replyer.after_response",
-        name="nai_draw_plugin_auto_draw_on_reply",
-        description="bot reply 命中视觉自指/情感节点时自动跟一张图",
-        mode=HookMode.OBSERVE,
-    )
-    async def handle_replyer_after_response_for_auto_draw(
-        self,
-        session_id: str = "",
-        response: str = "",
-        attempt: int = 1,
-        **kwargs: Any,
-    ) -> None:
-        """OBSERVE 模式：reply 文本生成成功时旁路评分，命中阈值就启动后台跟图。"""
-        del kwargs
-        # 主程序 LLM retry 时本 hook 会被反复触发（attempt>=2 表示当前是 retry 后的版本）；
-        # 中间被丢弃的版本不应该启动跟图，否则会污染签名集合并浪费一次评分。
-        if attempt > 1:
-            return
-
-        normalized_session = (session_id or "").strip()
-        reply_text = (response or "").strip()
-        if not normalized_session or not reply_text:
-            return
-
-        async def _prepare() -> None:
-            try:
-                plugin_config = await self._load_plugin_config_data()
-            except Exception:
-                return
-            if not isinstance(plugin_config, dict):
-                return
-            decision = self._generation_admission_policy.evaluate_reply_candidate(
-                stream_id=normalized_session,
-                reply_text=reply_text,
-                config=plugin_config,
-            )
-            if not decision.should_generate:
-                return
-
-            invocation = await self._create_invocation(
-                normalized_session,
-                action_data={"description": decision.seed_description},
-                source="reply_auto_draw",
-            )
-            self._start_image_generation_in_background(
-                normalized_session,
-                lambda: invocation.handle_auto_draw_from_reply(
-                    decision.seed_description,
-                    reply_context_text=reply_text,
-                ),
-                invocation=invocation,
-                name="nai-reply-auto-draw",
-            )
-
-        await self._background_tasks.run(_prepare, name="nai-reply-auto-draw-submission")
 
     @HookHandler(
         "chat.receive.before_process",
@@ -1569,7 +1510,12 @@ class NaiPicPlugin(MaiBotPlugin):
         "nai_web_draw",
         description=(
             "生成图片/照片/自拍/场景图。"
-            "可以根据语境发送 bot 本人的自拍、非自拍肖像照，或符合对话场景的图片。"
+            "核心是把当前聊天情景视觉化；Bot 出镜不等于自拍，"
+            "应根据语境选择自拍、第三视角、POV、远景或纯环境等合适画面。"
+            "【参数填写优先级】先把语义拆到正确字段，再调用工具；每个字段只填自己的信息，"
+            "禁止把一整段中文画面描述复制到 scene_delta。"
+            "action=动作/姿态，emotion=表情/情绪，framing=景别，subject_and_pov=人数与视角，"
+            "scene_delta=仅稳定服装和固定环境，dynamic_scene=临时物件/倒影/天气/时间/光线。"
             "既可以响应用户明确的看图请求，也可以在 bot 自己说出视觉自指/进入情感互动节点时主动跟一张图。"
             "【调用语义 - 重要】本 Action 是 fire-and-forget 异步任务："
             "调用成功只代表'图片任务已提交后台'，图片由插件自行通过会话发送，"
@@ -1580,50 +1526,93 @@ class NaiPicPlugin(MaiBotPlugin):
         activation_type=ActivationType.ALWAYS,
         parallel_action=True,
         action_parameters={
-            # 五个结构化字段：每个字段只承担一类信息，强制 Planner 分维度思考，
+            # 六个结构化字段：每个字段只承担一类信息，强制 Planner 分维度思考，
             # 避免一锅炖成关键词堆砌。下游会按字段顺序拼成单行 request；若 Planner
             # 兼容性原因只填了 description，则按整段兜底使用。
             "subject_and_pov": (
-                "主体与视角，不写其它。"
-                "格式：'一女' / '一男一女' / '两女'，可加视角：'POV' / '自拍' / '第三视角'。"
-                "区分：对方看 bot 做事=POV；bot 自己举手机=自拍；旁观叙事=第三视角或留空。"
-                "【画指定角色 vs bot 出镜】本字段需要区分两种主体身份："
+                "【只填主体与视角】格式：'一女' / '一男一女' / '两女'，可加一个视角。"
+                "对方观看 bot=POV；bot 明确举手机/前置相机=自拍；旁观叙事=第三视角。"
+                "不要在这里写动作、表情、服装或地点。"
+                "【主体身份】本字段需要区分三种情况："
                 "(a) bot 自己出镜（包括 bot cos 某角色，出镜的还是 bot）→ 正常写 '一女' 等；"
                 "(b) 画一个具体的二次元角色 / 用户点名的非 bot 角色（如'画一张初音未来'）→ "
                 "必须在主体前加 token '画指定角色'，例如 '画指定角色 一女 第三视角'。"
-                "该 token 用于告知后端：本轮主体不是 bot，禁止叠加 bot 外貌锚点。"
+                "(c) 画面只有环境或物件、bot 不出镜 → 必须写 token 'Bot不出镜'，"
+                "例如 'Bot不出镜 纯环境'。"
+                "这些 token 用于告知后端本轮不是 bot 出镜，禁止叠加 bot 外貌锚点。"
                 "判断标准：用户/Planner 明确写了具体角色名（初音未来、蕾姆、芙兰朵露等）"
-                "或作品角色的 → (b)；'画一张自己'/cosplay/泛指人物 → (a)。"
+                "或作品角色的 → (b)；纯环境/物件 → (c)；"
+                "'画一张自己'/cosplay/泛指人物 → (a)。"
             ),
             "action": (
-                "本轮核心动作，必须用用户原话/reasoning 里的动词，禁止软化。"
+                "【只填动作与姿态】必须用用户原话/reasoning 里的动词，禁止软化；不要写表情、情绪、"
+                "服装、地点或镜头。"
                 "如'揉胸'写'揉胸'、不要写'轻捧'；'骑'写'骑乘'、不要写'坐在身上'。"
-                "纯静态画面可留空或写'站立'。"
-                "禁词：轻捧/触碰/贴近/迷离/陶醉/挑逗。"
+                "纯静态画面可写'站立'。例如：'坐着，揉腰'，不要写'坐着，揉腰，嘟嘴'。"
             ),
             "emotion": (
-                "情绪状态，必须贴 reasoning 里 bot 当前心境，不要默认套'迷离咬唇'。"
+                "【只填表情与情绪】必须贴 reasoning 里的当前心境，不要写动作、服装、地点或镜头，"
+                "不要默认套'迷离咬唇'。"
                 "示例：'不情愿 害羞'、'撒娇 期待'、'紧张 微微低头'、'慵懒 半眯眼'。"
                 "无明显情绪可留空。"
             ),
             "scene_delta": (
-                "本轮相对上一张图新增/变化的场景或服装动作，没变化就留空。"
-                "沿用元素（卧室/床上等）由系统自动继承，不要在这里重复。"
-                "服装变化（脱/穿/掀）写这里；外貌锚点（长发/瞳色/choker）由配置注入，禁写。"
+                "【兼容旧字段】稳定服装与固定环境的综合描述。新调用优先使用 outfit_change / "
+                "environment_change 分别声明变化；本轮没有换装/换地点时留空。"
+                "若使用本字段，只写稳定设计，不写动作、表情、姿态、镜头或临时散落物。"
+            ),
+            "outfit_change": (
+                "【Planner 先判定服装变化，只填枚举】unchanged=服装没变（默认）；clear=本轮不可见；"
+                "switch=换回之前穿过的某套（可写 switch:<服装库 key>，key 见上一次画图回执的"
+                "'视觉连续性状态'；不记得 key 就只写 switch，把口语描述放进 outfit_new_look）；"
+                "replace=聊天中明确建立了新服装。"
+                "unchanged 时下游逐字复用上一轮服装 Tag，不重新翻译；"
+                "不要因为动作或构图变化而 replace；拿不准就写 unchanged。"
+            ),
+            "outfit_new_look": (
+                "【仅 outfit_change=replace/switch 时填】replace：新服装的完整中文描述，"
+                "具体保留用户说出的款式、颜色、材质和可见细节；"
+                "switch：想切回哪套的口语描述（如'之前那套白色连衣裙'）。其余情况留空。"
+            ),
+            "environment_change": (
+                "【Planner 先判定环境变化，只填枚举】unchanged=地点没变（默认）；clear=纯人物无背景；"
+                "switch=回到之前出现过的地点（可写 switch:<环境库 key>；不记得 key 就只写 switch，"
+                "把口语描述放进 environment_new_look）；replace=聊天中明确换了新地点。"
+                "unchanged 时下游逐字复用上一轮环境 Tag；"
+                "动态灯光、天气、烟雾、倒影和临时散落物放 dynamic_scene，不算环境变化。"
+            ),
+            "environment_new_look": (
+                "【仅 environment_change=replace/switch 时填】replace：新固定环境的完整中文描述"
+                "（空间布局、固定物件、材质、配色）；switch：想回到哪个地点的口语描述。其余情况留空。"
+            ),
+            "dynamic_scene": (
+                "*【只填动态场景】* 本轮短暂变化的临时物件、倒影、天气、时间、灯光、烟雾、"
+                "凌乱物品和即时氛围；不要写服装、固定家具、人物名、动作、表情或景别。"
+                "例如：'镜中倒影，夜间暖色灯光，化妆桌上散落的刷子和口红'。"
+                "这些内容不进入稳定环境卡片，每轮可以变化。"
             ),
             "framing": (
-                "构图镜头，1-2 个词："
-                "近景/特写/全身/胸部以上/俯视/仰视/侧面/肖像照/生活照/pov_hands。"
-                "默认不要每次写'近景'，按本轮重点选。"
+                "【只填景别/构图】只写一个景别或构图词：近景/特写/中景/全身/胸部以上/俯视/仰视/侧面。"
+                "第三视角、POV、自拍只写在 subject_and_pov；不要在这里重复视角，也不要写动作、表情或场景。"
             ),
             "description": (
                 "兜底字段，正常留空。"
-                "只有当本轮内容无法拆进上面 5 个字段时，才在这里写一行完整关键词串。"
-                "格式：人数 + 视角 + 动作 + 情绪 + 场景 + 构图；禁写外貌锚点和画质词。"
-            ),
+                "只有当本轮内容无法拆进上面 6 个字段时，才在这里写一行完整关键词串。"
+                "格式：人数 + 视角 + 动作 + 情绪 + 稳定服装/环境 + 动态场景 + 构图；禁写外貌锚点和画质词。"
+                ),
             "size": "图片尺寸（默认从配置获取）",
         },
+        # 用星号把最容易串字段的规则提升到 Planner 注意力最高的区域，并给出可直接模仿的拆分样例。
         action_require=[
+            "*【字段边界是硬约束，先拆分再调用】*",
+            "错误示例：action='坐着 揉腰 嘟嘴'、framing='中景 第三视角'、scene_delta='夜场后台化妆间……她揉腰……丝袜……'。",
+            "正确示例：subject_and_pov='一女 第三视角'；action='坐着，揉腰'；emotion='羞恼，脸红，嘟嘴，疲惫'；",
+            "framing='中景'；scene_delta='亮银色弹力亮片面料的高腰修身短裙，窄版剪裁，黑色细腰带，半透明黑色丝袜；"
+            "后台化妆间固定镜台、整面镜子、木质抽屉柜和米白墙面'；",
+            "dynamic_scene='镜中倒影，夜间暖色灯光，化妆桌上散落刷子和口红'。",
+            "*scene_delta 不得包含动作/表情/倒影/临时物件；framing 不得包含 POV/第三视角；嘟嘴必须在 emotion。*",
+            "*必须由 Planner 先分别决定 outfit_change 和 environment_change（只填枚举，新内容写进 "
+            "outfit_new_look / environment_new_look）；Tag LLM 不得猜测稳定区是否变化。*",
             "可以触发的典型时机：",
             "1. 用户明确要求看图/画图/发图/自拍/肖像/再来一张",
             "2. 用户明确想看 bot 本人的样子、穿搭、状态、某个身体/服饰视觉重点",
@@ -1695,6 +1684,7 @@ class NaiPicPlugin(MaiBotPlugin):
             return True, (
                 "图片任务已提交后台，图片由插件异步发送到会话，本次 tool_result 不包含 image 内容；"
                 "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可"
+                + invocation.render_visual_state_for_planner()
             )
 
         return await self._background_tasks.run(_prepare, name="nai-action-submission")

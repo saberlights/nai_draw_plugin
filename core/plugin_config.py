@@ -123,10 +123,6 @@ _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
         "ui_type": "select",
         "choices": ["png", "webp"],
     },
-    "auto_draw_on_reply.score_threshold": {
-        **_WEBUI_SLIDER_0_1,
-        "step": 0.05,
-    },
     "tag_retriever.popularity_weight": _WEBUI_SLIDER_0_1,
     "tag_retriever.min_score": _WEBUI_SLIDER_0_1,
     "retag.wd14_threshold": _WEBUI_SLIDER_0_1,
@@ -512,7 +508,7 @@ class PluginConfigDefinition:
     """以一个 Schema 驱动默认值、WebUI 和带注释 TOML 的深配置 Module。"""
 
     plugin_name = "nai_draw_plugin"
-    plugin_version = "1.8.0"
+    plugin_version = "1.11.0"
     plugin_author = "saberlight"
     # 配置文件顶部说明，渲染时挂在所有 section 之前（写 config.toml 时按行加 # 前缀）。
     config_file_header = (
@@ -536,7 +532,6 @@ class PluginConfigDefinition:
         "model",
         "prompt_generator",
         "action_guard",
-        "auto_draw_on_reply",
         "random_scene",
         "components",
         "prompt_show",
@@ -595,7 +590,6 @@ class PluginConfigDefinition:
     # TOML 分组标题面向源码阅读；WebUI 使用独立标题与标签页，避免把装饰性标题
     # 直接当成导航文案，并保证当前默认的 V4.5 配置进入首屏。
     config_webui_section_titles = {
-        "auto_draw_on_reply": "回复后自动跟图",
         "prompt_show": "提示词显示",
         "nsfw_filter": "NSFW 过滤",
         "auto_recall": "自动撤回",
@@ -643,7 +637,6 @@ class PluginConfigDefinition:
             "sections": [
                 "plugin",
                 "action_guard",
-                "auto_draw_on_reply",
                 "components",
                 "prompt_show",
                 "nsfw_filter",
@@ -1072,12 +1065,12 @@ class PluginConfigDefinition:
             "selfie_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="自拍模式额外正向外貌词；可填英文 prompt 片段；命中 selfie 时拼到正向"
+                description="Bot 出镜时固定追加的外貌与身材正向词；可填英文 prompt 片段；配置名为历史兼容，不会强制自拍构图"
             ),
             "selfie_negative_prompt_add": ConfigField(
                 type=str,
                 default="",
-                description="自拍模式额外负向外貌词；可填英文 prompt 片段；命中 selfie 时拼在 negative_prompt_add 之前，优先级更高"
+                description="Bot 出镜时固定追加的外貌负向词；可填英文 prompt 片段；拼在 negative_prompt_add 之前，优先级更高"
             ),
             "nai_extra_params": ConfigField(
                 type=dict,
@@ -1179,7 +1172,7 @@ class PluginConfigDefinition:
             "temperature": ConfigField(
                 type=float,
                 default=0.2,
-                description="提示词生成 LLM 温度；可填正浮点数；常用 0.2~1.5，越高越发散"
+                description="提示词生成 LLM 温度；可填正浮点数；常用 0.2~1.5，越高越发散；Bot 情景连续性路径为保证稳定 Tag 确定性固定使用 0.2，不受本项影响"
             ),
             "max_tokens": ConfigField(
                 type=int,
@@ -1194,7 +1187,12 @@ class PluginConfigDefinition:
             "inherit_ttl": ConfigField(
                 type=int,
                 default=3600,
-                description="上一轮提示词继承的有效时间；单位秒，可填正整数；默认 3600（1 小时），0 表示永不过期"
+                description="上一轮提示词继承（指定角色等 legacy 路径）与自拍上下文的有效时间；单位秒，可填正整数；默认 3600（1 小时），0 表示永不过期"
+            ),
+            "visual_state_ttl": ConfigField(
+                type=int,
+                default=0,
+                description="Bot 情景连续性中当前服装/环境的沿用有效期；单位秒；0 表示不过期，直到聊天中明确更换；过期后仅当前装扮失效，服装/环境卡片库始终保留可供 switch 切回"
             ),
             "custom_model": ConfigField(
                 type=dict,
@@ -1232,28 +1230,6 @@ class PluginConfigDefinition:
                 type=bool,
                 default=True,
                 description="主动出图自动注入自拍/肖像标签；可填 true / false；命中 proactive 且描述不含自拍/肖像关键词时启用"
-            ),
-        },
-        "auto_draw_on_reply": {
-            "enabled": ConfigField(
-                type=bool,
-                default=True,
-                description="reply 后置自动跟图开关；可填 true / false；开启后 bot 写出的 reply 命中视觉自指/情感节点时自动跟一张图"
-            ),
-            "score_threshold": ConfigField(
-                type=float,
-                default=0.6,
-                description="reply 评分阈值；可填 0.0~1.0 的浮点数；评分 ≥ 阈值才触发跟图，越高越保守"
-            ),
-            "min_interval_seconds": ConfigField(
-                type=int,
-                default=15,
-                description="reply 自动跟图的最小间隔；单位秒，可填正整数；与显式出图独立计时，关键词召回噪音大故略高于 explicit/proactive"
-            ),
-            "self_image_boost": ConfigField(
-                type=bool,
-                default=True,
-                description="跟图自动注入自拍/肖像标签；可填 true / false；不含自拍/肖像关键词时启用"
             ),
         },
         "random_scene": {

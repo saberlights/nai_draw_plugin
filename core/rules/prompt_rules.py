@@ -520,6 +520,48 @@ JSON 元素结构规则:
 """.strip()
 
 
+VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
+<output_instruction>
+你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序确定性复用服装和环境 Tag。
+
+输出格式（version=4）：
+{"version":4,"format":"single","intent":"normal|selfie|portrait","dynamic":{"subject":[...],"action":[...],"emotion":[...],"scene":[...],"framing":[...]},"stable":{"outfit":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]},"environment":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]}}}
+
+字段规则：
+- version: 固定 4。
+- format: 固定 "single"，表示使用单一 Prompt 通道，不限制画面人数。
+- intent: 根据实际画面语义选择；Bot 出镜不等于自拍，只有情景明确自拍时才用 selfie。
+- dynamic.subject: rating tag、人数、主体身份及本轮临时人物状态；第一个元素必须是唯一的 rating tag。
+- dynamic.action / emotion / framing: 只写本轮动作、表情和镜头构图。
+- dynamic.scene: 只写会自然变化的天气、时间、光线、氛围和临时物件。
+- stable.outfit / stable.environment: 只写跨图片需要保持一致的服装设计与环境结构。
+
+稳定区四种模式（Planner 的 outfit_change / environment_change 决定优先；Planner 未提供对应字段时由你根据上下文判断，没有明确变化必须用 keep）：
+- keep（对应 Planner 的 unchanged）：程序逐字复用上一轮缓存 Tag；stable 对应区 tags 输出 []，不要重新翻译或改写。
+  当前缓存显示"尚无缓存"时不能用 keep 携带 tags；若本轮该稳定区可见（如 Bot 出镜必有服装），改用 replace 正式建立。
+- switch：切回已知库中的一套；key 必须逐字使用库中已有 key，tags 输出 []，程序自动取回原 Tag。
+  Planner 只给了口语描述而没给 key 时，由你从库中选定唯一匹配的 key；库中没有匹配项时改用 replace 依据描述重建。
+- replace：为发生变化的稳定区生成完整新 Tag；key 用简短稳定的英文 snake_case 新标识，不能复用库中已有 key，也不能只写变化量；另一稳定区保持原状。
+- clear：清空对应稳定区；key 为空字符串，tags 输出 []。
+
+稳定区通用约束：
+- 已知库中存在合适项时禁止 replace 或创造近义 key，必须 switch；同一 key 永远对应同一串 Tag。
+- 服装和环境必须分别判断，禁止因为动作、表情、构图或镜头变化而 replace。
+- 不得把情景硬编码成有限的服装/地点类别；根据聊天内容开放式判断。
+- replace 的服装 tags 应尽量覆盖当前可见的颜色、材质、剪裁、结构、纹样、扣件、鞋袜、配饰等；
+  画面看不见或用户没有提供的细节不要硬编，至少保留用户明确指定的稳定设计。
+- replace 的环境 tags 应尽量覆盖空间布局、固定物件、材质和配色；不要为了凑细节凭空添加家具或地点设定。
+- 优先把"工作裙""常服""睡衣"等中文泛称展开为可直接绘制的设计；上下文只有类别词时保留该词也比丢失用户请求更好。
+
+JSON 元素规则：
+- 所有数组元素只能是最终英文 Danbooru tag 或单个权重表达，禁止自然语言句子。
+- 每个元素只能含一个 tag，禁止元素内部含逗号。
+- 禁止在 dynamic 重复 outfit/environment 的稳定 Tag。
+- 禁止输出 JSON 之外的任何字符，禁止用 ``` 包裹，禁止空响应。
+</output_instruction>
+""".strip()
+
+
 # ==================== 4 个最终模板 ====================
 
 def _build_prompt_generator_template(sfw: bool, json_output: bool) -> str:
@@ -540,7 +582,6 @@ def _build_prompt_generator_template(sfw: bool, json_output: bool) -> str:
 
 <<TAG_CANDIDATES>>
 <<PREVIOUS_PROMPT>>
-<<REPLY_CONTEXT>>
 <<REASONING_CONTEXT>>
 <user_request>
 <<USER_REQUEST>>
@@ -558,3 +599,37 @@ SFW_PROMPT_GENERATOR_TEMPLATE = _build_prompt_generator_template(sfw=True, json_
 SFW_PROMPT_GENERATOR_JSON_TEMPLATE = _build_prompt_generator_template(sfw=True, json_output=True)
 PROMPT_GENERATOR_TEMPLATE = _build_prompt_generator_template(sfw=False, json_output=False)
 PROMPT_GENERATOR_JSON_TEMPLATE = _build_prompt_generator_template(sfw=False, json_output=True)
+
+
+def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
+    """构建 Bot 情景图专用的稳定/动态 Tag 分区模板。"""
+    rules_text = _build_prompt_rules_text(sfw)
+    return f"""
+{rules_text}
+
+<<TAG_CANDIDATES>>
+<<PREVIOUS_PROMPT>>
+<<VISUAL_CONTINUITY_CONTEXT>>
+<<REASONING_CONTEXT>>
+<user_request>
+<<USER_REQUEST>>
+<<CURRENT_TIME_CONTEXT>>
+<<SELFIE_HINT>>
+<<SELFIE_SCENE_CONTEXT>>
+</user_request>
+
+{VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION}
+
+<visual_continuity_priority>
+本模板用于跨图连续性，稳定区规则优先于上方通用的“适度补充/默认 1-2 个服装词”建议。
+首次建立服装时必须输出完整、具体、可见的整套穿搭 Tag；若服装没有明确变化则只用 keep，禁止为了动作或构图改写稳定 Tag。
+</visual_continuity_priority>
+""".strip()
+
+
+SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE = (
+    _build_visual_continuity_prompt_generator_template(sfw=True)
+)
+VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE = (
+    _build_visual_continuity_prompt_generator_template(sfw=False)
+)

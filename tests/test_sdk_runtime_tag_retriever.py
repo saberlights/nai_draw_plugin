@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import os
 import sys
 import types
@@ -137,15 +136,10 @@ class _RecordingAdmissionPolicy:
     def __init__(self, decision: AdmissionDecision | None = None) -> None:
         self.decision = decision or AdmissionDecision(True, "proactive", "准入")
         self.action_calls: list[dict[str, object]] = []
-        self.auto_draw_calls: list[dict[str, object]] = []
         self.success_calls: list[dict[str, object]] = []
 
     def evaluate_action(self, **kwargs: object) -> AdmissionDecision:
         self.action_calls.append(kwargs)
-        return self.decision
-
-    def evaluate_auto_draw(self, **kwargs: object) -> AdmissionDecision:
-        self.auto_draw_calls.append(kwargs)
         return self.decision
 
     def record_success(self, **kwargs: object) -> None:
@@ -268,34 +262,6 @@ def test_preflight_action_guard_returns_typed_cached_policy_decision(
             "user_text": "别画了",
             "user_text_age_seconds": 12.5,
             "reasoning": "用户要求看图",
-        }
-    ]
-
-
-def test_auto_draw_assessment_passes_recent_user_signal_to_policy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    decision = AdmissionDecision(True, "auto_draw", "准入")
-    policy = _RecordingAdmissionPolicy(decision)
-    invocation = object.__new__(NaiInvocation)
-    invocation.plugin_config = {"auto_draw_on_reply": {"min_interval_seconds": 180}}
-    invocation.stream_id = "stream-auto"
-    invocation._generation_admission_policy = policy
-
-    async def fake_fetch(*, lookback: int = 6) -> tuple[str, float]:
-        return "给我用文字讲讲", 8.0
-
-    monkeypatch.setattr(invocation, "_fetch_last_user_text_with_age", fake_fetch)
-
-    result = asyncio.run(invocation._assess_auto_draw_trigger())
-
-    assert result is decision
-    assert policy.auto_draw_calls == [
-        {
-            "stream_id": "stream-auto",
-            "config": invocation.plugin_config,
-            "user_text": "给我用文字讲讲",
-            "user_text_age_seconds": 8.0,
         }
     ]
 
@@ -636,7 +602,6 @@ def test_send_image_result_downloads_generation_url_then_sends_base64_for_unknow
     assert invocation._generation_admission_policy.success_calls == [
         {
             "stream_id": "stream-1",
-            "category": "action",
             "sent_at": invocation._last_send_timestamp,
         }
     ]
@@ -702,7 +667,6 @@ def test_send_image_result_downloads_generation_url_for_qq_after_direct_url_fail
     assert invocation._generation_admission_policy.success_calls == [
         {
             "stream_id": "stream-1",
-            "category": "action",
             "sent_at": invocation._last_send_timestamp,
         }
     ]
@@ -761,44 +725,6 @@ def test_send_image_result_falls_back_to_base64_after_remote_url_exception(
     assert invocation._generation_admission_policy.success_calls == [
         {
             "stream_id": "stream-1",
-            "category": "action",
-            "sent_at": invocation._last_send_timestamp,
-        }
-    ]
-
-
-def test_send_image_result_records_auto_draw_success() -> None:
-    invocation = _build_image_send_invocation()
-
-    async def fake_send_custom(
-        message_type: str,
-        content: str,
-        *,
-        display_message: str = "",
-        storage_message: bool = True,
-    ) -> bool:
-        return True
-
-    async def fake_schedule() -> None:
-        return None
-
-    invocation.send_custom = fake_send_custom
-    invocation._schedule_auto_recall = fake_schedule
-    invocation._build_image_display_message = lambda _desc="": "[nai-image]"
-
-    result = asyncio.run(
-        invocation._send_image_result(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
-            "一女 自拍",
-            track_as_auto_draw=True,
-        )
-    )
-
-    assert result == (True, "图片生成成功", True)
-    assert invocation._generation_admission_policy.success_calls == [
-        {
-            "stream_id": "stream-1",
-            "category": "auto_draw",
             "sent_at": invocation._last_send_timestamp,
         }
     ]

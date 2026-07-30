@@ -69,6 +69,14 @@ src_services_module = types.ModuleType("src.services")
 src_services_module.llm_service = types.SimpleNamespace()
 sys.modules["src.services"] = src_services_module
 
+tag_retriever_module = types.ModuleType(
+    "plugins.nai_draw_plugin.core.services.tag_retriever"
+)
+tag_retriever_module.get_tag_retriever = lambda **_kwargs: None
+sys.modules[
+    "plugins.nai_draw_plugin.core.services.tag_retriever"
+] = tag_retriever_module
+
 from plugins.nai_draw_plugin.core.services.prompt_generation_workflow import (
     PromptGenerationWorkflow,
 )
@@ -83,4 +91,6 @@ def test_prompt_workflow_selfie_scene_context_uses_only_text_history() -> None:
 
     assert "上一轮自拍锚点" not in context
     assert "上一轮用户请求：发张自拍" in context
-    assert "上一轮自拍提示词：solo, 1girl, selfie, by window" in context
+    assert "上一轮 Bot 情景图提示词：solo, 1girl, selfie, by window" in context
+    assert "不代表本轮必须自拍" in context
+    assert "动作、表情、姿态、构图和镜头" in context

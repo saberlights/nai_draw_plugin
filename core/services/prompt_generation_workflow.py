@@ -14,6 +14,9 @@ from ..rules.prompt_rules import (
     PROMPT_GENERATOR_TEMPLATE,
     SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
     SFW_PROMPT_GENERATOR_TEMPLATE,
+    SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
+    VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION,
+    VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
 )
 from ..rules.selfie_rules import (
     detect_explicit_image_request,
@@ -30,6 +33,13 @@ from .llm_text_generator import LLMTextGenerator
 from .prompt_memory import render_previous_prompt_block
 from .session_state import session_state
 from .tag_candidate_resolver import resolve_tag_candidates
+from .visual_continuity import (
+    StableVisualTags,
+    VisualChangeDirective,
+    describe_visual_failure,
+    render_visual_continuity_context,
+    resolve_visual_continuity,
+)
 
 
 logger = get_logger("nai_draw_plugin")
@@ -43,10 +53,14 @@ class TextSender(Protocol):
 class PromptGenerationResult:
     text: str
     structured: dict[str, Any] | None
+    visual_continuity: StableVisualTags | None = None
 
 
 class PromptGenerationWorkflow:
     """隐藏模板、检索、记忆、LLM 调用和输出解析的深 Module。"""
+
+    # 首次响应之外允许的修复重试次数；所有失败原因码都是 LLM 可修复的
+    _MAX_VISUAL_REPAIR_ATTEMPTS = 2
 
     def __init__(
         self,
@@ -70,13 +84,18 @@ class PromptGenerationWorkflow:
         request_text: str,
         *,
         allow_inherit: bool,
+        tag_query_text: str = "",
         include_custom_system_prompt: bool = True,
-        reply_context_text: str = "",
         reasoning_context_text: str = "",
+        use_visual_continuity: bool = False,
+        include_outfit: bool = True,
+        stable_change_text: str = "",
+        visual_directives: dict[str, VisualChangeDirective] | None = None,
     ) -> PromptGenerationResult | None:
         request_text = str(request_text or "").strip()
         if not request_text:
             return None
+        tag_query_text = str(tag_query_text or request_text).strip()
 
         generator_config = self._get_dict_config("prompt_generator")
         output_format = str(
@@ -87,7 +106,13 @@ class PromptGenerationWorkflow:
             self._stream_id,
             self._get_config,
         )
-        if output_format == "json":
+        if use_visual_continuity:
+            default_template = (
+                SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE
+                if nsfw_filter_enabled
+                else VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE
+            )
+        elif output_format == "json":
             default_template = (
                 SFW_PROMPT_GENERATOR_JSON_TEMPLATE
                 if nsfw_filter_enabled
@@ -104,6 +129,7 @@ class PromptGenerationWorkflow:
         previous_request = ""
         last_selfie_prompt = ""
         last_selfie_request = ""
+        stable_visual_tags: StableVisualTags | None = None
         inherit_ttl = self._as_float(
             self._get_config("prompt_generator.inherit_ttl", 0),
             0.0,
@@ -122,31 +148,59 @@ class PromptGenerationWorkflow:
                 self._stream_id,
                 ttl=inherit_ttl,
             )
+            if use_visual_continuity:
+                stable_visual_tags = session_state.get_visual_continuity(
+                    self._stream_id,
+                    ttl=self._as_float(
+                        self._get_config("prompt_generator.visual_state_ttl", 0),
+                        0.0,
+                    ),
+                )
 
-        prompt_template = str(generator_config.get("prompt_template") or default_template)
+        custom_template = str(generator_config.get("prompt_template") or "").strip()
+        if custom_template and use_visual_continuity:
+            prompt_template = (
+                f"{custom_template}\n\n<<VISUAL_CONTINUITY_CONTEXT>>\n\n"
+                f"{VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION}"
+            )
+        else:
+            prompt_template = custom_template or default_template
         prompt = self._render_prompt(
             prompt_template,
             request_text,
             include_custom_system_prompt=(
                 include_custom_system_prompt and not nsfw_filter_enabled
             ),
-            previous_prompt=(previous_prompt or "") if allow_inherit else "",
-            previous_request=(previous_request or "") if allow_inherit else "",
-            last_selfie_prompt=(last_selfie_prompt or "") if allow_inherit else "",
-            last_selfie_request=(last_selfie_request or "") if allow_inherit else "",
-            reply_context_text=reply_context_text,
+            previous_prompt=(previous_prompt or "")
+            if allow_inherit and not use_visual_continuity
+            else "",
+            previous_request=(previous_request or "")
+            if allow_inherit and not use_visual_continuity
+            else "",
+            last_selfie_prompt=(last_selfie_prompt or "")
+            if allow_inherit and not use_visual_continuity
+            else "",
+            last_selfie_request=(last_selfie_request or "")
+            if allow_inherit and not use_visual_continuity
+            else "",
             reasoning_context_text=reasoning_context_text,
+            stable_visual_tags=stable_visual_tags,
+            include_outfit=include_outfit,
         )
 
-        tag_candidates = await self._retrieve_tag_candidates(request_text)
+        tag_candidates = await self._retrieve_tag_candidates(tag_query_text)
         if self._show_tag_candidates:
             await self._send_tag_retriever_display(tag_candidates)
         prompt = prompt.replace("<<TAG_CANDIDATES>>", tag_candidates).strip()
 
+        effective_generator_config = generator_config
+        if use_visual_continuity:
+            # 连续性路径要求确定性输出，固定低温覆盖用户配置（见 temperature 配置说明）
+            effective_generator_config = {**generator_config, "temperature": 0.2}
         response = await self._text_generator.generate(
             prompt,
             request_type="nai_draw_plugin.prompt_generator",
-            generator_config=generator_config,
+            generator_config=effective_generator_config,
             default_model_name="planner",
             default_temperature=0.2,
             default_max_tokens=200,
@@ -154,19 +208,69 @@ class PromptGenerationWorkflow:
         if not response:
             return None
 
-        cleaned_prompt = self._cleanup_llm_prompt(response)
+        continuity_result = None
+        if use_visual_continuity:
+            # resolve 是唯一校验事实源：失败原因码直接驱动修复重试，
+            # 覆盖 JSON 解析失败 / 缺 rating / 稳定区协议冲突等全部失败模式
+            for repair_attempt in range(self._MAX_VISUAL_REPAIR_ATTEMPTS + 1):
+                if repair_attempt:
+                    response = await self._text_generator.generate(
+                        self._build_visual_repair_prompt(
+                            prompt,
+                            response,
+                            continuity_result.failure,
+                        ),
+                        request_type="nai_draw_plugin.prompt_generator",
+                        generator_config=effective_generator_config,
+                        default_model_name="planner",
+                        default_temperature=0.2,
+                        default_max_tokens=200,
+                    )
+                    if not response:
+                        return None
+                extracted = extract_last_code_block(response)
+                continuity_result = resolve_visual_continuity(
+                    extracted if extracted is not None else response,
+                    previous=stable_visual_tags,
+                    include_outfit=include_outfit,
+                    directives=visual_directives,
+                    stable_change_text=stable_change_text,
+                )
+                if continuity_result.prompt:
+                    break
+                if repair_attempt < self._MAX_VISUAL_REPAIR_ATTEMPTS:
+                    logger.info(
+                        "%s v4 视觉连续性响应不可用（原因: %s），发起第 %d 次修复",
+                        self._log_prefix,
+                        continuity_result.failure,
+                        repair_attempt + 1,
+                    )
+            if not continuity_result.prompt:
+                logger.warning(
+                    "%s 未获得可用的 v4 视觉连续性 Tag（原因: %s），已拒绝发送",
+                    self._log_prefix,
+                    continuity_result.failure,
+                )
+                return None
+
+        cleaned_prompt = (
+            continuity_result.prompt
+            if continuity_result is not None
+            else self._cleanup_llm_prompt(response)
+        )
         if not cleaned_prompt:
             return None
 
-        structured_payload = resolve_multi_character_payload(response, cleaned_prompt)
-        if allow_inherit and self._stream_id:
-            session_state.set_last_nai_context(
-                self._stream_id,
-                cleaned_prompt,
-                request_text,
-                inherit_ttl,
-            )
-        return PromptGenerationResult(cleaned_prompt, structured_payload)
+        structured_payload = (
+            None
+            if continuity_result is not None
+            else resolve_multi_character_payload(response, cleaned_prompt)
+        )
+        return PromptGenerationResult(
+            cleaned_prompt,
+            structured_payload,
+            continuity_result.stable if continuity_result is not None else None,
+        )
 
     def _get_config(self, key: str, default: Any = None) -> Any:
         current: Any = self._config
@@ -190,8 +294,9 @@ class PromptGenerationWorkflow:
         previous_request: str,
         last_selfie_prompt: str,
         last_selfie_request: str,
-        reply_context_text: str,
         reasoning_context_text: str,
+        stable_visual_tags: StableVisualTags | None,
+        include_outfit: bool,
     ) -> str:
         custom_system_prompt = ""
         if include_custom_system_prompt:
@@ -207,8 +312,11 @@ class PromptGenerationWorkflow:
             render_previous_prompt_block(previous_prompt, previous_request),
         ).strip()
         prompt = prompt.replace(
-            "<<REPLY_CONTEXT>>",
-            self._render_reply_context(reply_context_text),
+            "<<VISUAL_CONTINUITY_CONTEXT>>",
+            render_visual_continuity_context(
+                stable_visual_tags,
+                include_outfit=include_outfit,
+            ),
         ).strip()
         prompt = prompt.replace(
             "<<REASONING_CONTEXT>>",
@@ -228,6 +336,30 @@ class PromptGenerationWorkflow:
             ),
         ).strip()
         return prompt.replace("<<USER_REQUEST>>", request_text.strip() or "N/A")
+
+    @staticmethod
+    def _build_visual_repair_prompt(
+        base_prompt: str,
+        rejected_response: str,
+        failure: str,
+    ) -> str:
+        """把 resolve 的失败原因翻译成修复指引，附上被拒响应供 LLM 对照。"""
+
+        return (
+            f"{base_prompt}\n\n<visual_continuity_repair>\n"
+            "上一次输出未通过程序校验，不能使用。"
+            f"本次失败原因：{describe_visual_failure(failure)}\n"
+            "请对照 planner_visual_request 与上方稳定 Tag 库逐项修正并重新输出完整 JSON；"
+            "**Planner 的 outfit_change / environment_change 决定优先于本 JSON，"
+            "不要自行猜测稳定区是否变化。**"
+            "stable.outfit 应尽量是整套当前可见穿搭，并优先保留用户明确给出的颜色、材质、"
+            "版型/剪裁、长度/层次、结构、鞋袜或配饰；不要为了凑数量凭空编造。"
+            "stable.environment 应尽量保留用户明确给出的空间布局、固定家具/物件、材质和配色；"
+            "dynamic 只放动作、表情、镜头、光线和临时物件。不得遗漏用户明确描述。"
+            f"\n<rejected_visual_continuity_json>\n{rejected_response}\n"
+            "</rejected_visual_continuity_json>\n"
+            "只输出修正后的 JSON。\n</visual_continuity_repair>"
+        )
 
     async def _retrieve_tag_candidates(self, request_text: str) -> str:
         return await resolve_tag_candidates(
@@ -271,20 +403,6 @@ class PromptGenerationWorkflow:
         logger.warning(
             "%s Danbooru 检索结果回显发送失败，已放弃回显",
             self._log_prefix,
-        )
-
-    @staticmethod
-    def _render_reply_context(text: str) -> str:
-        normalized = (text or "").strip()
-        if not normalized:
-            return ""
-        return (
-            "<bot_reply_context>\n"
-            "（这是 bot 本人这一轮即将说出去的回复原文。请基于这段语境扩展画面细节"
-            "——衣着、姿态、光照、室内陈设等——让生成的图与文匹配，"
-            "而不是仅看 user_request 的关键词。）\n"
-            f"{normalized}\n"
-            "</bot_reply_context>"
         )
 
     @staticmethod
@@ -340,15 +458,16 @@ class PromptGenerationWorkflow:
 
         lines = [
             "<selfie_scene_context>",
-            "这轮请求很可能属于 bot 本人自拍/展示照 的连续发图。",
-            "若用户没有明确要求切换场景、换穿搭或改光线，默认延续上一轮的背景、穿搭、时间氛围与构图重点。",
-            "服装连续性要尽量真实：若用户没有明确要求换衣服、换颜色、换材质、换风格，默认延续上一轮服装款式、主色、材质、袜子和鞋子的视觉设定，不要突然从白衣变黑衣，或从针织变皮衣。",
-            "如果用户明确指定了本轮想看的重点（如黑丝、鞋子、腿部、全身穿搭、背景），优先保留该重点，并选择能看清它的构图。",
+            "这轮请求可能属于 Bot 本人的连续情景图；Bot 出镜不代表本轮必须自拍。",
+            "若聊天没有明确建立换装或地点变化，服装设计和环境结构必须沿用已有稳定 Tag。",
+            "动作、表情、姿态、构图和镜头按本轮情景动态生成，不要求继承上一张图；"
+            "当下时间、天气和光线也只按当前语境决定。",
+            "用户明确指定视觉重点时，选择能看清该重点的构图，但不要借此改写未变化的服装或环境。",
         ]
         if last_selfie_request:
             lines.append(f"上一轮用户请求：{last_selfie_request.strip()}")
         if previous_prompt:
-            lines.append(f"上一轮自拍提示词：{previous_prompt}")
+            lines.append(f"上一轮 Bot 情景图提示词：{previous_prompt}")
         lines.append("</selfie_scene_context>")
         return "\n".join(lines)
 

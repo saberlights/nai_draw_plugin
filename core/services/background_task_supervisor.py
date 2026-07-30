@@ -137,6 +137,9 @@ class BackgroundTaskSupervisor:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # gather 对已终态任务不会让出事件循环，而 done_callback 里的 discard
+            # 靠 call_soon 排队执行；不主动移除本轮任务会在这里空转死锁
+            self._tasks.difference_update(tasks)
 
     async def _invoke_failure_callback(
         self,

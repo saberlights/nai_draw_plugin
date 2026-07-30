@@ -39,6 +39,11 @@ from .core.services.prompt_generation_workflow import PromptGenerationWorkflow
 from .core.services.random_scene_planner import RandomScenePlanner
 from .core.services.recall_workflow import RecallWorkflow
 from .core.services.session_state import session_state
+from .core.services.visual_continuity import (
+    StableVisualTags,
+    VisualChangeDirective,
+    parse_visual_change_directives,
+)
 from .core.services.user_blacklist import user_blacklist
 from .core.services.named_reference_store import (
     CapacityExceededError as _NamedRefCapacityExceededError,
@@ -54,7 +59,9 @@ from .core.services.named_reference_store import (
 from .core.utils.action_payload import (
     STRUCTURED_DESCRIPTION_FIELDS,
     compose_description_from_action_payload,
+    is_bot_absent_intent,
     is_named_character_intent,
+    render_action_payload_for_prompt,
 )
 from .core.utils.display_message_helper import build_action_image_display_message
 from .core.utils.help_renderer import HELP_FALLBACK_TEXT as _HELP_FALLBACK_TEXT
@@ -345,6 +352,8 @@ class NaiInvocation(ModelConfigMixin):
             log_prefix=self.log_prefix,
         )
         self._last_send_timestamp: float | None = None
+        # 连续性状态候选：workflow 生成时暂存，出图并发送成功后才提交
+        self._pending_visual_continuity: StableVisualTags | None = None
         # Action Guard 评估缓存：主路径同步预检后，后台 handle_action 复用结果，避免重复读消息库
         self._cached_action_trigger_assessment: AdmissionDecision | None = None
 
@@ -717,7 +726,7 @@ class NaiInvocation(ModelConfigMixin):
             image_base64,
             display_message=display_message,
         )
-        # 命令 / 自动跟图发出的图：发送（已 await 入库）后立刻在图片库标记“已识别”，
+        # 命令发出的图：发送（已 await 入库）后立刻在图片库标记“已识别”，
         # 让 MaiBot 后续不再对这张图触发 VLM 识图；action（麦麦主动画图）不在此列。
         if self._skip_self_vlm():
             await self._register_self_image_as_processed(image_base64, image_description)
@@ -727,8 +736,7 @@ class NaiInvocation(ModelConfigMixin):
         """是否跳过 MaiBot 对“本插件这次发出的图”的 VLM 识图。
 
         仅 ``action``（LLM 工具调用 handle_action）保留识图，让麦麦能“看见”自己在对话里
-        主动画的图；命令（/nai 等）与自动跟图（reply_auto_draw）都是用户点单或配图的产物，
-        描述已知、无需再过 VLM，一律跳过。
+        主动画的图；命令（/nai 等）是用户点单的产物，描述已知、无需再过 VLM。
         """
         return self.source != "action"
 
@@ -864,16 +872,8 @@ class NaiInvocation(ModelConfigMixin):
         self,
         result: str,
         description: str = "",
-        *,
-        track_as_auto_draw: bool = False,
     ) -> tuple[bool, str | None, bool]:
-        """发送图片结果。
-
-        Args:
-            track_as_auto_draw: 若为 True，把这次发送计入 auto_draw 独立间隔门，
-                不刷新 explicit/proactive 共用的最近出图时间——这样 reply hook
-                自动跟图不会冻结后续用户的明确出图请求。
-        """
+        """发送图片结果。"""
         final_image_data = self._process_api_response(result)
         if not final_image_data:
             await self.send_text("API 返回了无效的数据")
@@ -916,7 +916,6 @@ class NaiInvocation(ModelConfigMixin):
 
         self._generation_admission_policy.record_success(
             stream_id=self.stream_id,
-            category="auto_draw" if track_as_auto_draw else "action",
             sent_at=self._last_send_timestamp,
         )
         await self._schedule_auto_recall()
@@ -976,19 +975,29 @@ class NaiInvocation(ModelConfigMixin):
         request_text: str,
         *,
         allow_inherit: bool,
+        tag_query_text: str = "",
         include_custom_system_prompt: bool = True,
-        reply_context_text: str = "",
         reasoning_context_text: str = "",
+        use_visual_continuity: bool = False,
+        include_outfit: bool = True,
+        stable_change_text: str = "",
+        visual_directives: dict[str, VisualChangeDirective] | None = None,
     ) -> Optional[tuple[str, Optional[dict[str, Any]]]]:
+        self._pending_visual_continuity = None
         result = await self._prompt_generation_workflow.generate(
             request_text,
             allow_inherit=allow_inherit,
+            tag_query_text=tag_query_text,
             include_custom_system_prompt=include_custom_system_prompt,
-            reply_context_text=reply_context_text,
             reasoning_context_text=reasoning_context_text,
+            use_visual_continuity=use_visual_continuity,
+            include_outfit=include_outfit,
+            stable_change_text=stable_change_text,
+            visual_directives=visual_directives,
         )
         if result is None:
             return None
+        self._pending_visual_continuity = result.visual_continuity
         return result.text, result.structured
 
     async def _generate_random_description(
@@ -1860,13 +1869,13 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text(f"执行失败：{str(exc)[:100]}")
             return False, f"执行失败: {exc}", True
 
-    # 结构化字段顺序固定为：主体视角 → 动作 → 情绪 → 场景增量 → 构图。
+    # 结构化字段顺序固定为：主体视角 → 动作 → 情绪 → 稳定区增量 → 动态场景 → 构图。
     # 这个顺序与 NAI tag 标准排序对齐，下游 prompt 模板里"tag 顺序"硬规则也基于此排序解析。
     # 实际取值与拼接逻辑见 core/utils/action_payload.py（提到独立模块方便单测）。
     _STRUCTURED_DESCRIPTION_FIELDS = STRUCTURED_DESCRIPTION_FIELDS
 
     def _compose_description_from_action_data(self) -> str:
-        """把 Planner 拆分的 5 个结构化字段 + ``description`` 拼成单行 request 文本。
+        """把 Planner 拆分的 6 个结构化字段 + ``description`` 拼成单行 request 文本。
 
         细节见 ``compose_description_from_action_payload``：``description`` 字段含**独有的
         核心锚点**（角色名 / 服装款式 / 场景物件），不能因为结构化字段非空就丢——否则
@@ -1883,6 +1892,10 @@ class NaiInvocation(ModelConfigMixin):
         会把 ``初音未来`` 的绿色双马尾洗成 bot 自己的发色。
         """
         return is_named_character_intent(self.action_data)
+
+    def _is_bot_absent_intent(self) -> bool:
+        """Planner 是否声明本轮只画环境或物件，Bot 不出镜。"""
+        return is_bot_absent_intent(self.action_data)
 
     async def handle_action(self) -> tuple[bool, str]:
         """处理 `nai_web_draw` Action。"""
@@ -1903,10 +1916,10 @@ class NaiInvocation(ModelConfigMixin):
         # LLM 改写前的版本（与最终 description 区分）。
         raw_description = description
 
-        # "画指定角色" 短路：Planner 明确标记本轮主体不是 bot 时，跳过 self-image 注入与
-        # selfie 后处理。这两步原本是给"bot 自己出镜"兜底的——会把"肖像照"塞进 description、
-        # 把 bot 默认外貌锚点合进 prompt，对画指定角色（如初音未来）就是把角色洗成 bot。
+        # 指定角色与纯环境都不是 Bot 出镜：两者跳过固定外貌注入，指定角色另外跳过
+        # Bot 专用视觉连续性，避免把 Bot 的衣服和环境带到二创角色请求中。
         is_named_character = self._is_named_character_intent()
+        is_bot_absent = self._is_bot_absent_intent()
 
         trigger_assessment = await self._assess_action_trigger(reasoning=self.reasoning)
         if self._is_action_guard_enabled() and not trigger_assessment.should_generate:
@@ -1922,37 +1935,47 @@ class NaiInvocation(ModelConfigMixin):
 
         # 主动出图自动 self-image 增强：bot 自己想发图时，让出来的图更像"她给你看一眼自己"
         # 而不是"画了一张陌生女孩"。explicit 路径不动，保持用户原意。
-        # 画指定角色路径不注入：本轮主体是指定角色而非 bot，加"肖像照"会把角色洗成 bot 肖像。
+        # 非 Bot 画面不注入：指定角色会被洗成 Bot，纯环境则会被强行塞入人物。
         if (
             trigger_assessment.category == "proactive"
             and bool(self.get_config("action_guard.proactive_self_image_boost", True))
             and description
             and not is_named_character
+            and not is_bot_absent
             and not detect_selfie_from_output(description)
         ):
             description = _inject_self_image_hint(description, mode="portrait")
             raw_description = description
             logger.debug("%s 主动出图已注入 self-image 提示: %s", self.log_prefix, description[:80])
 
+        prompt_request = render_action_payload_for_prompt(
+            self.action_data,
+            effective_description=description,
+        ) or description
+        # 指定角色不走 Bot 专用视觉连续性，避免把 Bot 的衣服和环境带到二创角色请求中
+        use_visual_continuity = not is_named_character
         generated_prompt = await self._generate_prompt_with_llm(
-            description,
+            prompt_request,
             allow_inherit=True,
+            tag_query_text=description,
             include_custom_system_prompt=True,
             reasoning_context_text=self.reasoning,
+            use_visual_continuity=use_visual_continuity,
+            include_outfit=not is_bot_absent,
+            stable_change_text=str(self.action_data.get("scene_delta", "") or "").strip(),
+            visual_directives=parse_visual_change_directives(self.action_data),
         )
         structured_payload: Optional[Dict[str, Any]] = None
         if generated_prompt:
             description = generated_prompt[0].strip()
             structured_payload = generated_prompt[1]
-        elif not description:
+        else:
             await self.send_text("提示词生成器开小差了，请直接告诉我想画什么，或者稍后再试一次~")
-            return False, "图片描述为空"
+            return False, "提示词生成失败，已取消本次图片任务"
 
-        is_selfie = (
-            False
-            if is_named_character
-            else detect_bot_self_image_intent(raw_description)
-        )
+        # 这里的 is_selfie 是历史变量名，真实语义是“Bot 本人是否出镜”。第三视角、POV
+        # 和生活场景同样必须注入 config.toml 的 selfie_prompt_add 固定外貌。
+        is_selfie = not is_named_character and not is_bot_absent
         selfie_base_prompt = description
         if is_selfie:
             description = self._process_selfie_prompt(
@@ -1960,12 +1983,6 @@ class NaiInvocation(ModelConfigMixin):
                 raw_description,
                 include_selfie_prompt_add=True,
                 log_changes=True,
-            )
-            session_state.set_last_selfie_context(
-                self.stream_id,
-                description,
-                raw_description,
-                ttl=float(self.get_config("prompt_generator.inherit_ttl", 0) or 0),
             )
             structured_payload = None
 
@@ -2020,135 +2037,57 @@ class NaiInvocation(ModelConfigMixin):
             return False, str(result)
 
         send_result = await self._send_image_result(result, raw_description or description)
+        if send_result[0]:
+            inherit_ttl = float(self.get_config("prompt_generator.inherit_ttl", 0) or 0)
+            # 状态一律在出图并发送成功后才提交：连续性状态与 legacy 继承上下文
+            # 互不写入对方的槽位，避免 Bot 服装/环境污染指定角色的继承链（反之亦然）
+            if self._pending_visual_continuity is not None:
+                session_state.set_visual_continuity(
+                    self.stream_id,
+                    self._pending_visual_continuity,
+                )
+            elif not use_visual_continuity:
+                session_state.set_last_nai_context(
+                    self.stream_id,
+                    selfie_base_prompt,
+                    prompt_request,
+                    inherit_ttl,
+                )
+            if is_selfie:
+                session_state.set_last_selfie_context(
+                    self.stream_id,
+                    description,
+                    raw_description,
+                    ttl=inherit_ttl,
+                )
         if send_result[0] and enable_debug:
             await self.send_text("图片生成完成！")
         return send_result[0], send_result[1] or ""
 
-    async def handle_auto_draw_from_reply(
-        self,
-        seed_description: str,
-        *,
-        reply_context_text: str = "",
-    ) -> tuple[bool, str]:
-        """reply 后置 hook 触发的自动跟图。
+    def render_visual_state_for_planner(self) -> str:
+        """把当前连续性 key 库渲染进 action 回执，给 Planner 提供 switch 词汇表。
 
-        与 handle_action 区别：
-        - description 由 reply 评分模块拼好（``seed_description``），不依赖 Planner 写参数
-        - guard 走 ``category="auto_draw"``，使用独立间隔门
-        - 发送计入 ``last_auto_draw_sent_at``，不会冻结后续显式请求
-        - 失败不发用户可见报错（OBSERVE hook 静默兜底）
-
-        ``reply_context_text`` 是 bot 即将说出的回复原文：description 只是关键词拼接，LLM
-        看不到 reply 的具体语境（"刚洗完澡"暗示的浴袍/湿发等）；这段原文会注入 prompt 模板，
-        让生成的图与文匹配。
+        Planner 只能通过历史 tool_result 看到这些 key——这是它下一轮填
+        ``outfit_change=switch:<key>`` 的唯一可靠来源。
         """
-        if not await self.ensure_user_not_blacklisted():
-            return False, "黑名单用户"
-        if not await self.ensure_generation_permission():
-            return False, "没有权限"
-
-        description = (seed_description or "").strip()
-        if not description:
-            return False, "空 description"
-
-        # auto_draw 单独跑 guard：负向用户原话仍要兜底，间隔走 auto_draw 档
-        guard_state = await self._assess_auto_draw_trigger()
-        if self._is_action_guard_enabled() and not guard_state.should_generate:
-            logger.info(
-                "%s reply 自动跟图被拦截: detail=%s text=%s",
-                self.log_prefix,
-                guard_state.detail,
-                guard_state.signal_text,
-            )
-            return False, guard_state.detail
-
-        # 自动 self-image 增强：description 不含自拍/肖像/生活照标签时补一个
-        if (
-            bool(self.get_config("auto_draw_on_reply.self_image_boost", True))
-            and not detect_selfie_from_output(description)
-        ):
-            description = _inject_self_image_hint(description, mode="portrait")
-
-        raw_description = description
-
-        generated_prompt = await self._generate_prompt_with_llm(
-            description,
-            allow_inherit=True,
-            include_custom_system_prompt=True,
-            reply_context_text=reply_context_text,
-        )
-        structured_payload: Optional[Dict[str, Any]] = None
-        if generated_prompt:
-            description = generated_prompt[0].strip()
-            structured_payload = generated_prompt[1]
-        elif not description:
-            return False, "图片描述为空"
-
-        # 肖像规则不再要求 portrait photo/candid photo；因此这里必须依赖 LLM 前已经
-        # 注入的 bot 本人意图，不能反推最终标签，否则会漏掉自拍外貌串。
-        is_selfie = detect_bot_self_image_intent(raw_description)
-        if is_selfie:
-            description = self._process_selfie_prompt(
-                description,
-                raw_description,
-                include_selfie_prompt_add=True,
-                log_changes=True,
-            )
-            session_state.set_last_selfie_context(
-                self.stream_id,
-                description,
-                raw_description,
-                ttl=float(self.get_config("prompt_generator.inherit_ttl", 0) or 0),
-            )
-            structured_payload = None
-
-        if self.get_config("prompt_generator.enforce_tag_order", False):
-            description = normalize_prompt_order(description)
-            structured_payload = self._normalize_structured_order(structured_payload)
-
-        description = self._sanitize_prompt_for_sfw_mode(description)
-        structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
-
-        model_config = self._get_model_config(is_selfie=is_selfie)
-        if not model_config or not model_config.get("base_url"):
-            return False, "模型配置无效"
-
-        image_size = model_config.get("nai_size") or model_config.get("default_size", "")
-
-        request_prompt, request_characters = self._select_send_payload(
-            description, structured_payload
-        )
-        try:
-            success, result = await self.api_client.generate_image(
-                prompt=request_prompt,
-                model_config=model_config,
-                size=image_size,
-                characters=request_characters,
-            )
-        except Exception as exc:
-            logger.error("%s reply 自动跟图生成失败: %r", self.log_prefix, exc, exc_info=True)
-            return False, str(exc)
-
-        if not success:
-            logger.info("%s reply 自动跟图未成功: %s", self.log_prefix, result)
-            return False, str(result)
-
-        send_result = await self._send_image_result(
-            result,
-            raw_description or description,
-            track_as_auto_draw=True,
-        )
-        return send_result[0], send_result[1] or ""
-
-    async def _assess_auto_draw_trigger(self) -> AdmissionDecision:
-        """读取最近用户原话并评估 reply 自动跟图。"""
-        user_text, age_seconds = await self._fetch_last_user_text_with_age()
-        return self._generation_admission_policy.evaluate_auto_draw(
-            stream_id=self.stream_id,
-            config=self.plugin_config,
-            user_text=user_text,
-            user_text_age_seconds=age_seconds,
-        )
+        ttl = float(self.get_config("prompt_generator.visual_state_ttl", 0) or 0)
+        stable = session_state.get_visual_continuity(self.stream_id, ttl=ttl)
+        if stable is None:
+            return ""
+        parts = []
+        if stable.outfit_key:
+            parts.append(f"当前服装key={stable.outfit_key}")
+        if stable.environment_key:
+            parts.append(f"当前环境key={stable.environment_key}")
+        outfit_keys = ", ".join(card.key for card in stable.outfits)
+        if outfit_keys:
+            parts.append(f"可switch的服装库[{outfit_keys}]")
+        environment_keys = ", ".join(card.key for card in stable.environments)
+        if environment_keys:
+            parts.append(f"可switch的环境库[{environment_keys}]")
+        if not parts:
+            return ""
+        return "。视觉连续性状态：" + "；".join(parts)
 
     def _is_action_guard_enabled(self) -> bool:
         """检查是否启用自动出图保护。"""

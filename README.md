@@ -9,7 +9,7 @@
 - `/nai vibe` / `/nai ref` 命名图库：把常用参考图存为命名条目，跨重启保留；vibe = §20.3 风格/氛围迁移，ref = §20.4 角色参考（仅 V4.5）
 - `/nai 反推` 图片反推 prompt（PNG 元数据 → WD14 在线 Space 兜底）
 - `/nai models` 拉取网关实时可用模型清单
-- Planner Action 主动出图、reply 后置自动跟图
+- Planner Action 根据聊天情景主动出图
 - 自拍模式（24 关键词、5 类型）、Tag 检索增强、NSFW 过滤、自动撤回、管理员模式
 
 Vibe / 角色参考的命名图库在群聊按 `group_id` 共享、私聊按 `user_id` 隔离，并使用文件系统
@@ -135,7 +135,7 @@ default_model = "nai-diffusion-4-5-full"
 ```
 [plugin] / [model]                                       # 启用 + NewAPI 网关
 [prompt_generator] / [prompt_generator.custom_model]     # 提示词生成 LLM
-[action_guard] / [auto_draw_on_reply]                    # 出图触发保护 + reply 跟图
+[action_guard]                                           # Planner 出图触发保护
 [random_scene] / [tag_retriever]                         # 随机场景 / Tag 检索
 [retag]                                                  # 图片反推（PNG 元数据 + WD14 兜底）
 [i2i] / [vibe] / [character_reference]                   # 图生图各模式可调参数（§20.1/§20.3/§20.4）
@@ -156,7 +156,7 @@ default_model = "nai-diffusion-4-5-full"
 | `quality_toggle` / `auto_smea` / `variety_boost` | 透传到 inner.qualityToggle / autoSmea / variety_boost |
 | `artist_presets` | 画师风格预设（多套，可自定义命名） |
 | `custom_prompt_add` / `negative_prompt_add` | 固定追加的正/负向词 |
-| `selfie_prompt_add` / `selfie_negative_prompt_add` | 自拍模式追加的 Bot 形象 / 负向词 |
+| `selfie_prompt_add` / `selfie_negative_prompt_add` | Bot 出镜时追加的固定外貌、身材正向词 / 外貌负向词；历史键名不代表必须自拍 |
 | `nai_extra_params` | 透传任意额外字段（如 `cfg_rescale` / `noise_schedule`） |
 
 ### 关键配置块
@@ -169,13 +169,6 @@ explicit_request_min_interval_seconds = 5     # 用户明确要求 → 短间隔
 proactive_min_interval_seconds = 10           # bot 主动出图 → 略长
 weak_negative_ttl_seconds = 60
 proactive_self_image_boost = true             # 主动出图不含自拍/肖像词时自动补"肖像照 近景"
-
-# reply 后置自动跟图：bot 写出"我刚换了新发型"时自动配图
-[auto_draw_on_reply]
-enabled = true
-score_threshold = 0.6
-min_interval_seconds = 15
-self_image_boost = true
 
 # 自动撤回
 [auto_recall]
@@ -375,7 +368,7 @@ nai_draw_plugin/
 │   ├── clients/           # NewAPI 网关 + Danbooru online 客户端
 │   ├── commands/          # 命令实现（部分逻辑已合并进 plugin.py）
 │   ├── mixins/            # 自动撤回 / 模型配置等可复用 Mixin
-│   ├── rules/             # prompt_rules / selfie_rules / reply_auto_draw
+│   ├── rules/             # prompt_rules / selfie_rules
 │   ├── services/          # session_state / prompt_memory / tag_retriever 等
 │   └── utils/             # 输出解析、后处理、tag_data_builder 等
 └── tests/
@@ -390,6 +383,18 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v1.11.0 (2026-07-30)
+- **Bot 情景图视觉连续性（服装/场景固定与切换）整体落地**：Tag LLM 输出 v4 分区 JSON（dynamic 动态区 + stable 稳定区），服装与环境稳定 Tag 由程序逐字复用与合成，杜绝 LLM 每轮重译导致的服装/场景漂移；replace 建立的每套服装/环境进入卡片库（各 12 张，LRU 保护当前在用的卡），可随时 switch 逐字切回
+- **连续性状态跨重启持久化**：新增 `data/visual_continuity.json`（`VisualContinuityStore`），当前装扮与卡片库落盘；新增 `prompt_generator.visual_state_ttl`（默认 0 = 不过期）单独控制当前服装/环境的沿用期，过期只失效当前装扮、卡片库永续可切回，与 `inherit_ttl`（legacy 继承/自拍上下文）解耦
+- **Planner 稳定区协议改为"枚举 + 描述"双字段**：`outfit_change` / `environment_change` 只填 `unchanged|clear|switch|replace`，新内容写 `outfit_new_look` / `environment_new_look`；解析器整句匹配"保持不变/没换/无变化"等口语归 keep，无法归类的自由文本降级为 auto 交 Tag LLM 判定——修复旧版"非枚举文本一律当 replace"把没换装误判成换装的服装漂移主因
+- **switch 的 key 解析权下放给 Tag LLM**：Planner 只给口语目标（如 `switch` + "之前那套白裙"）即可，由看得到卡片库的 Tag LLM 选定 key，程序校验必须命中库；库中无匹配（重启丢库/过期）时自动降级 replace 重建，不再整单失败。画图 action 回执现在携带"视觉连续性状态"（当前服装/环境 key + 可 switch 的库清单），Planner 下轮可直接引用真实 key
+- **校验与修复循环统一为单一事实源**：删除与 resolve 双标准维护的 `visual_detail_repair_needed` 族，resolve 失败返回结构化原因码（不是 JSON / 缺 rating / switch 未命中 / 首图未建立服装区等），带中文修复指引重试最多 2 次；JSON 截断、缺 rating 等旧版"零重试直接放弃"的失败模式现在都能自愈
+- **Bot 出镜强制建立服装稳定区**：首图 keep+空不再被放行（显式 clear 除外），杜绝"服装写进 dynamic 不入缓存、第二张必然重掷"的漏洞；replace 撞已有 key 时按 switch 处理并复用卡片原 Tag，维持"同一 key 永远同一串 Tag"不变量
+- **状态提交时序统一**：`last_nai_context`（legacy 继承）与视觉连续性状态一律在图片发送成功后提交；连续性轮次不再写 legacy 继承槽，指定角色（`画指定角色`）与 Bot 情景两条继承链互不污染
+- **控制信道与数据信道分离**：`unchanged` / `switch:key` 等控制 token 不再拼进 request 文本，Danbooru 检索 query 与图片 caption 不受枚举噪声污染
+- 修复 `BackgroundTaskSupervisor.shutdown()` 在任务同步完成时的事件循环空转死锁（gather 对已终态任务不让出循环，done_callback 的 discard 永远排不上队）
+- dynamic 与稳定区去重改为归一化比对（下划线/权重壳同义写法不再漏网）；`inherit_ttl` / `temperature` 配置描述同步实际语义（连续性路径固定 0.2）
 
 ### v1.10.0 (2026-05-30)
 - **`/nai nsfw` 状态持久化**：把每个 (platform, chat_id) 的开关落盘到 `data/nsfw_state.json`，重启插件后会话级开关自动恢复；优先级 store > 进程内内存 > `nsfw_filter.enabled` 配置默认。`/nai st`/`clear_session_state` 仍会同步清掉持久化条目，语义没变。
@@ -430,12 +435,11 @@ Rabbit
 - `config_hidden_fields` 机制：默认配置生成 / 注释回填时跳过 `wd14_spaces`（用户改不动也不易写对），代码内置默认 3 个 Space，高级用户仍可手动覆盖
 
 ### v1.6.0 (2026-05-23)
-- Action `nai_web_draw` 的 `description` 单字段拆为 5 个结构化字段：`subject_and_pov` / `action` / `emotion` / `scene_delta` / `framing`，强制 Planner 分维度思考，避免一锅炖关键词堆砌
+- Action `nai_web_draw` 的 `description` 单字段拆为 6 个结构化字段：`subject_and_pov` / `action` / `emotion` / `scene_delta` / `dynamic_scene` / `framing`，强制 Planner 分维度思考，避免一锅炖关键词堆砌
 - Action 链路下游 LLM 现在能拿到 Planner reasoning（新增 `<<REASONING_CONTEXT>>` 占位符），description 失真时可从 reasoning 救回画面意图，避免动词被软化、情绪被默认套模板
 - 新增 `variety_boost` 配置项（V3/V4/V4.5 三段都有），开启后透传到 inner.variety_boost，构图/姿势更随机
-- reply 后置自动跟图链路新增 `<<REPLY_CONTEXT>>` 透传 bot 回复原文，让图与文匹配
 - Action Guard 现在主路径同步预检，Planner 第一时间拿到拦截原因；评估结果缓存供后台 handle_action 复用，避免重复读消息库
-- 节流间隔大幅调低（explicit 5s / proactive 10s / auto_draw 15s），改为只防同秒重复触发，不再做长冷却
+- 节流间隔大幅调低（explicit 5s / proactive 10s），改为只防同秒重复触发，不再做长冷却
 
 ### v1.5.0 (2026-03-23)
 - Danbooru Tag 检索增强：embedding 模型从 5481 条中文 tag 对照表语义检索候选标签

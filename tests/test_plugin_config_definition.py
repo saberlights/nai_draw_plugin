@@ -18,6 +18,14 @@ def test_config_definition_exposes_defaults_and_webui_from_one_schema() -> None:
     assert webui["sections"]["retag"]["fields"]["wd14_spaces"]["hidden"] is True
 
 
+def test_removed_reply_auto_draw_is_not_exposed_in_config() -> None:
+    defaults = PLUGIN_CONFIG.default_config()
+    webui = PLUGIN_CONFIG.webui_schema(plugin_id="nai_draw_plugin")
+
+    assert "auto_draw_on_reply" not in defaults
+    assert "auto_draw_on_reply" not in webui["sections"]
+
+
 def test_webui_makes_v45_prompt_fields_discoverable_in_first_tab() -> None:
     webui = PLUGIN_CONFIG.webui_schema(plugin_id="nai_draw_plugin")
 
@@ -105,7 +113,6 @@ def test_webui_tabs_cover_all_sections_once_with_human_readable_titles() -> None
     assert set(tab_sections) == set(webui["sections"])
 
     expected_titles = {
-        "auto_draw_on_reply": "回复后自动跟图",
         "prompt_show": "提示词显示",
         "nsfw_filter": "NSFW 过滤",
         "auto_recall": "自动撤回",
@@ -272,7 +279,6 @@ def test_webui_numeric_controls_expose_steps_and_documented_ranges() -> None:
     assert numeric_fields_without_step == []
 
     expected_ranges = {
-        ("auto_draw_on_reply", "score_threshold"): (0.0, 1.0, 0.05),
         ("tag_retriever", "popularity_weight"): (0.0, 1.0, 0.01),
         ("tag_retriever", "min_score"): (0.0, 1.0, 0.01),
         ("retag", "wd14_threshold"): (0.0, 1.0, 0.01),

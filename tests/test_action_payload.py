@@ -7,24 +7,15 @@
 
 from __future__ import annotations
 
-import os
-import sys
-import importlib.util
-
-
-PLUGIN_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-MOD_PATH = os.path.join(PLUGIN_DIR, "core", "utils", "action_payload.py")
-
-_spec = importlib.util.spec_from_file_location("action_payload", MOD_PATH)
-if _spec is None or _spec.loader is None:
-    raise RuntimeError(f"无法加载模块: {MOD_PATH}")
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)  # type: ignore[union-attr]
-
-compose_description_from_action_payload = _mod.compose_description_from_action_payload
-STRUCTURED_DESCRIPTION_FIELDS = _mod.STRUCTURED_DESCRIPTION_FIELDS
-is_named_character_intent = _mod.is_named_character_intent
-NAMED_CHARACTER_TOKEN = _mod.NAMED_CHARACTER_TOKEN
+from plugins.nai_draw_plugin.core.utils.action_payload import (
+    BOT_ABSENT_TOKEN,
+    NAMED_CHARACTER_TOKEN,
+    STRUCTURED_DESCRIPTION_FIELDS,
+    compose_description_from_action_payload,
+    is_bot_absent_intent,
+    is_named_character_intent,
+    render_action_payload_for_prompt,
+)
 
 
 def test_keeps_description_when_structured_fields_also_present():
@@ -38,6 +29,7 @@ def test_keeps_description_when_structured_fields_also_present():
         "action": "站立",
         "emotion": "俏皮 微笑",
         "scene_delta": "",
+        "dynamic_scene": "舞台灯光",
         "framing": "特写",
         "description": "一女, 初音未来, 公式服, 葱色双马尾, 精致的面容, 灵动的眼神, 背景为舞台, 特写",
     }
@@ -50,6 +42,7 @@ def test_keeps_description_when_structured_fields_also_present():
     assert "站立" in out
     assert "俏皮 微笑" in out
     assert "特写" in out
+    assert "舞台灯光" in out
     # 关键：角色锚点不能丢
     assert "初音未来" in out
 
@@ -90,10 +83,11 @@ def test_structured_field_order_preserved():
         "subject_and_pov": "A",
         "emotion": "C",
         "scene_delta": "D",
+        "dynamic_scene": "E",
     }
     out = compose_description_from_action_payload(action_data)
-    # 顺序：subject_and_pov action emotion scene_delta framing
-    assert out == "A B C D F"
+    # 顺序：subject_and_pov action emotion scene_delta dynamic_scene framing
+    assert out == "A B C D E F"
 
 
 def test_strips_whitespace_in_each_field():
@@ -125,8 +119,63 @@ def test_structured_description_fields_constant_unchanged():
         "action",
         "emotion",
         "scene_delta",
+        "dynamic_scene",
         "framing",
     )
+
+
+def test_render_action_payload_for_prompt_preserves_field_boundaries():
+    """Tag LLM 必须看见 Planner 字段名，不能再收到无边界关键词串。"""
+
+    assert callable(render_action_payload_for_prompt)
+    rendered = render_action_payload_for_prompt({
+        "subject_and_pov": "一女 第三视角",
+        "action": "坐着，揉腰",
+        "emotion": "羞恼，脸红",
+        "scene_delta": "淡青色丝绸旗袍；片场固定灯架和黑色遮光布",
+        "dynamic_scene": "烟雾，聚光灯",
+        "framing": "中景",
+        "description": "",
+    })
+
+    assert rendered.startswith("<planner_visual_request>")
+    assert '"action": "坐着，揉腰"' in rendered
+    assert '"scene_delta": "淡青色丝绸旗袍；片场固定灯架和黑色遮光布"' in rendered
+    assert '"dynamic_scene": "烟雾，聚光灯"' in rendered
+    assert rendered.endswith("</planner_visual_request>")
+
+
+def test_render_action_payload_omits_duplicate_flat_description():
+    """结构化字段已经完整时，不再用同义扁平串稀释字段边界。"""
+
+    action_data = {
+        "subject_and_pov": "一女 第三视角",
+        "action": "坐着，揉腰",
+        "emotion": "疲惫",
+        "scene_delta": "淡青色丝绸旗袍；片场固定灯架",
+        "dynamic_scene": "烟雾",
+        "framing": "中景",
+    }
+    flat = compose_description_from_action_payload(action_data)
+
+    rendered = render_action_payload_for_prompt(
+        action_data,
+        effective_description=flat,
+    )
+
+    assert '"effective_description"' not in rendered
+    assert '"scene_delta": "淡青色丝绸旗袍；片场固定灯架"' in rendered
+
+
+def test_render_action_payload_includes_planner_stable_change_decisions():
+    rendered = render_action_payload_for_prompt({
+        "subject_and_pov": "一女 第三视角",
+        "outfit_change": "replace: 淡青色丝绸旗袍，肉色丝袜，复古黑色皮鞋",
+        "environment_change": "unchanged",
+    })
+
+    assert '"outfit_change": "replace: 淡青色丝绸旗袍，肉色丝袜，复古黑色皮鞋"' in rendered
+    assert '"environment_change": "unchanged"' in rendered
 
 
 # ============ is_named_character_intent ============
@@ -185,3 +234,15 @@ def test_named_character_intent_non_string_subject_safe():
     """Planner 偶发 None/数字时不抛，按未声明处理。"""
     assert is_named_character_intent({"subject_and_pov": None}) is False
     assert is_named_character_intent({"subject_and_pov": 0}) is False
+
+
+def test_bot_absent_intent_only_matches_explicit_subject_token():
+    assert is_bot_absent_intent({
+        "subject_and_pov": f"{BOT_ABSENT_TOKEN} 纯环境",
+        "description": "空荡的书房",
+    }) is True
+    assert is_bot_absent_intent({
+        "subject_and_pov": "纯环境",
+        "description": f"文字里偶然提到{BOT_ABSENT_TOKEN}",
+    }) is False
+    assert is_bot_absent_intent({"subject_and_pov": None}) is False

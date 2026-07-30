@@ -20,6 +20,8 @@ from src.common.logger import get_logger
 from .nsfw_state_store import nsfw_state_store
 from .session_preferences import SessionPreferences
 from .transient_generation_state import TransientGenerationState
+from .visual_continuity import StableVisualTags
+from .visual_continuity_store import visual_continuity_store
 
 logger = get_logger("nai_draw_plugin")
 
@@ -481,8 +483,9 @@ class SessionStateManager:
         logger.info(f"[nai_pic] 会话 {key} 状态已清除")
 
     def clear_transient_generation_state(self, chat_stream_id: str) -> None:
-        """清除一个聊天流的生成上下文、冷却与 pending 状态。"""
+        """清除一个聊天流的生成上下文、冷却、pending 与视觉连续性状态。"""
         self._transient.clear_session(chat_stream_id)
+        visual_continuity_store.clear(chat_stream_id)
 
     # ==================== 上一轮提示词（Action 专用） ====================
 
@@ -512,6 +515,27 @@ class SessionStateManager:
         自动附带当前时间戳。
         """
         self._transient.set_last_nai_context(chat_stream_id, prompt, request, ttl)
+
+    # ==================== Bot 情景图视觉连续性 ====================
+
+    def get_visual_continuity(
+        self,
+        chat_stream_id: str,
+        ttl: float = 0,
+    ) -> Optional[StableVisualTags]:
+        """获取服装与环境的稳定 NovelAI Tag（持久化存储，跨重启保留）。
+
+        ``ttl`` 只约束当前服装/环境；卡片库不过期，始终可供 switch 回切。
+        """
+        return visual_continuity_store.get(chat_stream_id, ttl)
+
+    def set_visual_continuity(
+        self,
+        chat_stream_id: str,
+        stable: StableVisualTags,
+    ) -> None:
+        """保存已经生成过、后续需要逐字复用的稳定 NovelAI Tag 并落盘。"""
+        visual_continuity_store.set(chat_stream_id, stable)
 
     # ==================== 上一轮自拍场景（Action 自拍专用） ====================
 
@@ -549,14 +573,6 @@ class SessionStateManager:
     def set_last_action_image_sent_at(self, chat_stream_id: str, sent_at: Optional[float] = None) -> None:
         """记录指定聊天流最近一次自动出图成功发送时间。"""
         self._transient.set_last_action_image_sent_at(chat_stream_id, sent_at)
-
-    def get_last_auto_draw_sent_at(self, chat_stream_id: str) -> Optional[float]:
-        """获取指定聊天流最近一次 reply-hook 自动跟图发送时间。"""
-        return self._transient.get_last_auto_draw_sent_at(chat_stream_id)
-
-    def set_last_auto_draw_sent_at(self, chat_stream_id: str, sent_at: Optional[float] = None) -> None:
-        """记录指定聊天流最近一次 reply-hook 自动跟图发送时间。"""
-        self._transient.set_last_auto_draw_sent_at(chat_stream_id, sent_at)
 
     # ==================== 图片生成中状态 ====================
 

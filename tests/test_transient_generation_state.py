@@ -5,7 +5,7 @@ import sys
 MAIBOT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(MAIBOT_ROOT))
 
-from plugins.nai_draw_plugin.core.services.transient_generation_state import (
+from plugins.nai_draw_plugin.core.services.transient_generation_state import (  # noqa: E402
     TransientGenerationState,
 )
 

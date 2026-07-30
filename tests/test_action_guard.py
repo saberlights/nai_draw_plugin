@@ -87,11 +87,14 @@ mixins_package = types.ModuleType("plugins.nai_draw_plugin.core.mixins")
 mixins_package.__path__ = [os.path.join(MAIBOT_ROOT, "plugins", "nai_draw_plugin", "core", "mixins")]
 sys.modules.setdefault("plugins.nai_draw_plugin.core.mixins", mixins_package)
 
-from plugins.nai_draw_plugin import sdk_runtime as sdk_runtime_module
-from plugins.nai_draw_plugin.core.services.generation_admission_policy import (
+from plugins.nai_draw_plugin import sdk_runtime as sdk_runtime_module  # noqa: E402
+from plugins.nai_draw_plugin.core.services.generation_admission_policy import (  # noqa: E402
     reasoning_implies_explicit_request,
 )
-from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation
+from plugins.nai_draw_plugin.core.services.visual_continuity import (  # noqa: E402
+    StableVisualTags,
+)
+from plugins.nai_draw_plugin.sdk_runtime import NaiInvocation  # noqa: E402
 
 
 def _build_invocation(*, stream_id: str = "test-stream") -> NaiInvocation:
@@ -99,6 +102,7 @@ def _build_invocation(*, stream_id: str = "test-stream") -> NaiInvocation:
     invocation.stream_id = stream_id
     invocation.user_id = "user-1"
     invocation.log_prefix = "test"
+    invocation._pending_visual_continuity = None
     return invocation
 
 
@@ -190,44 +194,66 @@ def test_inject_self_image_hint_empty_description() -> None:
     assert "近景" not in out
 
 
-def test_auto_draw_uses_raw_portrait_intent_when_llm_has_no_portrait_tag(
+def test_action_third_person_bot_scene_still_injects_configured_appearance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     invocation = _build_invocation()
+    invocation.action_data = {
+        "subject_and_pov": "一女 第三视角",
+        "action": "坐在窗边读书",
+        "emotion": "放松",
+        "scene_delta": "",
+        "framing": "中景",
+    }
+    invocation.reasoning = ""
     processed_prompts: list[str] = []
+    prompt_kwargs: list[dict[str, object]] = []
 
     async def allowed() -> bool:
         return True
 
-    async def approved_trigger():
-        return types.SimpleNamespace(should_generate=True)
+    async def approved_trigger(**_kwargs):
+        return types.SimpleNamespace(
+            should_generate=True,
+            category="explicit",
+            detail="允许",
+            signal_source="test",
+            signal_text="test",
+        )
 
-    async def generated_prompt(*_args, **_kwargs):
-        return "rating:general, solo, 1girl, standing", None
+    async def generated_prompt(*_args, **kwargs):
+        prompt_kwargs.append(kwargs)
+        return "rating:general, solo, 1girl, reading, medium shot", None
+
+    def process_selfie(description: str, *_args, **_kwargs) -> str:
+        processed_prompts.append(description)
+        return f"{description}, configured bot appearance"
 
     async def generated_image(**_kwargs):
         return True, "image-data"
 
     async def sent_image(*_args, **_kwargs):
-        return True, "sent", True
-
-    def process_selfie(description: str, *_args, **_kwargs) -> str:
-        processed_prompts.append(description)
-        return f"{description}, bot appearance"
+        return True, "sent"
 
     invocation.ensure_user_not_blacklisted = allowed
     invocation.ensure_generation_permission = allowed
-    invocation._assess_auto_draw_trigger = approved_trigger
+    invocation._assess_action_trigger = approved_trigger
+    invocation._is_action_guard_enabled = lambda: True
     invocation._generate_prompt_with_llm = generated_prompt
     invocation._process_selfie_prompt = process_selfie
     invocation._sanitize_prompt_for_sfw_mode = lambda text: text
     invocation._sanitize_structured_for_sfw_mode = lambda payload: payload
     invocation._select_send_payload = lambda prompt, payload: (prompt, None)
-    invocation._get_model_config = lambda **_kwargs: {"base_url": "https://example.invalid"}
+    invocation._is_prompt_show_enabled = lambda: False
+    invocation._get_model_config = lambda **_kwargs: {
+        "base_url": "https://example.invalid",
+        "nai_size": "竖图",
+    }
     invocation._send_image_result = sent_image
     invocation.get_config = lambda key, default=None: {
-        "auto_draw_on_reply.self_image_boost": False,
         "prompt_generator.enforce_tag_order": False,
+        "prompt_generator.inherit_ttl": 3_600,
+        "components.enable_debug_info": False,
     }.get(key, default)
     invocation.api_client = types.SimpleNamespace(generate_image=generated_image)
     monkeypatch.setattr(
@@ -236,9 +262,176 @@ def test_auto_draw_uses_raw_portrait_intent_when_llm_has_no_portrait_tag(
         lambda *_args, **_kwargs: None,
     )
 
-    ok, detail = asyncio.run(
-        invocation.handle_auto_draw_from_reply("肖像照，窗边", reply_context_text="")
-    )
+    ok, detail = asyncio.run(invocation.handle_action())
 
     assert (ok, detail) == (True, "sent")
-    assert processed_prompts == ["rating:general, solo, 1girl, standing"]
+    assert processed_prompts == [
+        "rating:general, solo, 1girl, reading, medium shot"
+    ]
+    assert prompt_kwargs[0]["use_visual_continuity"] is True
+
+
+def test_action_stops_when_prompt_generation_fails_instead_of_sending_selfie_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tag LLM 被拒绝后不得把中文清空成仅含 selfie_prompt_add 的请求。"""
+
+    invocation = _build_invocation()
+    invocation.action_data = {
+        "subject_and_pov": "一女 第三视角",
+        "action": "侧坐在折叠椅上，一只手撑着后腰",
+        "emotion": "倦怠",
+        "scene_delta": "淡青色丝绸旗袍，肉色丝袜，复古黑色皮鞋；凌乱片场",
+        "framing": "中景",
+    }
+    invocation.reasoning = ""
+    api_called = False
+    sent_texts: list[str] = []
+
+    async def allowed() -> bool:
+        return True
+
+    async def approved_trigger(**_kwargs):
+        return types.SimpleNamespace(
+            should_generate=True,
+            category="explicit",
+            detail="允许",
+            signal_source="test",
+            signal_text="test",
+        )
+
+    async def failed_prompt(*_args, **_kwargs):
+        return None
+
+    async def generated_image(**_kwargs):
+        nonlocal api_called
+        api_called = True
+        return True, "image-data"
+
+    async def sent_image(*_args, **_kwargs):
+        return True, "sent"
+
+    async def sent_text(text: str, storage_message: bool = True) -> bool:
+        sent_texts.append(text)
+        return True
+
+    invocation.ensure_user_not_blacklisted = allowed
+    invocation.ensure_generation_permission = allowed
+    invocation._assess_action_trigger = approved_trigger
+    invocation._is_action_guard_enabled = lambda: True
+    invocation._generate_prompt_with_llm = failed_prompt
+    invocation._process_selfie_prompt = lambda *_args, **_kwargs: "configured bot appearance"
+    invocation._sanitize_prompt_for_sfw_mode = lambda text: text
+    invocation._sanitize_structured_for_sfw_mode = lambda payload: payload
+    invocation._select_send_payload = lambda prompt, payload: (prompt, None)
+    invocation._is_prompt_show_enabled = lambda: False
+    invocation._get_model_config = lambda **_kwargs: {
+        "base_url": "https://example.invalid",
+        "nai_size": "竖图",
+    }
+    invocation.get_config = lambda key, default=None: {
+        "prompt_generator.enforce_tag_order": False,
+        "components.enable_debug_info": False,
+    }.get(key, default)
+    invocation.api_client = types.SimpleNamespace(generate_image=generated_image)
+    invocation._send_image_result = sent_image
+    invocation.send_text = sent_text
+    monkeypatch.setattr(
+        sdk_runtime_module.session_state,
+        "set_last_selfie_context",
+        lambda *_args, **_kwargs: None,
+    )
+
+    ok, detail = asyncio.run(invocation.handle_action())
+
+    assert ok is False
+    assert "提示词生成" in detail
+    assert api_called is False
+    assert sent_texts == ["提示词生成器开小差了，请直接告诉我想画什么，或者稍后再试一次~"]
+
+
+@pytest.mark.parametrize(
+    ("send_success", "expected_commit_count"),
+    ((True, 1), (False, 0)),
+)
+def test_action_commits_visual_continuity_only_after_image_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    send_success: bool,
+    expected_commit_count: int,
+) -> None:
+    invocation = _build_invocation()
+    invocation.action_data = {
+        "subject_and_pov": "一女 第三视角",
+        "action": "站在片场中央",
+        "emotion": "平静",
+        "scene_delta": "淡青色丝绸旗袍；片场固定灯架和黑色遮光布",
+        "framing": "全身",
+    }
+    invocation.reasoning = ""
+    candidate = StableVisualTags(
+        outfit=("pale cyan silk qipao", "high side slit", "black leather shoes"),
+        environment=("film set", "light stand", "black blackout cloth"),
+        outfit_key="pale_cyan_qipao_set",
+        environment_key="film_set",
+    )
+    committed: list[StableVisualTags] = []
+
+    async def allowed() -> bool:
+        return True
+
+    async def approved_trigger(**_kwargs):
+        return types.SimpleNamespace(
+            should_generate=True,
+            category="explicit",
+            detail="允许",
+            signal_source="test",
+            signal_text="test",
+        )
+
+    async def generated_prompt(*_args, **kwargs):
+        assert kwargs["stable_change_text"] == invocation.action_data["scene_delta"]
+        invocation._pending_visual_continuity = candidate
+        return "rating:general, solo, 1girl, pale cyan silk qipao, film set", None
+
+    async def generated_image(**_kwargs):
+        return True, "image-data"
+
+    async def sent_image(*_args, **_kwargs):
+        return send_success, "sent" if send_success else "send failed"
+
+    invocation.ensure_user_not_blacklisted = allowed
+    invocation.ensure_generation_permission = allowed
+    invocation._assess_action_trigger = approved_trigger
+    invocation._is_action_guard_enabled = lambda: True
+    invocation._generate_prompt_with_llm = generated_prompt
+    invocation._process_selfie_prompt = lambda text, *_args, **_kwargs: text
+    invocation._sanitize_prompt_for_sfw_mode = lambda text: text
+    invocation._sanitize_structured_for_sfw_mode = lambda payload: payload
+    invocation._select_send_payload = lambda prompt, payload: (prompt, None)
+    invocation._is_prompt_show_enabled = lambda: False
+    invocation._get_model_config = lambda **_kwargs: {
+        "base_url": "https://example.invalid",
+        "nai_size": "竖图",
+    }
+    invocation.get_config = lambda key, default=None: {
+        "prompt_generator.enforce_tag_order": False,
+        "prompt_generator.inherit_ttl": 3_600,
+        "components.enable_debug_info": False,
+    }.get(key, default)
+    invocation.api_client = types.SimpleNamespace(generate_image=generated_image)
+    invocation._send_image_result = sent_image
+    monkeypatch.setattr(
+        sdk_runtime_module.session_state,
+        "set_visual_continuity",
+        lambda _stream_id, stable: committed.append(stable),
+    )
+    monkeypatch.setattr(
+        sdk_runtime_module.session_state,
+        "set_last_selfie_context",
+        lambda *_args, **_kwargs: None,
+    )
+
+    ok, _detail = asyncio.run(invocation.handle_action())
+
+    assert ok is send_success
+    assert committed == [candidate] * expected_commit_count

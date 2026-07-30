@@ -1,6 +1,6 @@
-"""命令 / 自动跟图发出的图跳过 VLM 识图的回写逻辑测试。
+"""命令发出的图跳过 VLM 识图的回写逻辑测试。
 
-覆盖 `_send_base64_image_result` 按 `source` 分流（命令/跟图回写、action 保留识图），
+覆盖 `_send_base64_image_result` 按 `source` 分流（命令回写、action 保留识图），
 以及 `_register_self_image_as_processed` 的哈希对齐、`vlm_processed=True` 置位与兜底描述。
 """
 
@@ -128,9 +128,8 @@ def _install_fake_image_manager(record, update_results: list):
 
 # --------- _skip_self_vlm：按 source 分流 ---------
 
-def test_skip_self_vlm_true_for_command_and_reply_auto_draw() -> None:
+def test_skip_self_vlm_true_for_command() -> None:
     assert _build_invocation("command")._skip_self_vlm() is True
-    assert _build_invocation("reply_auto_draw")._skip_self_vlm() is True
 
 
 def test_skip_self_vlm_false_for_action() -> None:
@@ -223,7 +222,7 @@ def test_writeback_handles_data_uri_prefix() -> None:
 
 
 def test_writeback_falls_back_to_placeholder_when_description_blank() -> None:
-    invocation = _build_invocation("reply_auto_draw")
+    invocation = _build_invocation("command")
     raw = b"x"
     image_b64 = base64.b64encode(raw).decode("ascii")
     record = _FakeRecord(hashlib.sha256(raw).hexdigest())
