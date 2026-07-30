@@ -16,6 +16,7 @@ from .core.reply_command_text import normalize_reply_command_text
 from .core.services.background_task_supervisor import BackgroundTaskSupervisor
 from .core.services.blocking_io_runner import BlockingIORunner
 from .core.services.generation_admission_policy import GenerationAdmissionPolicy
+from .core.services.group_access_policy import GroupAccessPolicy, without_tool
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -95,6 +96,7 @@ class NaiPicPlugin(MaiBotPlugin):
             state=session_state,
             logger=logger,
         )
+        self._session_group_ids: dict[str, str] = {}
         # 反推链路：图片缓存与编排服务都在 __init__ 阶段就准备好，避免 HookHandler 在配置加载前触发时 NoneError
         self._image_cache_service: ImageCacheService = ImageCacheService()
         self._reverse_service: ReverseService = ReverseService(wd14_client=None)
@@ -320,8 +322,82 @@ class NaiPicPlugin(MaiBotPlugin):
         """监听所有入站消息，把带图的存到 ImageCacheService。"""
         del kwargs
         if isinstance(message, dict):
+            self._remember_message_scope(message)
             self._image_cache_service.cache_inbound_message(message)
         return {"action": "continue"}
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="nai_draw_plugin_filter_planner_tool",
+        description="在受限群聊中隐藏 NAI 生图工具",
+        order=HookOrder.EARLY,
+    )
+    async def handle_planner_before_request(
+        self,
+        session_id: str = "",
+        tool_definitions: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Remove this plugin's Action before a restricted group's planner request."""
+        definitions = tool_definitions if isinstance(tool_definitions, list) else []
+        filtered_definitions = without_tool(
+            definitions,
+            tool_name="nai_web_draw",
+        )
+        if len(filtered_definitions) == len(definitions):
+            return {"action": "continue"}
+
+        plugin_config = await self._load_plugin_config_data()
+        try:
+            allowed = await self._is_group_access_allowed(
+                plugin_config,
+                stream_id=session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
+            allowed = False
+        if allowed:
+            return {"action": "continue"}
+
+        updated_kwargs = dict(kwargs)
+        updated_kwargs["session_id"] = session_id
+        updated_kwargs["tool_definitions"] = filtered_definitions
+        return {"action": "continue", "modified_kwargs": updated_kwargs}
+
+    @HookHandler(
+        "maisaka.planner.after_response",
+        name="nai_draw_plugin_reject_planner_tool_call",
+        description="在受限群聊中丢弃 NAI 生图工具调用",
+        order=HookOrder.EARLY,
+    )
+    async def handle_planner_after_response(
+        self,
+        session_id: str = "",
+        tool_calls: list[dict[str, Any]] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Drop restricted calls before the planner can dispatch them."""
+        calls = tool_calls if isinstance(tool_calls, list) else []
+        filtered_calls = without_tool(calls, tool_name="nai_web_draw")
+        if len(filtered_calls) == len(calls):
+            return {"action": "continue"}
+
+        plugin_config = await self._load_plugin_config_data()
+        try:
+            allowed = await self._is_group_access_allowed(
+                plugin_config,
+                stream_id=session_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
+            allowed = False
+        if allowed:
+            return {"action": "continue"}
+
+        updated_kwargs = dict(kwargs)
+        updated_kwargs["session_id"] = session_id
+        updated_kwargs["tool_calls"] = filtered_calls
+        return {"action": "continue", "modified_kwargs": updated_kwargs}
 
     @HookHandler(
         "chat.receive.after_process",
@@ -350,20 +426,38 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @HookHandler(
         "chat.command.before_execute",
-        name="nai_draw_plugin_retag_command_message_cache",
-        description="在需要引用图的命令（反推 / i2i / vibe存 / ref存）执行前缓存当前命令消息（保留 reply 信息）",
+        name="nai_draw_plugin_command_access_gate",
+        description="统一拦截受限群聊中的 NAI 命令，并为引用图命令缓存原消息",
         order=HookOrder.EARLY,
     )
     async def handle_retag_command_before_execute(
         self,
         message: dict[str, Any] | None = None,
         command_name: str = "",
+        plugin_id: str = "",
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """仅在需要引用图的命令触发前生效，其它命令直接放行。
-
-        /nai vibe 与 /nai ref 已迁移到命名图库，不再走引用图，所以从这个集合里拿掉了。"""
+        """Block every NAI command in restricted groups and cache messages when needed."""
         del kwargs
+        if plugin_id != self.ctx.plugin_id:
+            return {"action": "continue"}
+
+        if isinstance(message, dict):
+            self._remember_message_scope(message)
+        plugin_config = await self._load_plugin_config_data()
+        stream_id = str((message or {}).get("session_id", "") or "").strip()
+        try:
+            allowed = await self._is_group_access_allowed(
+                plugin_config,
+                stream_id=stream_id,
+                group_id=self._message_group_id(message),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
+            allowed = False
+        if not allowed:
+            return {"action": "abort"}
+
         if command_name in {
             "nai_retag_command",
             "nai_i2i_command",
@@ -372,6 +466,84 @@ class NaiPicPlugin(MaiBotPlugin):
         } and isinstance(message, dict):
             self._image_cache_service.remember_command_message(message)
         return {"action": "continue"}
+
+    @staticmethod
+    def _message_group_id(message: dict[str, Any] | None) -> str | None:
+        """Return a group ID, an empty private-chat marker, or None if unresolved."""
+        if not isinstance(message, dict):
+            return None
+        message_info = message.get("message_info")
+        if not isinstance(message_info, dict):
+            return None
+        group_info = message_info.get("group_info")
+        if group_info is None:
+            return ""
+        if not isinstance(group_info, dict):
+            return None
+        group_id = str(group_info.get("group_id", "") or "").strip()
+        return group_id or None
+
+    def _remember_message_scope(self, message: dict[str, Any]) -> None:
+        stream_id = str(message.get("session_id", "") or "").strip()
+        group_id = self._message_group_id(message)
+        if not stream_id or group_id is None:
+            return
+        self._session_scope_cache()[stream_id] = group_id
+
+    def _session_scope_cache(self) -> dict[str, str]:
+        cache = getattr(self, "_session_group_ids", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._session_group_ids = cache
+        return cache
+
+    async def _resolve_session_group_id(self, stream_id: str) -> str | None:
+        normalized_stream_id = str(stream_id or "").strip()
+        if not normalized_stream_id:
+            return None
+
+        cache = self._session_scope_cache()
+        if normalized_stream_id in cache:
+            return cache[normalized_stream_id]
+
+        streams = await self.ctx.chat.get_all_streams(platform="all_platforms")
+        if not isinstance(streams, list):
+            return None
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            candidate_stream_id = str(
+                stream.get("stream_id") or stream.get("session_id") or ""
+            ).strip()
+            if not candidate_stream_id:
+                continue
+            is_group = bool(stream.get("is_group_session")) or str(
+                stream.get("chat_type", "") or ""
+            ).strip().lower() == "group"
+            candidate_group_id = (
+                str(stream.get("group_id", "") or "").strip() if is_group else ""
+            )
+            if not is_group or candidate_group_id:
+                cache[candidate_stream_id] = candidate_group_id
+        return cache.get(normalized_stream_id)
+
+    async def _is_group_access_allowed(
+        self,
+        plugin_config: dict[str, Any],
+        *,
+        stream_id: str,
+        group_id: str | None = None,
+    ) -> bool:
+        policy = GroupAccessPolicy.from_config(plugin_config)
+        if not policy.has_group_restrictions:
+            return True
+
+        resolved_group_id = group_id
+        if resolved_group_id is None:
+            resolved_group_id = await self._resolve_session_group_id(stream_id)
+        elif resolved_group_id and stream_id:
+            self._session_scope_cache()[str(stream_id).strip()] = resolved_group_id
+        return policy.allows_scope(resolved_group_id)
 
     def _start_image_generation_in_background(
         self,
@@ -1650,6 +1822,19 @@ class NaiPicPlugin(MaiBotPlugin):
                 source="action",
             )
             try:
+                try:
+                    group_allowed = await self._is_group_access_allowed(
+                        invocation.plugin_config,
+                        stream_id=stream_id,
+                        group_id=group_id or None,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
+                    group_allowed = False
+                if not group_allowed:
+                    self._close_invocation(invocation)
+                    return False, "当前会话不可使用此工具"
+
                 if not await invocation.ensure_user_not_blacklisted():
                     self._close_invocation(invocation)
                     return False, "黑名单用户"

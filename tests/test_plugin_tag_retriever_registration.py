@@ -253,11 +253,17 @@ class _BlockingSend(_DummySend):
 
 
 class _DummyInvocation:
-    def __init__(self, *, generation_allowed: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        generation_allowed: bool = True,
+        plugin_config: dict[str, object] | None = None,
+    ) -> None:
         self.draw_calls: list[str] = []
         self.nai0_calls: list[str] = []
         self.close_calls = 0
         self.generation_allowed = generation_allowed
+        self.plugin_config = plugin_config or {}
 
     async def ensure_generation_permission(self) -> bool:
         return self.generation_allowed
@@ -883,3 +889,231 @@ def test_unload_cancels_retag_before_closing_wd14_runner(
     asyncio.run(scenario())
 
     assert events == ["retag-finalize", "wd14-close"]
+
+
+def test_restricted_group_is_removed_from_planner_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._session_group_ids = {"blocked-stream": "10001"}
+
+    async def load_config() -> dict[str, object]:
+        return {
+            "group_access": {
+                "mode": "blacklist",
+                "whitelist": [],
+                "blacklist": ["10001"],
+            }
+        }
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
+    definitions = [
+        {"type": "function", "function": {"name": "nai_web_draw"}},
+        {"type": "function", "function": {"name": "query_memory"}},
+    ]
+
+    result = asyncio.run(
+        plugin.handle_planner_before_request(
+            session_id="blocked-stream",
+            tool_definitions=definitions,
+            messages=[{"role": "user", "content": "画图"}],
+            selected_history_count=1,
+        )
+    )
+
+    assert result["action"] == "continue"
+    assert result["modified_kwargs"]["tool_definitions"] == [definitions[1]]
+    assert result["modified_kwargs"]["messages"] == [
+        {"role": "user", "content": "画图"}
+    ]
+    assert result["modified_kwargs"]["selected_history_count"] == 1
+
+
+def test_restricted_group_tool_call_is_removed_before_planner_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._session_group_ids = {"blocked-stream": "10001"}
+
+    async def load_config() -> dict[str, object]:
+        return {
+            "group_access": {
+                "mode": "blacklist",
+                "whitelist": [],
+                "blacklist": ["10001"],
+            }
+        }
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
+    calls = [
+        {
+            "id": "call-nai",
+            "function": {"name": "nai_web_draw", "arguments": {}},
+        },
+        {
+            "id": "call-reply",
+            "function": {"name": "reply", "arguments": {"content": "稍等"}},
+        },
+    ]
+
+    result = asyncio.run(
+        plugin.handle_planner_after_response(
+            session_id="blocked-stream",
+            tool_calls=calls,
+            response="",
+            prompt_tokens=10,
+        )
+    )
+
+    assert result["modified_kwargs"]["tool_calls"] == [calls[1]]
+    assert result["modified_kwargs"]["response"] == ""
+    assert result["modified_kwargs"]["prompt_tokens"] == 10
+
+
+def test_group_scope_can_be_resolved_from_all_platform_chat_streams() -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._session_group_ids = {}
+
+    class _Chat:
+        def __init__(self) -> None:
+            self.platforms: list[str] = []
+
+        async def get_all_streams(self, platform: str = "qq") -> list[dict[str, object]]:
+            self.platforms.append(platform)
+            return [
+                {
+                    "stream_id": "telegram-group-stream",
+                    "platform": "telegram",
+                    "is_group_session": True,
+                    "group_id": "tg-10001",
+                },
+                {
+                    "stream_id": "private-stream",
+                    "platform": "qq",
+                    "is_group_session": False,
+                    "group_id": "",
+                },
+            ]
+
+    chat = _Chat()
+    plugin.ctx = types.SimpleNamespace(chat=chat)
+    config = {
+        "group_access": {
+            "mode": "whitelist",
+            "whitelist": ["tg-10001"],
+            "blacklist": [],
+        }
+    }
+
+    async def scenario() -> tuple[bool, bool]:
+        group_allowed = await plugin._is_group_access_allowed(
+            config,
+            stream_id="telegram-group-stream",
+        )
+        private_allowed = await plugin._is_group_access_allowed(
+            config,
+            stream_id="private-stream",
+        )
+        return group_allowed, private_allowed
+
+    assert asyncio.run(scenario()) == (True, True)
+    assert chat.platforms == ["all_platforms"]
+
+
+def test_restricted_group_aborts_every_plugin_command_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(plugin_id="saberlights.nai-draw-plugin")
+    plugin._session_group_ids = {}
+    remembered: list[dict[str, object]] = []
+    plugin._image_cache_service = types.SimpleNamespace(
+        remember_command_message=remembered.append,
+    )
+
+    async def load_config() -> dict[str, object]:
+        return {
+            "group_access": {
+                "mode": "blacklist",
+                "whitelist": [],
+                "blacklist": ["10001"],
+            }
+        }
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
+    message = {
+        "session_id": "blocked-command-stream",
+        "message_info": {"group_info": {"group_id": "10001"}},
+    }
+
+    result = asyncio.run(
+        plugin.handle_retag_command_before_execute(
+            message=message,
+            command_name="nai_retag_command",
+            plugin_id="saberlights.nai-draw-plugin",
+        )
+    )
+
+    assert result == {"action": "abort"}
+    assert remembered == []
+
+
+def test_command_access_gate_ignores_commands_owned_by_other_plugins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(plugin_id="saberlights.nai-draw-plugin")
+
+    async def unexpected_config_load() -> dict[str, object]:
+        pytest.fail("foreign plugin commands must not load this plugin's access policy")
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", unexpected_config_load)
+
+    result = asyncio.run(
+        plugin.handle_retag_command_before_execute(
+            message={
+                "session_id": "blocked-command-stream",
+                "message_info": {"group_info": {"group_id": "10001"}},
+            },
+            command_name="other_plugin_command",
+            plugin_id="example.other-plugin",
+        )
+    )
+
+    assert result == {"action": "continue"}
+
+
+def test_action_guard_rejects_direct_invocation_in_restricted_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    plugin._session_group_ids = {}
+    invocation = _DummyInvocation(
+        plugin_config={
+            "group_access": {
+                "mode": "blacklist",
+                "whitelist": [],
+                "blacklist": ["10001"],
+            }
+        }
+    )
+
+    async def fake_create_invocation(*_args: Any, **_kwargs: Any) -> _DummyInvocation:
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    result = asyncio.run(
+        plugin.handle_nai_web_draw(
+            stream_id="blocked-action-stream",
+            group_id="10001",
+        )
+    )
+
+    assert result == (False, "当前会话不可使用此工具")
+    assert invocation.close_calls == 1
+    assert list(plugin._active_invocations) == []

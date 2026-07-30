@@ -68,6 +68,11 @@ _WEBUI_SLIDER_0_1 = {
 }
 _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
     "plugin.config_version": {"disabled": True},
+    "group_access.mode": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": ["blacklist", "whitelist"],
+    },
     "model.nai_proxy_mode": {
         "input_type": "select",
         "ui_type": "select",
@@ -529,6 +534,7 @@ class PluginConfigDefinition:
     # 保证配置文件读起来从'要先改的'到'通常不动的'。未列出的 section 走 schema 字典原顺序。
     config_section_order = [
         "plugin",
+        "group_access",
         "model",
         "prompt_generator",
         "action_guard",
@@ -554,6 +560,7 @@ class PluginConfigDefinition:
     # 其它 section 直接跟在后面，不再插入分隔符。
     config_section_group_headers = {
         "plugin": "========== 基础开关 ==========",
+        "group_access": "========== 群聊访问控制 ==========",
         "model": "========== NewAPI 兼容网关连接与默认模型 ==========",
         "prompt_generator": "========== 提示词生成（/nai） ==========",
         "action_guard": "========== 自动出图触发保护 ==========",
@@ -590,6 +597,7 @@ class PluginConfigDefinition:
     # TOML 分组标题面向源码阅读；WebUI 使用独立标题与标签页，避免把装饰性标题
     # 直接当成导航文案，并保证当前默认的 V4.5 配置进入首屏。
     config_webui_section_titles = {
+        "group_access": "群聊访问控制",
         "prompt_show": "提示词显示",
         "nsfw_filter": "NSFW 过滤",
         "auto_recall": "自动撤回",
@@ -636,6 +644,7 @@ class PluginConfigDefinition:
             "title": "自动化与权限",
             "sections": [
                 "plugin",
+                "group_access",
                 "action_guard",
                 "components",
                 "prompt_show",
@@ -711,6 +720,32 @@ class PluginConfigDefinition:
                 default=False,
                 description="是否启用插件；可填 true / false"
             )
+        },
+        "group_access": {
+            "mode": ConfigField(
+                type=str,
+                default="blacklist",
+                description=(
+                    "群聊访问模式；blacklist=除黑名单外均可用，"
+                    "whitelist=仅白名单群可用；私聊不受限制"
+                ),
+            ),
+            "whitelist": ConfigField(
+                type=list,
+                default=[],
+                description=(
+                    "群聊白名单；填群号字符串数组，仅在 mode=whitelist 时生效；"
+                    "空数组表示所有群均不可用"
+                ),
+            ),
+            "blacklist": ConfigField(
+                type=list,
+                default=[],
+                description=(
+                    "群聊黑名单；填群号字符串数组，仅在 mode=blacklist 时生效；"
+                    "空数组表示所有群均可用"
+                ),
+            ),
         },
         "model": {
             "name": ConfigField(
