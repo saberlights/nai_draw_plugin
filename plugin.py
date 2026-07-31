@@ -1875,7 +1875,9 @@ class NaiPicPlugin(MaiBotPlugin):
                 )
             return True, (
                 "图片任务已提交后台，图片由插件异步发送到会话，本次 tool_result 不包含 image 内容；"
-                "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可"
+                "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可；"
+                "本轮或后续调用回复工具时，建议在 reference_info 里用一句话简述刚画的图"
+                "（谁、穿着、在哪、做什么），让回复自然衔接图片内容"
                 + invocation.render_visual_state_for_planner()
             )
 

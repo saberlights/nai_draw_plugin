@@ -1,7 +1,6 @@
-"""插件发出的图片跳过 VLM 识图并回写已知描述的逻辑测试。
+"""命令发出的图跳过 VLM 识图的回写逻辑测试。
 
-覆盖 `_send_base64_image_result` 对命令与 action 两条路径的统一回写、
-`_compose_action_image_caption` 的描述合成，
+覆盖 `_send_base64_image_result` 按 `source` 分流（命令回写、action 保留识图），
 以及 `_register_self_image_as_processed` 的哈希对齐、`vlm_processed=True` 置位与兜底描述。
 """
 
@@ -127,7 +126,17 @@ def _install_fake_image_manager(record, update_results: list):
     return captured
 
 
-# --------- _send_base64_image_result：命令与 action 统一回写已知描述 ---------
+# --------- _skip_self_vlm：按 source 分流 ---------
+
+def test_skip_self_vlm_true_for_command() -> None:
+    assert _build_invocation("command")._skip_self_vlm() is True
+
+
+def test_skip_self_vlm_false_for_action() -> None:
+    assert _build_invocation("action")._skip_self_vlm() is False
+
+
+# --------- _send_base64_image_result：命令回写、action 保留识图 ---------
 
 def test_command_image_triggers_recognition_skip_writeback() -> None:
     invocation = _build_invocation("command")
@@ -153,9 +162,7 @@ def test_command_image_triggers_recognition_skip_writeback() -> None:
     assert register_calls == [("Zm9v", "1girl, cat")]
 
 
-def test_action_image_also_writes_back_known_description() -> None:
-    """action 图不再留给 VLM 异步识图：立即回写已知描述，replyer 下一轮即可读到。"""
-
+def test_action_image_keeps_vlm_and_skips_writeback() -> None:
     invocation = _build_invocation("action")
     register_calls: list = []
 
@@ -173,29 +180,8 @@ def test_action_image_also_writes_back_known_description() -> None:
     )
 
     assert ok is True
-    assert register_calls == [("Zm9v", "1girl, cat")]
-
-
-def test_action_caption_includes_outfit_and_environment_digest() -> None:
-    from plugins.nai_draw_plugin.core.services.visual_continuity import StableVisualTags
-
-    invocation = _build_invocation("action")
-    invocation._pending_visual_continuity = StableVisualTags(
-        outfit=("white camisole", "lace trim", "denim shorts"),
-        environment=("bedroom", "soft bed", "warm lamp"),
-        outfit_key="white_cami_set",
-        environment_key="bedroom_night",
-    )
-
-    caption = invocation._compose_action_image_caption("一女 躺在床上 慵懒 近景")
-
-    assert "一女 躺在床上 慵懒 近景" in caption
-    assert "画面服装：white camisole" in caption
-    assert "画面场景：bedroom" in caption
-
-    # 无连续性状态时退化为原始描述
-    invocation._pending_visual_continuity = None
-    assert invocation._compose_action_image_caption("纯环境 夜景") == "纯环境 夜景"
+    # action 路径必须保留识图：绝不触发跳过识图回写，也不向 replyer 侧写入额外文本
+    assert register_calls == []
 
 
 # --------- _register_self_image_as_processed：哈希对齐、置位、兜底、缺记录 ---------
