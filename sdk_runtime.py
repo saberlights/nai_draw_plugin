@@ -726,19 +726,12 @@ class NaiInvocation(ModelConfigMixin):
             image_base64,
             display_message=display_message,
         )
-        # 命令发出的图：发送（已 await 入库）后立刻在图片库标记“已识别”，
-        # 让 MaiBot 后续不再对这张图触发 VLM 识图；action（麦麦主动画图）不在此列。
-        if self._skip_self_vlm():
-            await self._register_self_image_as_processed(image_base64, image_description)
+        # 发送（已 await 入库）后立刻在图片库写入已知描述并标记"已识别"：
+        # 命令路径描述来自用户点单；action 路径描述由生成参数合成（场景+服装+环境摘要）。
+        # 这让 replyer 下一轮读历史时立刻"知道"这张图画了什么——此前 action 图留给
+        # VLM 异步识图，存在延迟且描述失真，reply 模型经常拿不到刚出图的内容。
+        await self._register_self_image_as_processed(image_base64, image_description)
         return sent
-
-    def _skip_self_vlm(self) -> bool:
-        """是否跳过 MaiBot 对“本插件这次发出的图”的 VLM 识图。
-
-        仅 ``action``（LLM 工具调用 handle_action）保留识图，让麦麦能“看见”自己在对话里
-        主动画的图；命令（/nai 等）是用户点单的产物，描述已知、无需再过 VLM。
-        """
-        return self.source != "action"
 
     async def _register_self_image_as_processed(self, image_base64: str, description: str) -> None:
         """把本插件刚发出的图片在 MaiBot 图片库标记为“已识别”，从源头省掉 VLM 识图。
@@ -2036,7 +2029,10 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text(f"哎呀，生成图片时遇到问题：{result}")
             return False, str(result)
 
-        send_result = await self._send_image_result(result, raw_description or description)
+        send_result = await self._send_image_result(
+            result,
+            self._compose_action_image_caption(raw_description or description),
+        )
         if send_result[0]:
             inherit_ttl = float(self.get_config("prompt_generator.inherit_ttl", 0) or 0)
             # 状态一律在出图并发送成功后才提交：连续性状态与 legacy 继承上下文
@@ -2064,6 +2060,22 @@ class NaiInvocation(ModelConfigMixin):
             await self.send_text("图片生成完成！")
         return send_result[0], send_result[1] or ""
 
+    def _compose_action_image_caption(self, base_description: str) -> str:
+        """为 action 图片合成中文描述，写入展示文案与图片库供 replyer 读取。
+
+        场景语义来自 Planner 的中文描述，服装/环境补充来自本轮解析出的稳定 Tag——
+        这是"刚生成的图里到底穿了什么、在哪"最准确的一手来源。
+        """
+        parts = [" ".join(str(base_description or "").split())]
+        stable = self._pending_visual_continuity
+        if stable is not None:
+            if stable.outfit:
+                parts.append("画面服装：" + ", ".join(stable.outfit[:6]))
+            if stable.environment:
+                parts.append("画面场景：" + ", ".join(stable.environment[:6]))
+        caption = "；".join(part for part in parts if part)
+        return caption[:300]
+
     def render_visual_state_for_planner(self) -> str:
         """把当前连续性 key 库渲染进 action 回执，给 Planner 提供 switch 词汇表。
 
@@ -2076,9 +2088,19 @@ class NaiInvocation(ModelConfigMixin):
             return ""
         parts = []
         if stable.outfit_key:
-            parts.append(f"当前服装key={stable.outfit_key}")
+            outfit_digest = ", ".join(stable.outfit[:4])
+            parts.append(
+                f"当前服装key={stable.outfit_key}（{outfit_digest}）"
+                if outfit_digest
+                else f"当前服装key={stable.outfit_key}"
+            )
         if stable.environment_key:
-            parts.append(f"当前环境key={stable.environment_key}")
+            environment_digest = ", ".join(stable.environment[:4])
+            parts.append(
+                f"当前环境key={stable.environment_key}（{environment_digest}）"
+                if environment_digest
+                else f"当前环境key={stable.environment_key}"
+            )
         outfit_keys = ", ".join(card.key for card in stable.outfits)
         if outfit_keys:
             parts.append(f"可switch的服装库[{outfit_keys}]")
@@ -2087,7 +2109,11 @@ class NaiInvocation(ModelConfigMixin):
             parts.append(f"可switch的环境库[{environment_keys}]")
         if not parts:
             return ""
-        return "。视觉连续性状态：" + "；".join(parts)
+        return (
+            "。视觉连续性状态：" + "；".join(parts)
+            + "。若聊天已进入睡觉/洗澡/回家/出门等自然换装节点而当前服装不合情景"
+            "（如深夜床上仍是白天外出装），下次出图必须用 outfit_change=replace 换成合适衣着"
+        )
 
     def _is_action_guard_enabled(self) -> bool:
         """检查是否启用自动出图保护。"""

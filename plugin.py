@@ -1734,22 +1734,27 @@ class NaiPicPlugin(MaiBotPlugin):
                 "若使用本字段，只写稳定设计，不写动作、表情、姿态、镜头或临时散落物。"
             ),
             "outfit_change": (
-                "【Planner 先判定服装变化，只填枚举】unchanged=服装没变（默认）；clear=本轮不可见；"
+                "【Planner 先判定服装变化，只填枚举】unchanged=服装确实没变；clear=本轮不可见；"
                 "switch=换回之前穿过的某套（可写 switch:<服装库 key>，key 见上一次画图回执的"
                 "'视觉连续性状态'；不记得 key 就只写 switch，把口语描述放进 outfit_new_look）；"
-                "replace=聊天中明确建立了新服装。"
-                "unchanged 时下游逐字复用上一轮服装 Tag，不重新翻译；"
-                "不要因为动作或构图变化而 replace；拿不准就写 unchanged。"
+                "replace=应当换新衣服。"
+                "判定标准看情景不看措辞：聊天进入睡觉/洗澡/回家/出门/运动等会自然换装的生活节点时，"
+                "即使没人明说换衣服也必须 replace 或 switch（深夜上床=睡衣，回家=家居服，出门=外出装）；"
+                "只有动作、构图、镜头变化而情景未变时才写 unchanged。"
+                "unchanged 时下游逐字复用上一轮服装 Tag，不重新翻译。"
             ),
             "outfit_new_look": (
-                "【仅 outfit_change=replace/switch 时填】replace：新服装的完整中文描述，"
-                "具体保留用户说出的款式、颜色、材质和可见细节；"
+                "【仅 outfit_change=replace/switch 时填】replace：新服装的完整中文描述；"
+                "用户指定了款式颜色材质就忠实保留，用户没指定就由你来设计——"
+                "给一套贴合情景与人设、有记忆点的具体穿搭（配色、材质、剪裁、小配饰都有着落），"
+                "睡衣/家居服也要有质感细节，避免每次都是千篇一律的基础款。"
                 "switch：想切回哪套的口语描述（如'之前那套白色连衣裙'）。其余情况留空。"
             ),
             "environment_change": (
                 "【Planner 先判定环境变化，只填枚举】unchanged=地点没变（默认）；clear=纯人物无背景；"
                 "switch=回到之前出现过的地点（可写 switch:<环境库 key>；不记得 key 就只写 switch，"
-                "把口语描述放进 environment_new_look）；replace=聊天中明确换了新地点。"
+                "把口语描述放进 environment_new_look）；replace=人物到了新场所。"
+                "'我到家了''去洗澡''躺床上了'这类表述都意味着场所已变，必须 replace 或 switch；"
                 "unchanged 时下游逐字复用上一轮环境 Tag；"
                 "动态灯光、天气、烟雾、倒影和临时散落物放 dynamic_scene，不算环境变化。"
             ),
@@ -1785,6 +1790,8 @@ class NaiPicPlugin(MaiBotPlugin):
             "*scene_delta 不得包含动作/表情/倒影/临时物件；framing 不得包含 POV/第三视角；嘟嘴必须在 emotion。*",
             "*必须由 Planner 先分别决定 outfit_change 和 environment_change（只填枚举，新内容写进 "
             "outfit_new_look / environment_new_look）；Tag LLM 不得猜测稳定区是否变化。*",
+            "*服装环境要跟着生活节点走：睡觉=睡衣、洗澡=浴巾浴袍、回家=家居服、出门=外出装；"
+            "节点已发生而画面服装还停在上一个情景是错误，必须用 outfit_change=replace/switch 更新。*",
             "可以触发的典型时机：",
             "1. 用户明确要求看图/画图/发图/自拍/肖像/再来一张",
             "2. 用户明确想看 bot 本人的样子、穿搭、状态、某个身体/服饰视觉重点",
