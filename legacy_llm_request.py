@@ -4,7 +4,12 @@ from typing import Any
 
 from src.common.data_models.llm_service_data_models import LLMGenerationOptions, LLMImageOptions
 from src.services.embedding_service import EmbeddingServiceClient
-from src.services.llm_service import LLMServiceClient, resolve_task_name, resolve_task_name_from_model_config
+from src.services.llm_service import LLMServiceClient, resolve_task_name
+
+try:
+    from src.services.llm_service import resolve_task_name_from_model_config
+except ImportError:
+    resolve_task_name_from_model_config = None  # type: ignore[assignment]
 
 
 class LegacyLLMRequest:
@@ -15,7 +20,7 @@ class LegacyLLMRequest:
         self.request_type = str(request_type or "")
 
     def _resolve_task_name(self, preferred_task_name: str = "") -> str:
-        if self.model_set is not None:
+        if self.model_set is not None and resolve_task_name_from_model_config is not None:
             try:
                 return resolve_task_name_from_model_config(
                     self.model_set,

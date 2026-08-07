@@ -49,9 +49,6 @@ class _FakeEmbeddingClient:
 fake_llm_service_module = types.ModuleType("src.services.llm_service")
 fake_llm_service_module.LLMServiceClient = _FakeLLMClient
 fake_llm_service_module.resolve_task_name = lambda preferred="": preferred or "default_task"
-fake_llm_service_module.resolve_task_name_from_model_config = (
-    lambda model_config, preferred_task_name="": preferred_task_name or "resolved_from_model"
-)
 sys.modules["src.services.llm_service"] = fake_llm_service_module
 
 fake_embedding_service_module = types.ModuleType("src.services.embedding_service")
@@ -79,7 +76,7 @@ from legacy_llm_request import LegacyLLMRequest
 
 
 class LegacyLLMRequestTest(unittest.TestCase):
-    def test_generate_response_async_should_use_model_resolver(self):
+    def test_generate_response_async_should_import_without_removed_model_resolver(self):
         import asyncio
 
         request = LegacyLLMRequest(model_set=object(), request_type="nai_draw_plugin.prompt_generator")
@@ -92,7 +89,7 @@ class LegacyLLMRequestTest(unittest.TestCase):
         )
 
         self.assertEqual(response, "text:hello")
-        self.assertEqual(result.task_name, "resolved_from_model")
+        self.assertEqual(result.task_name, "default_task")
         self.assertEqual(result.options.temperature, 0.7)
         self.assertEqual(result.options.max_tokens, 128)
 
