@@ -45,6 +45,78 @@ async def _ignore_text(_text: str, storage_message: bool = True) -> bool:
     return True
 
 
+def test_forced_sfw_workflow_uses_group_safe_template_even_when_session_filter_is_off(
+    monkeypatch,
+) -> None:
+    generator = _FakeTextGenerator("rating:general, solo, 1girl, long sleeves, city street")
+    monkeypatch.setattr(
+        session_state,
+        "is_nsfw_filter_enabled",
+        lambda *_args, **_kwargs: False,
+    )
+    workflow = PromptGenerationWorkflow(
+        config={
+            "prompt_generator": {"output_format": "text"},
+            "custom_prompt": {"system_prompt": "UNSAFE CUSTOM PROMPT"},
+        },
+        stream_id="forced-group-sfw",
+        text_generator=generator,
+        send_text=_ignore_text,
+        show_tag_candidates=False,
+        log_prefix="test",
+        force_sfw=True,
+    )
+
+    result = asyncio.run(
+        workflow.generate("日常街景", allow_inherit=False, use_visual_continuity=False)
+    )
+
+    assert result is not None
+    assert "<sfw_safety>" in generator.prompts[0]
+    assert "<nsfw_capability>" not in generator.prompts[0]
+    assert "UNSAFE CUSTOM PROMPT" not in generator.prompts[0]
+
+
+def test_visual_continuity_workflow_preserves_multi_character_payload() -> None:
+    response = (
+        '{"version":4,"format":"multi","intent":"normal",'
+        '"dynamic":{"subject":["rating:sensitive","1boy 1girl"],'
+        '"action":[],"emotion":[],"scene":["hotel room"],'
+        '"framing":["close-up"],"people":['
+        '{"role":"bot","subject":["girl"],'
+        '"action":["target#kissed"],"emotion":["blush"]},'
+        '{"role":"other","subject":["boy"],'
+        '"action":["source#kissing"],"emotion":[]}],"positions":[]},'
+        '"stable":{"outfit":{"mode":"replace","key":"white_blouse_set",'
+        '"tags":["white blouse","navy pleated skirt"]},'
+        '"environment":{"mode":"keep","key":"","tags":[]}}}'
+    )
+    workflow = PromptGenerationWorkflow(
+        config={"prompt_generator": {"output_format": "json"}, "tag_retriever": {}},
+        stream_id="multi-continuity-workflow",
+        text_generator=_FakeTextGenerator(response),
+        send_text=_ignore_text,
+        show_tag_candidates=False,
+        log_prefix="test",
+    )
+
+    result = asyncio.run(workflow.generate(
+        "一男一女接吻",
+        allow_inherit=False,
+        use_visual_continuity=True,
+    ))
+
+    assert result is not None
+    assert result.structured is not None
+    assert result.structured["bot_character_index"] == 0
+    assert [item["prompt"].split(",", 1)[0] for item in result.structured["characters"]] == [
+        "girl",
+        "boy",
+    ]
+    assert "white blouse" in result.structured["characters"][0]["prompt"]
+    assert "white blouse" not in result.structured["characters"][1]["prompt"]
+
+
 def test_workflow_reuses_cached_stable_tags_and_only_accepts_new_dynamic_tags() -> None:
     stream_id = "visual-continuity-workflow-test"
     previous = StableVisualTags(

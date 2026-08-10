@@ -87,6 +87,10 @@ def test_planner_tool_filter_supports_openai_and_flattened_definitions() -> None
     definitions = [
         {"type": "function", "function": {"name": "nai_web_draw"}},
         {"name": "nai_web_draw"},
+        {
+            "item_type": "FunctionCallItem",
+            "tool_call": {"func_name": "nai_web_draw", "args": {}},
+        },
         {"type": "function", "function": {"name": "query_memory"}},
         "invalid-but-preserved",
     ]

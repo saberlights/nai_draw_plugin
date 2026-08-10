@@ -20,6 +20,7 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from ..data_paths import plugin_data_path
 from ..utils.image_meta import normalize_image_base64
 
 
@@ -206,8 +207,8 @@ _INSTANCE_LOCK = threading.Lock()
 
 
 def _default_db_path() -> Path:
-    """落到本插件目录下的 ``data/vibe_cache.db``，避免污染宿主数据库。"""
-    return Path(__file__).resolve().parents[2] / "data" / _DEFAULT_DB_FILENAME
+    """落到统一持久化目录下的 ``vibe_cache.db``，避免污染宿主数据库。"""
+    return plugin_data_path(_DEFAULT_DB_FILENAME)
 
 
 def get_vibe_cache_service(db_path: Optional[Path] = None) -> VibeCacheService:

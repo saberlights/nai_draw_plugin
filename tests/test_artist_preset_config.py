@@ -235,6 +235,24 @@ class ArtistPresetConfigTest(unittest.TestCase):
 
         self.assertEqual(model_config["negative_prompt_add"], "model-default-negative")
 
+    def test_group_planner_forces_nsfw_negative_filter_even_when_session_filter_is_off(self):
+        host = _DummyModelConfigHost({
+            "model": {
+                "base_url": "https://example.com",
+                "default_model": "nai-diffusion-4-5-full",
+                "negative_prompt_add": "model-default-negative",
+            },
+            "model_nai4_5": {},
+            "nsfw_filter": {
+                "filter_tags": "{{{{{nsfw}}}}}",
+            },
+        })
+        host._force_group_planner_sfw = True
+
+        model_config = host._get_model_config(is_selfie=False)
+
+        self.assertTrue(model_config["negative_prompt_add"].startswith("{{{{{nsfw}}}}}"))
+
     def test_model_config_uses_selfie_negative_prompt_alone_when_base_negative_empty(self):
         host = _DummyModelConfigHost({
             "model": {

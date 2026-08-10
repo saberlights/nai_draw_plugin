@@ -34,6 +34,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional
 
+from ..data_paths import plugin_data_path
+
 
 __all__ = [
     "NamedReference",
@@ -727,7 +729,7 @@ _INSTANCE_LOCK = threading.Lock()
 
 
 def _default_root() -> Path:
-    return Path(__file__).resolve().parents[2] / "data" / "named_refs"
+    return plugin_data_path("named_refs")
 
 
 def get_named_reference_store(

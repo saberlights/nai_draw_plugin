@@ -16,15 +16,14 @@ import numpy as np
 from src.common.logger import get_logger
 from src.config.config import model_config
 
+from ..data_paths import plugin_data_path
 from ...legacy_llm_request import LegacyLLMRequest
 
 logger = get_logger("nai_draw_plugin")
 
-_plugin_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# 默认路径
-_DEFAULT_TAG_JSON = os.path.join(_plugin_root, "data", "danbooru_tags.json")
-_DEFAULT_EMBEDDING_CACHE = os.path.join(_plugin_root, "data", "tag_embeddings.npy")
+# 默认路径（统一持久化目录；embedding tag 快照沿用 .npy 同名 _tags.json 派生规则）
+_DEFAULT_TAG_JSON = str(plugin_data_path("danbooru_tags.json"))
+_DEFAULT_EMBEDDING_CACHE = str(plugin_data_path("tag_embeddings.npy"))
 
 
 class TagRetriever:

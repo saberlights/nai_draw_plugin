@@ -61,6 +61,7 @@ class GenerationAdmissionPolicy:
         user_text: str = "",
         user_text_age_seconds: float | None = None,
         reasoning: str = "",
+        bypass_throttle: bool = False,
     ) -> AdmissionDecision:
         """根据用户原话、Planner reasoning 与冷却状态评估 Action。"""
         normalized_user_text = str(user_text or "").strip()
@@ -84,11 +85,14 @@ class GenerationAdmissionPolicy:
             explicit_request = reasoning_implies_explicit_request(reasoning_text)
 
         category = "explicit" if explicit_request else "proactive"
-        allowed, detail = self._check_interval(
-            stream_id=stream_id,
-            config=config,
-            category=category,
-        )
+        if bypass_throttle:
+            allowed, detail = True, "管理员豁免图片频率节流"
+        else:
+            allowed, detail = self._check_interval(
+                stream_id=stream_id,
+                config=config,
+                category=category,
+            )
         return AdmissionDecision(
             should_generate=allowed,
             category=category,

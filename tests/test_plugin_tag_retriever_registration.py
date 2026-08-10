@@ -221,6 +221,25 @@ def test_reply_auto_draw_hook_is_not_exposed() -> None:
     assert not hasattr(NaiPicPlugin, "handle_replyer_after_response_for_auto_draw")
 
 
+def test_planner_identity_rule_excludes_chat_names_from_visual_fields() -> None:
+    rule = plugin_module._CHAT_PARTICIPANT_IDENTITY_RULE
+
+    assert "最高优先级" in rule
+    assert "先执行会话身份匿名化" in rule
+    assert "私聊和群聊" in rule
+    assert "当前用户、消息发送者、群成员" in rule
+    assert "姓名、昵称、群名片、账号显示名" in rule
+    assert "任何 action_data 字段" in rule
+    assert "男性→男生/男人" in rule
+    assert "女性→女生/女人" in rule
+    assert "性别未知→对方/另一人" in rule
+    assert "Bot 的人设姓名→女生" in rule
+    assert "Bot 的人设姓名→Bot" not in rule
+    assert "错误：'<聊天昵称>坐在<Bot名字>身边'" in rule
+    assert "正确：'男生坐在女生身边'" in rule
+    assert "即使明确要求画聊天对象本人" in rule
+
+
 class _DummySend:
     def __init__(self) -> None:
         self.text_calls: list[tuple[str, str, bool]] = []
@@ -635,6 +654,8 @@ def test_action_background_failure_reports_once_and_releases_invocation() -> Non
     result = asyncio.run(scenario())
 
     assert result[0] is True
+    assert "reply_reference" in result[1]
+    assert "reference_info" not in result[1]
     assert plugin.ctx.send.text_calls == [
         ("图片生成任务意外中断，请稍后重试。", stream_id, False)
     ]
@@ -891,7 +912,7 @@ def test_unload_cancels_retag_before_closing_wd14_runner(
     assert events == ["retag-finalize", "wd14-close"]
 
 
-def test_restricted_group_is_removed_from_planner_tools(
+def test_group_planner_keeps_draw_tool_and_receives_group_only_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
@@ -903,12 +924,16 @@ def test_restricted_group_is_removed_from_planner_tools(
                 "mode": "blacklist",
                 "whitelist": [],
                 "blacklist": ["10001"],
-            }
+            },
+            "admin": {"admin_users": ["90001"]},
         }
 
     monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
     definitions = [
-        {"type": "function", "function": {"name": "nai_web_draw"}},
+        {
+            "type": "function",
+            "function": {"name": "nai_web_draw", "description": "生成图片。"},
+        },
         {"type": "function", "function": {"name": "query_memory"}},
     ]
 
@@ -922,52 +947,74 @@ def test_restricted_group_is_removed_from_planner_tools(
     )
 
     assert result["action"] == "continue"
-    assert result["modified_kwargs"]["tool_definitions"] == [definitions[1]]
+    updated_definitions = result["modified_kwargs"]["tool_definitions"]
+    assert [item["function"]["name"] for item in updated_definitions] == [
+        "nai_web_draw",
+        "query_memory",
+    ]
+    draw_description = updated_definitions[0]["function"]["description"]
+    assert draw_description.startswith("生成图片。")
+    assert "看腿、发照片、画图" in draw_description
+    assert "不能构成调用理由" in draw_description
+    assert "完全由 Bot 自己决定" in draw_description
+    assert "插件管理员用户 ID：90001" in draw_description
+    assert "严格控制出图频率" in draw_description
+    assert "管理员不受此条聊天频率限制" in draw_description
+    assert "rating:general" in draw_description
+    assert "擦边、色情或性暗示" in draw_description
+    assert "安全规则对管理员同样生效" in draw_description
+    assert definitions[0]["function"]["description"] == "生成图片。"
     assert result["modified_kwargs"]["messages"] == [
         {"role": "user", "content": "画图"}
     ]
     assert result["modified_kwargs"]["selected_history_count"] == 1
 
 
-def test_restricted_group_tool_call_is_removed_before_planner_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_planner_draw_switch_off_hides_only_nai_draw_for_current_session() -> None:
     plugin = object.__new__(NaiPicPlugin)
-    plugin._session_group_ids = {"blocked-stream": "10001"}
-
-    async def load_config() -> dict[str, object]:
-        return {
-            "group_access": {
-                "mode": "blacklist",
-                "whitelist": [],
-                "blacklist": ["10001"],
-            }
-        }
-
-    monkeypatch.setattr(plugin, "_load_plugin_config_data", load_config)
-    calls = [
-        {
-            "id": "call-nai",
-            "function": {"name": "nai_web_draw", "arguments": {}},
-        },
-        {
-            "id": "call-reply",
-            "function": {"name": "reply", "arguments": {"content": "稍等"}},
-        },
+    plugin._planner_draw_enabled_by_session = {"planner-off-stream": False}
+    definitions = [
+        {"type": "function", "function": {"name": "nai_web_draw"}},
+        {"type": "function", "function": {"name": "reply"}},
     ]
 
     result = asyncio.run(
-        plugin.handle_planner_after_response(
-            session_id="blocked-stream",
-            tool_calls=calls,
-            response="",
-            prompt_tokens=10,
+        plugin.handle_planner_before_request(
+            session_id="planner-off-stream",
+            tool_definitions=definitions,
+            items=[],
         )
     )
 
-    assert result["modified_kwargs"]["tool_calls"] == [calls[1]]
-    assert result["modified_kwargs"]["response"] == ""
-    assert result["modified_kwargs"]["prompt_tokens"] == 10
+    assert [
+        item["function"]["name"]
+        for item in result["modified_kwargs"]["tool_definitions"]
+    ] == ["reply"]
+
+
+def test_private_planner_does_not_receive_group_draw_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._session_group_ids = {"private-stream": ""}
+
+    async def unexpected_config_load() -> dict[str, object]:
+        pytest.fail("private planner must not load group-only prompt config")
+
+    monkeypatch.setattr(plugin, "_load_plugin_config_data", unexpected_config_load)
+    result = asyncio.run(
+        plugin.handle_planner_before_request(
+            session_id="private-stream",
+            tool_definitions=[
+                {
+                    "type": "function",
+                    "function": {"name": "nai_web_draw", "description": "生成图片。"},
+                }
+            ],
+        )
+    )
+
+    assert result == {"action": "continue"}
 
 
 def test_group_scope_can_be_resolved_from_all_platform_chat_streams() -> None:
@@ -1020,7 +1067,7 @@ def test_group_scope_can_be_resolved_from_all_platform_chat_streams() -> None:
     assert chat.platforms == ["all_platforms"]
 
 
-def test_restricted_group_aborts_every_plugin_command_before_execution(
+def test_restricted_group_aborts_regular_commands_but_allows_planner_control(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
@@ -1046,15 +1093,23 @@ def test_restricted_group_aborts_every_plugin_command_before_execution(
         "message_info": {"group_info": {"group_id": "10001"}},
     }
 
-    result = asyncio.run(
+    regular_result = asyncio.run(
         plugin.handle_retag_command_before_execute(
             message=message,
             command_name="nai_retag_command",
             plugin_id="saberlights.nai-draw-plugin",
         )
     )
+    planner_control_result = asyncio.run(
+        plugin.handle_retag_command_before_execute(
+            message=message,
+            command_name="nai_planner_draw_control_command",
+            plugin_id="saberlights.nai-draw-plugin",
+        )
+    )
 
-    assert result == {"action": "abort"}
+    assert regular_result == {"action": "abort"}
+    assert planner_control_result == {"action": "continue"}
     assert remembered == []
 
 
@@ -1083,7 +1138,7 @@ def test_command_access_gate_ignores_commands_owned_by_other_plugins(
     assert result == {"action": "continue"}
 
 
-def test_action_guard_rejects_direct_invocation_in_restricted_group(
+def test_action_guard_allows_direct_invocation_in_restricted_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plugin = object.__new__(NaiPicPlugin)
@@ -1107,13 +1162,42 @@ def test_action_guard_rejects_direct_invocation_in_restricted_group(
 
     monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
 
-    result = asyncio.run(
-        plugin.handle_nai_web_draw(
+    async def handle_action() -> tuple[bool, str]:
+        return True, "sent"
+
+    invocation.handle_action = handle_action
+
+    async def scenario() -> tuple[bool, str]:
+        result = await plugin.handle_nai_web_draw(
             stream_id="blocked-action-stream",
             group_id="10001",
         )
-    )
+        await asyncio.sleep(0)
+        await plugin._background_tasks.shutdown()
+        return result
 
-    assert result == (False, "当前会话不可使用此工具")
+    result = asyncio.run(scenario())
+
+    assert result[0] is True
+    assert "图片任务已提交后台" in result[1]
     assert invocation.close_calls == 1
     assert list(plugin._active_invocations) == []
+
+
+def test_planner_draw_switch_off_rejects_direct_action_before_creating_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._planner_draw_enabled_by_session = {"planner-off-action": False}
+
+    async def unexpected_create(*_args: Any, **_kwargs: Any) -> _DummyInvocation:
+        pytest.fail("disabled Planner Action must not create an invocation")
+
+    monkeypatch.setattr(plugin, "_create_invocation", unexpected_create)
+
+    result = asyncio.run(
+        plugin.handle_nai_web_draw(stream_id="planner-off-action", group_id="10001")
+    )
+
+    assert result == (False, "当前会话已关闭 Planner 自动生图")

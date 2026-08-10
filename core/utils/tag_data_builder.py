@@ -11,6 +11,8 @@ import json
 import os
 import sys
 
+from ..data_paths import plugin_data_path
+
 
 def build_tag_data(
     xlsx_path: str = None,
@@ -37,7 +39,7 @@ def build_tag_data(
         )
 
     if output_path is None:
-        output_path = os.path.join(plugin_root, "data", "danbooru_tags.json")
+        output_path = str(plugin_data_path("danbooru_tags.json"))
 
     if not os.path.exists(xlsx_path):
         print(f"找不到 xlsx 文件: {xlsx_path}")

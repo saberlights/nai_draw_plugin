@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from src.common.logger import get_logger
 
+from ..data_paths import plugin_data_path
 from .visual_continuity import StableVisualTags, VisualTagCard
 
 logger = get_logger("nai_draw_plugin")
@@ -24,7 +25,7 @@ logger = get_logger("nai_draw_plugin")
 class VisualContinuityStore:
     """按聊天流持久化视觉连续性状态，跨重启保留。"""
 
-    _DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "visual_continuity.json"
+    _DEFAULT_PATH = plugin_data_path("visual_continuity.json")
 
     def __init__(
         self,

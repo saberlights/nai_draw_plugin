@@ -63,8 +63,9 @@ _HARD_RULES = """
 - 单人女性 → `rating:*` 后必须 `solo, 1girl`
 - 单人男性 → `rating:*` 后必须 `solo, 1boy`
 - 多人 → 用 `2girls`/`3girls`/`1boy 1girl` 等，**不加** `solo`
-- 男女互动且焦点在女性 → 可用 `solo focus`
-- 男女在场但无互动、焦点在女性 → 忽略男性，按单人女性处理
+- 当前情景明确出现另一人物，且该人物在画面中可见或正在与主体发生动作关系时，必须按实际人数输出（例如 `1boy 1girl`）；
+  只有被提及但不入镜的路人、背景人物或纯叙事对象才可以省略，不能为了套模板凭空增加人物
+- 男女互动且焦点在女性 → 仍保留 `1boy 1girl`，用人物段和相对位置表现焦点，不得把实际互动对象压成单人
 - 第一人称视角：通用 `pov`，女性视角 `female pov`
 - 纯风景/物品场景 → 不加人数 tag
 
@@ -94,6 +95,12 @@ Rating → 人数（1girl/2girls/solo）→ **镜头框图（framing，三档互
 - 用户明确要求全身/全身穿搭/腿/袜子/鞋时，`full body` 必须是唯一 framing，并在人数后立即出现；禁止用 `portrait` / `close-up` / `upper body` / `cowboy shot` 稀释它
 - 光影标签必须放最后，禁止散落到中间
 - 一个动作只用一个最准确的词，禁止堆叠近义词
+
+### 当前状态与动作关系
+
+- 用户请求或 Planner 的 `action` 里如果写了女生当前状态（这里的女生指 Bot 出镜角色，例如“女生被男生从身后抱住”“女生被按在沙发上”），必须把这个状态保留到对应人物段，不能只输出施动者的主动动作。
+- “谁实施、谁接收”优先按语义拆分：实施方写 `source#` + 现在分词，接收方写 `target#` + 过去分词；不要把“被……”改写成模糊的 `hugging` / `touching`，也不要把单向动作写成 `mutual#`。
+- `action` 使用自然语言描述关系时，先根据人物身份、相对位置和被动语态判断对应人物，再翻译成互动 Tag；没有明确第二人时不得自行补出另一角色。
 
 ### 5. 视角减法
 
@@ -214,6 +221,9 @@ char2:[人物2 tag],
 - 人物段内 tag 顺序：身份词 → 相对位置 → 头部（发型/表情）→ 身体细节 → 服装 → 姿势/动作 → 互动 tag
 
 ### 互动 tag（多人核心机制）
+Planner 的 `action` 可能使用自然中文来说明女生状态和关系（例如“男生从身后抱住女生，女生被抱住并回头看他”）。
+不要把这类描述压缩成“亲密互动”：先确认画面里实际有几个人，再把实施方和接收方分别落到对应人物段；
+女生是被动方时，女生的人物段必须保留 `target#` 状态，另一人的人物段写 `source#` 动作。
 当多人发生物理互动，使用前缀区分主被动：
 - `source#动作`：动作发出者（现在分词形式，如 `source#hugging`、`source#kissing`）
 - `target#动作`：动作接受者（过去分词形式，如 `target#hugged`、`target#kissed`）
@@ -525,14 +535,19 @@ VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
 你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序确定性复用服装和环境 Tag。
 
 输出格式（version=4）：
-{"version":4,"format":"single","intent":"normal|selfie|portrait","dynamic":{"subject":[...],"action":[...],"emotion":[...],"scene":[...],"framing":[...]},"stable":{"outfit":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]},"environment":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]}}}
+{"version":4,"format":"single|multi","intent":"normal|selfie|portrait","dynamic":{"subject":[...],"action":[...],"emotion":[...],"scene":[...],"framing":[...],"people":[{"role":"bot|other","subject":[...],"action":[...],"emotion":[...]}],"positions":[...]},"stable":{"outfit":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]},"environment":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]}}}
 
 字段规则：
 - version: 固定 4。
-- format: 固定 "single"，表示使用单一 Prompt 通道，不限制画面人数。
+- format: 单人画面用 "single"；两个以上可见人物必须用 "multi"，让程序通过独立人物通道发送。
 - intent: 根据实际画面语义选择；Bot 出镜不等于自拍，只有情景明确自拍时才用 selfie。
 - dynamic.subject: rating tag、人数、主体身份及本轮临时人物状态；第一个元素必须是唯一的 rating tag。
-- dynamic.action / emotion / framing: 只写本轮动作、表情和镜头构图。
+- single 时 dynamic.action / emotion 写主体动作和表情；multi 时两者必须为 []，动作与情绪分别写入对应 people 人物段。
+- multi 的 dynamic.people 每项必须含 role、subject、action、emotion；Bot 女生恰有一个且 role="bot"，其他人物 role="other"。subject 首项写 girl/boy/woman/man 等身份 Tag，禁止放 rating 和总人数 Tag。
+- multi 互动必须拆分到双方：施动方写 source# 动作，接收方写 target# 状态；Bot 女生的被动反应、闭眼、脸红等不能丢失。
+- multi 的 positions 可省略或用 []；非空时必须与 people 等长，每项为 A1-E5 坐标。
+- 程序只把 stable.outfit 注入 role="bot" 的女生人物段，绝不注入其他人物；stable.environment、rating、总人数、场景和 framing 只进入全局段。
+- dynamic.framing: 只写镜头构图。
 - dynamic.scene: 只写会自然变化的天气、时间、光线、氛围和临时物件。
 - stable.outfit / stable.environment: 只写跨图片需要保持一致的服装设计与环境结构。
 

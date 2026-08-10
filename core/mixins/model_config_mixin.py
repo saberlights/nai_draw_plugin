@@ -117,7 +117,10 @@ class ModelConfigMixin:
 
         # 应用 NSFW 过滤（最后合并 → 拼到最前 → 永远享有最高优先级）
         if platform and chat_id:
-            if session_state.is_nsfw_filter_enabled(
+            force_group_planner_sfw = bool(
+                getattr(self, "_force_group_planner_sfw", False)
+            )
+            if force_group_planner_sfw or session_state.is_nsfw_filter_enabled(
                 platform, chat_id, self.get_config  # type: ignore[attr-defined]
             ):
                 nsfw_tags = self.get_config("nsfw_filter.filter_tags", "{{{{{nsfw}}}}}")  # type: ignore[attr-defined]

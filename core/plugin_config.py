@@ -513,7 +513,7 @@ class PluginConfigDefinition:
     """以一个 Schema 驱动默认值、WebUI 和带注释 TOML 的深配置 Module。"""
 
     plugin_name = "nai_draw_plugin"
-    plugin_version = "1.11.0"
+    plugin_version = "1.12.0"
     plugin_author = "saberlight"
     # 配置文件顶部说明，渲染时挂在所有 section 之前（写 config.toml 时按行加 # 前缀）。
     config_file_header = (
@@ -1310,7 +1310,7 @@ class PluginConfigDefinition:
             "mode": ConfigField(
                 type=str,
                 default="online",
-                description="检索模式；可填 online / local；online=远程 DanbooruSearchOnline API，local=本地 embedding（需 data/tag_embeddings.npy）"
+                description="检索模式；可填 online / local；online=远程 DanbooruSearchOnline API，local=本地 embedding（需先在统一持久化目录 data/plugins/saberlights.nai-draw-plugin/ 构建 danbooru_tags.json）"
             ),
             "api_url": ConfigField(
                 type=str,

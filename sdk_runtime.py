@@ -322,6 +322,7 @@ class NaiInvocation(ModelConfigMixin):
         self.reasoning = str(reasoning or "")
         self.text = str(text or "")
         self.source = source
+        self._force_group_planner_sfw = bool(self.group_id and source == "action")
         self.log_prefix = "nai_draw_plugin"
         self._generation_admission_policy = plugin._generation_admission_policy
         self.api_client = NaiWebClient(
@@ -336,6 +337,7 @@ class NaiInvocation(ModelConfigMixin):
             send_text=self.send_text,
             show_tag_candidates=self._is_tag_retriever_show_enabled(),
             log_prefix=self.log_prefix,
+            force_sfw=self._force_group_planner_sfw,
         )
         random_scene_config = self.get_config("random_scene", {})
         self._random_scene_planner = RandomScenePlanner(
@@ -471,6 +473,16 @@ class NaiInvocation(ModelConfigMixin):
             return True
         return session_state.check_user_permission(platform, chat_id, user_id, self.get_config)
 
+    def _is_configured_plugin_admin(self) -> bool:
+        """检查用户是否明确列在插件管理员列表中。"""
+        admin_users = self.get_config("admin.admin_users", [])
+        if not isinstance(admin_users, list) or not self.user_id:
+            return False
+        normalized_user_id = str(self.user_id).strip()
+        return bool(normalized_user_id) and normalized_user_id in {
+            str(user_id).strip() for user_id in admin_users if str(user_id).strip()
+        }
+
     async def ensure_generation_permission(self) -> bool:
         """检查当前用户是否有权限使用生图能力，并在失败时返回提示。"""
         if not await self.ensure_user_not_blacklisted():
@@ -521,7 +533,9 @@ class NaiInvocation(ModelConfigMixin):
         """
         if not prompt:
             return prompt
-        if session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
+        if self._force_group_planner_sfw or session_state.is_nsfw_filter_enabled(
+            "stream", self.stream_id, self.get_config
+        ):
             prompt = sanitize_sfw_prompt(prompt)
         return strip_cjk_and_fullwidth(prompt)
 
@@ -541,7 +555,9 @@ class NaiInvocation(ModelConfigMixin):
         global_text = structured.get("global_text", "")
         characters = structured.get("characters") or []
 
-        if session_state.is_nsfw_filter_enabled("stream", self.stream_id, self.get_config):
+        if self._force_group_planner_sfw or session_state.is_nsfw_filter_enabled(
+            "stream", self.stream_id, self.get_config
+        ):
             global_text, characters = sanitize_sfw_characters(global_text, characters)
             if len(characters) < 2:
                 logger.info(
@@ -729,7 +745,7 @@ class NaiInvocation(ModelConfigMixin):
         # 命令发出的图：发送（已 await 入库）后立刻在图片库标记“已识别”，
         # 让 MaiBot 后续不再对这张图触发 VLM 识图；action（麦麦主动画图）不在此列，
         # 保留 VLM 识图、不向 replyer 侧写入任何额外文本——图片内容改由 Planner
-        # 依据画图回执自行写进 reply 工具的 reference_info。
+        # 依据画图回执自行写进 reply 工具的 reply_reference。
         if self._skip_self_vlm():
             await self._register_self_image_as_processed(image_base64, image_description)
         return sent
@@ -972,6 +988,74 @@ class NaiInvocation(ModelConfigMixin):
 
         return description
 
+    def _process_selfie_structured_prompt(
+        self,
+        fallback_prompt: str,
+        structured: dict[str, Any],
+        raw_request: str = "",
+        *,
+        include_selfie_prompt_add: bool = True,
+        log_changes: bool = True,
+    ) -> tuple[str, dict[str, Any]]:
+        """只在 Bot 女生的人物段应用固定外貌，并保留多人发送结构。"""
+
+        raw_characters = structured.get("characters") or []
+        if not isinstance(raw_characters, list) or len(raw_characters) < 2:
+            return fallback_prompt, structured
+        if not all(isinstance(character, dict) for character in raw_characters):
+            logger.warning(
+                "%s 多人提示词包含非法人物段，跳过固定外貌注入",
+                self.log_prefix,
+            )
+            return fallback_prompt, structured
+
+        bot_index = structured.get("bot_character_index")
+        if not (
+            isinstance(bot_index, int)
+            and not isinstance(bot_index, bool)
+            and 0 <= bot_index < len(raw_characters)
+        ):
+            female_indices = []
+            for index, character in enumerate(raw_characters):
+                if not isinstance(character, dict):
+                    continue
+                first_tag = str(character.get("prompt", "") or "").split(",", 1)[0]
+                if first_tag.strip().lower() in {"girl", "woman", "female"}:
+                    female_indices.append(index)
+            if len(female_indices) != 1:
+                logger.warning(
+                    "%s 多人提示词无法唯一定位 Bot 女生，保留人物结构但跳过固定外貌注入",
+                    self.log_prefix,
+                )
+                return fallback_prompt, structured
+            bot_index = female_indices[0]
+
+        characters = [dict(character) for character in raw_characters]
+        bot_character = characters[bot_index]
+        first_tag = str(bot_character.get("prompt", "") or "").split(",", 1)[0]
+        if first_tag.strip().lower() not in {"girl", "woman", "female"}:
+            logger.warning(
+                "%s 多人提示词的 Bot 角色不是女生，跳过固定外貌注入",
+                self.log_prefix,
+            )
+            return fallback_prompt, structured
+        bot_character["prompt"] = self._process_selfie_prompt(
+            str(bot_character.get("prompt", "") or ""),
+            raw_request,
+            include_selfie_prompt_add=include_selfie_prompt_add,
+            log_changes=log_changes,
+        )
+        processed = {**structured, "characters": characters, "bot_character_index": bot_index}
+        global_text = str(processed.get("global_text", "") or "").strip()
+        if not global_text:
+            return fallback_prompt, processed
+        lines = [f"{global_text},"]
+        lines.extend(
+            f"char{index}:{character.get('prompt', '')},"
+            for index, character in enumerate(characters, start=1)
+        )
+        return "\n".join(lines), processed
+
     async def _generate_prompt_with_llm(
         self,
         request_text: str,
@@ -1060,15 +1144,23 @@ class NaiInvocation(ModelConfigMixin):
                 else detect_bot_self_image_intent(raw_description)
             )
             selfie_base_prompt = generated_prompt
+            selfie_base_structured = structured_payload
             if is_selfie:
-                generated_prompt = self._process_selfie_prompt(
-                    generated_prompt,
-                    description,
-                    include_selfie_prompt_add=True,
-                    log_changes=True,
-                )
-                # 自拍场景目前一律按单字符串路径处理（_process_selfie_prompt 只作用于字符串）
-                structured_payload = None
+                if structured_payload:
+                    generated_prompt, structured_payload = self._process_selfie_structured_prompt(
+                        generated_prompt,
+                        structured_payload,
+                        description,
+                        include_selfie_prompt_add=True,
+                        log_changes=True,
+                    )
+                else:
+                    generated_prompt = self._process_selfie_prompt(
+                        generated_prompt,
+                        description,
+                        include_selfie_prompt_add=True,
+                        log_changes=True,
+                    )
 
             if self.get_config("prompt_generator.enforce_tag_order", False):
                 generated_prompt = normalize_prompt_order(generated_prompt)
@@ -1082,12 +1174,21 @@ class NaiInvocation(ModelConfigMixin):
                 header = "📝 提示词:"
                 if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
                     # 重新处理以隐藏 selfie_prompt_add，但仍需应用外貌过滤
-                    show_prompt = self._process_selfie_prompt(
-                        selfie_base_prompt,
-                        description,
-                        include_selfie_prompt_add=False,
-                        log_changes=False,
-                    )
+                    if selfie_base_structured:
+                        show_prompt, _ = self._process_selfie_structured_prompt(
+                            selfie_base_prompt,
+                            selfie_base_structured,
+                            description,
+                            include_selfie_prompt_add=False,
+                            log_changes=False,
+                        )
+                    else:
+                        show_prompt = self._process_selfie_prompt(
+                            selfie_base_prompt,
+                            description,
+                            include_selfie_prompt_add=False,
+                            log_changes=False,
+                        )
                     header = "📝 提示词(已隐藏自拍补充):"
                 elif is_selfie:
                     # 即使不隐藏 selfie_prompt_add，显示的也应该是过滤后的版本
@@ -1664,15 +1765,23 @@ class NaiInvocation(ModelConfigMixin):
                 and detect_bot_self_image_intent(description)
             )
             selfie_base_prompt = generated_prompt
+            selfie_base_structured = structured_payload
             if is_selfie:
-                generated_prompt = self._process_selfie_prompt(
-                    generated_prompt,
-                    description,
-                    include_selfie_prompt_add=True,
-                    log_changes=True,
-                )
-                # 自拍场景目前一律按单字符串路径处理（_process_selfie_prompt 只作用于字符串）
-                structured_payload = None
+                if structured_payload:
+                    generated_prompt, structured_payload = self._process_selfie_structured_prompt(
+                        generated_prompt,
+                        structured_payload,
+                        description,
+                        include_selfie_prompt_add=True,
+                        log_changes=True,
+                    )
+                else:
+                    generated_prompt = self._process_selfie_prompt(
+                        generated_prompt,
+                        description,
+                        include_selfie_prompt_add=True,
+                        log_changes=True,
+                    )
 
             generated_prompt = self._sanitize_prompt_for_sfw_mode(generated_prompt)
             structured_payload = self._sanitize_structured_for_sfw_mode(structured_payload)
@@ -1681,12 +1790,21 @@ class NaiInvocation(ModelConfigMixin):
                 show_prompt = generated_prompt
                 header = "📝 提示词:"
                 if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
-                    show_prompt = self._process_selfie_prompt(
-                        selfie_base_prompt,
-                        description,
-                        include_selfie_prompt_add=False,
-                        log_changes=False,
-                    )
+                    if selfie_base_structured:
+                        show_prompt, _ = self._process_selfie_structured_prompt(
+                            selfie_base_prompt,
+                            selfie_base_structured,
+                            description,
+                            include_selfie_prompt_add=False,
+                            log_changes=False,
+                        )
+                    else:
+                        show_prompt = self._process_selfie_prompt(
+                            selfie_base_prompt,
+                            description,
+                            include_selfie_prompt_add=False,
+                            log_changes=False,
+                        )
                     header = "📝 提示词(已隐藏自拍补充):"
                 show_prompt = self._sanitize_prompt_for_sfw_mode(show_prompt)
                 await self.send_text(f"{header}\n{show_prompt}", storage_message=False)
@@ -1979,14 +2097,23 @@ class NaiInvocation(ModelConfigMixin):
         # 和生活场景同样必须注入 config.toml 的 selfie_prompt_add 固定外貌。
         is_selfie = not is_named_character and not is_bot_absent
         selfie_base_prompt = description
+        selfie_base_structured = structured_payload
         if is_selfie:
-            description = self._process_selfie_prompt(
-                description,
-                raw_description,
-                include_selfie_prompt_add=True,
-                log_changes=True,
-            )
-            structured_payload = None
+            if structured_payload:
+                description, structured_payload = self._process_selfie_structured_prompt(
+                    description,
+                    structured_payload,
+                    raw_description,
+                    include_selfie_prompt_add=True,
+                    log_changes=True,
+                )
+            else:
+                description = self._process_selfie_prompt(
+                    description,
+                    raw_description,
+                    include_selfie_prompt_add=True,
+                    log_changes=True,
+                )
 
         if self.get_config("prompt_generator.enforce_tag_order", False):
             description = normalize_prompt_order(description)
@@ -1999,12 +2126,21 @@ class NaiInvocation(ModelConfigMixin):
             show_prompt = description
             header = "📝 提示词:"
             if is_selfie and self.get_config("prompt_show.hide_selfie_prompt_add", False):
-                show_prompt = self._process_selfie_prompt(
-                    selfie_base_prompt,
-                    raw_description,
-                    include_selfie_prompt_add=False,
-                    log_changes=False,
-                )
+                if selfie_base_structured:
+                    show_prompt, _ = self._process_selfie_structured_prompt(
+                        selfie_base_prompt,
+                        selfie_base_structured,
+                        raw_description,
+                        include_selfie_prompt_add=False,
+                        log_changes=False,
+                    )
+                else:
+                    show_prompt = self._process_selfie_prompt(
+                        selfie_base_prompt,
+                        raw_description,
+                        include_selfie_prompt_add=False,
+                        log_changes=False,
+                    )
                 header = "📝 提示词(已隐藏自拍补充):"
             show_prompt = self._sanitize_prompt_for_sfw_mode(show_prompt)
             await self.send_text(f"{header}\n{show_prompt}", storage_message=False)
@@ -2124,12 +2260,17 @@ class NaiInvocation(ModelConfigMixin):
         if self._cached_action_trigger_assessment is not None:
             return self._cached_action_trigger_assessment
         user_text, age_seconds = await self._fetch_last_user_text_with_age()
+        policy_kwargs: dict[str, Any] = {
+            "stream_id": self.stream_id,
+            "config": self.plugin_config,
+            "user_text": user_text,
+            "user_text_age_seconds": age_seconds,
+            "reasoning": reasoning,
+        }
+        if getattr(self, "_force_group_planner_sfw", False) and self._is_configured_plugin_admin():
+            policy_kwargs["bypass_throttle"] = True
         result = self._generation_admission_policy.evaluate_action(
-            stream_id=self.stream_id,
-            config=self.plugin_config,
-            user_text=user_text,
-            user_text_age_seconds=age_seconds,
-            reasoning=reasoning,
+            **policy_kwargs,
         )
         self._cached_action_trigger_assessment = result
         return result
@@ -2416,6 +2557,46 @@ class NaiInvocation(ModelConfigMixin):
         state_text = "开启" if enabled else "关闭"
         await self.send_text(f"✅ 已在{self._chat_type_text()}中{state_text} NSFW 内容过滤", storage_message=False)
         return True, f"NSFW 过滤已{state_text}", True
+
+    async def handle_planner_draw_command(
+        self,
+        action: str,
+    ) -> tuple[bool, str | None, bool]:
+        """查看或切换当前会话的 Planner 自动生图能力。"""
+        if not await self.ensure_user_not_blacklisted():
+            return False, "黑名单用户", True
+
+        _, chat_id, user_id = self._get_chat_identity()
+        if not chat_id:
+            await self.send_text("❌ 无法获取会话信息", storage_message=False)
+            return False, "无法获取会话信息", True
+        if not self._is_configured_plugin_admin():
+            await self.send_text(
+                "❌ 只有管理员可以控制 Planner 自动生图",
+                storage_message=False,
+            )
+            return False, "没有管理员权限", True
+
+        state_stream_id = self.stream_id or chat_id
+        normalized_action = str(action or "").strip().lower()
+        if not normalized_action:
+            enabled = self.plugin.is_planner_draw_enabled(state_stream_id)
+            state_text = "已开启" if enabled else "已关闭"
+            await self.send_text(
+                f"当前会话 Planner 自动生图：{state_text}\n"
+                "使用 /nai planner on 或 /nai planner off 切换",
+                storage_message=False,
+            )
+            return True, f"Planner 生图{state_text}", True
+
+        enabled = normalized_action == "on"
+        self.plugin.set_planner_draw_enabled(state_stream_id, enabled)
+        state_text = "开启" if enabled else "关闭"
+        await self.send_text(
+            f"✅ 已在当前会话中{state_text} Planner 自动生图",
+            storage_message=False,
+        )
+        return True, f"Planner 生图已{state_text}", True
 
     async def handle_ref_type_command(self, value: str) -> tuple[bool, str | None, bool]:
         """处理 `/nai ref类型 <character|style|both>`：切换本会话 §20.4 type。

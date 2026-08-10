@@ -21,7 +21,7 @@ _visual_store_module = importlib.import_module(
 
 @pytest.fixture(autouse=True)
 def _isolate_visual_continuity_store(tmp_path, monkeypatch):
-    """把视觉连续性持久化重定向到临时目录，避免测试污染仓库 data/。"""
+    """把视觉连续性持久化重定向到临时目录，避免测试污染统一持久化目录。"""
     store = VisualContinuityStore(storage_path=tmp_path / "visual_continuity.json")
     monkeypatch.setattr(_visual_store_module, "visual_continuity_store", store)
     monkeypatch.setattr(_session_state_module, "visual_continuity_store", store)

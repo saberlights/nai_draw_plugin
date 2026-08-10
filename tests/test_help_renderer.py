@@ -24,6 +24,14 @@ def _documented_commands() -> tuple[str, ...]:
     return tuple(command for section in HELP_DOC.sections for command, _ in section.items)
 
 
+def _description_for(command: str) -> str:
+    for section in HELP_DOC.sections:
+        for documented_command, description in section.items:
+            if documented_command == command:
+                return description
+    raise AssertionError(f"HELP_DOC 缺少命令：{command}")
+
+
 def test_help_lists_random_role_and_key_operational_commands() -> None:
     """帮助页必须覆盖用户容易遗漏但实际可用的关键命令。"""
     commands = _documented_commands()
@@ -32,6 +40,7 @@ def test_help_lists_random_role_and_key_operational_commands() -> None:
         "/nai 随机自拍 [角色]",
         "/nai tag on/off",
         "/nai models",
+        "/nai planner [on|off]",
         "/nai ref类型 [character|style|both]",
         "/nai vibe清空",
         "/nai ref清空",
@@ -46,3 +55,11 @@ def test_fallback_text_contains_every_structured_help_command() -> None:
     """HTML 渲染失败时，纯文本回退不能丢掉结构化帮助里的命令。"""
     for command in _documented_commands():
         assert command in HELP_FALLBACK_TEXT, f"纯文本回退遗漏命令：{command}"
+
+
+def test_planner_help_states_permission_scope_and_default() -> None:
+    description = _description_for("/nai planner [on|off]")
+
+    assert "仅管理员" in description
+    assert "会话级" in description
+    assert "默认开启" in description

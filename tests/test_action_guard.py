@@ -271,6 +271,175 @@ def test_action_third_person_bot_scene_still_injects_configured_appearance(
     assert prompt_kwargs[0]["use_visual_continuity"] is True
 
 
+def test_command_multi_bot_scene_sends_two_characters_and_only_styles_girl() -> None:
+    invocation = _build_invocation()
+    invocation._force_group_planner_sfw = False
+    sent_payloads: list[dict[str, object]] = []
+
+    async def allowed() -> bool:
+        return True
+
+    async def generated_prompt(*_args, **_kwargs):
+        return (
+            "rating:sensitive, 1boy 1girl",
+            {
+                "global_text": "rating:sensitive, 1boy 1girl, hotel room",
+                "characters": [
+                    {"prompt": "girl, target#kissed, blush", "negative_prompt": "", "position": ""},
+                    {"prompt": "boy, source#kissing", "negative_prompt": "", "position": ""},
+                ],
+                "has_coords": False,
+            },
+        )
+
+    async def generated_image(**kwargs):
+        sent_payloads.append(kwargs)
+        return True, "image-data"
+
+    async def sent_image(*_args, **_kwargs):
+        return True, "sent", True
+
+    async def sent_text(*_args, **_kwargs):
+        return True
+
+    invocation.ensure_generation_permission = allowed
+    invocation._generate_prompt_with_llm = generated_prompt
+    invocation._sanitize_prompt_for_sfw_mode = lambda text: text
+    invocation._sanitize_structured_for_sfw_mode = lambda payload: payload
+    invocation._is_prompt_show_enabled = lambda: False
+    invocation._get_model_config = lambda **_kwargs: {
+        "base_url": "https://example.invalid",
+        "nai_size": "竖图",
+        "selfie_prompt_add": "female, black hair, blue eyes",
+    }
+    invocation.get_config = lambda key, default=None: {
+        "prompt_generator.selfie_appearance_policy": "auto",
+        "prompt_generator.enforce_tag_order": False,
+        "components.enable_debug_info": False,
+    }.get(key, default)
+    invocation.api_client = types.SimpleNamespace(generate_image=generated_image)
+    invocation._send_image_result = sent_image
+    invocation.send_text = sent_text
+
+    result = asyncio.run(invocation.handle_nai_draw("看看你和一个男生接吻"))
+
+    assert result == (True, "sent", True)
+    assert len(sent_payloads) == 1
+    assert sent_payloads[0]["prompt"] == "rating:sensitive, 1boy 1girl, hotel room"
+    characters = sent_payloads[0]["characters"]
+    assert isinstance(characters, list) and len(characters) == 2
+    assert "black hair" in characters[0]["prompt"]
+    assert "blue eyes" in characters[0]["prompt"]
+    assert "black hair" not in characters[1]["prompt"]
+    assert characters[1]["prompt"] == "boy, source#kissing"
+
+
+def test_action_multi_bot_scene_preserves_boy_appearance_and_only_styles_bot_girl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation = _build_invocation()
+    invocation.action_data = {
+        "subject_and_pov": "一男一女 第三视角",
+        "action": "男生吻女生，女生闭眼回应",
+        "emotion": "女生害羞紧张",
+        "environment_change": "unchanged",
+        "outfit_change": "unchanged",
+        "framing": "近景",
+    }
+    invocation.reasoning = "用户要求生成一男一女接吻场景"
+    sent_payloads: list[dict[str, object]] = []
+
+    async def allowed() -> bool:
+        return True
+
+    async def approved_trigger(**_kwargs):
+        return types.SimpleNamespace(
+            should_generate=True,
+            category="explicit",
+            detail="允许",
+            signal_source="test",
+            signal_text="test",
+        )
+
+    async def generated_prompt(*_args, **kwargs):
+        assert kwargs["use_visual_continuity"] is True
+        return (
+            "rating:sensitive, 1boy 1girl",
+            {
+                "global_text": "rating:sensitive, 1boy 1girl, hotel room",
+                "characters": [
+                    {
+                        "prompt": "boy, short black hair, green eyes, source#kissing",
+                        "negative_prompt": "",
+                        "position": "",
+                    },
+                    {
+                        "prompt": "girl, brown hair, blue eyes, target#kissed, blush",
+                        "negative_prompt": "",
+                        "position": "",
+                    },
+                ],
+                "has_coords": False,
+                "bot_character_index": 1,
+            },
+        )
+
+    async def generated_image(**kwargs):
+        sent_payloads.append(kwargs)
+        return True, "image-data"
+
+    async def sent_image(*_args, **_kwargs):
+        return True, "sent"
+
+    async def sent_text(*_args, **_kwargs):
+        return True
+
+    invocation.ensure_user_not_blacklisted = allowed
+    invocation.ensure_generation_permission = allowed
+    invocation._assess_action_trigger = approved_trigger
+    invocation._is_action_guard_enabled = lambda: True
+    invocation._generate_prompt_with_llm = generated_prompt
+    invocation._sanitize_prompt_for_sfw_mode = lambda text: text
+    invocation._sanitize_structured_for_sfw_mode = lambda payload: payload
+    invocation._is_prompt_show_enabled = lambda: False
+    invocation._get_model_config = lambda **_kwargs: {
+        "base_url": "https://example.invalid",
+        "nai_size": "竖图",
+        "selfie_prompt_add": "silver hair, violet eyes",
+    }
+    invocation.get_config = lambda key, default=None: {
+        "prompt_generator.selfie_appearance_policy": "auto",
+        "prompt_generator.enforce_tag_order": False,
+        "prompt_generator.inherit_ttl": 3_600,
+        "components.enable_debug_info": False,
+    }.get(key, default)
+    invocation.api_client = types.SimpleNamespace(generate_image=generated_image)
+    invocation._send_image_result = sent_image
+    invocation.send_text = sent_text
+    monkeypatch.setattr(
+        sdk_runtime_module.session_state,
+        "set_last_selfie_context",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = asyncio.run(invocation.handle_action())
+
+    assert result == (True, "sent")
+    assert len(sent_payloads) == 1
+    assert sent_payloads[0]["prompt"] == "rating:sensitive, 1boy 1girl, hotel room"
+    characters = sent_payloads[0]["characters"]
+    assert isinstance(characters, list) and len(characters) == 2
+    assert "short black hair" in characters[0]["prompt"]
+    assert "green eyes" in characters[0]["prompt"]
+    assert "source#kissing" in characters[0]["prompt"]
+    assert "silver hair" not in characters[0]["prompt"]
+    assert "silver hair" in characters[1]["prompt"]
+    assert "violet eyes" in characters[1]["prompt"]
+    assert "target#kissed" in characters[1]["prompt"]
+    assert "brown hair" not in characters[1]["prompt"]
+    assert "blue eyes" not in characters[1]["prompt"]
+
+
 def test_action_stops_when_prompt_generation_fails_instead_of_sending_selfie_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -435,3 +604,60 @@ def test_action_commits_visual_continuity_only_after_image_delivery(
 
     assert ok is send_success
     assert committed == [candidate] * expected_commit_count
+
+
+def test_planner_draw_switch_is_admin_only_and_scoped_to_current_stream() -> None:
+    invocation = _build_invocation(stream_id="planner-switch-stream")
+    invocation.user_id = "admin-1"
+    invocation.plugin_config = {"admin": {"admin_users": ["admin-1"]}}
+    states: dict[str, bool] = {}
+    sent_texts: list[str] = []
+    invocation.plugin = types.SimpleNamespace(
+        is_planner_draw_enabled=lambda stream_id: states.get(stream_id, True),
+        set_planner_draw_enabled=lambda stream_id, enabled: states.__setitem__(
+            stream_id, enabled
+        ),
+    )
+
+    async def send_text(text: str, storage_message: bool = True) -> bool:
+        del storage_message
+        sent_texts.append(text)
+        return True
+
+    invocation.send_text = send_text
+
+    result = asyncio.run(invocation.handle_planner_draw_command("off"))
+
+    assert result == (True, "Planner 生图已关闭", True)
+    assert states == {"planner-switch-stream": False}
+    assert sent_texts == ["✅ 已在当前会话中关闭 Planner 自动生图"]
+
+    invocation.user_id = "member-1"
+    denied = asyncio.run(invocation.handle_planner_draw_command("on"))
+
+    assert denied == (False, "没有管理员权限", True)
+    assert states["planner-switch-stream"] is False
+    assert "只有管理员" in sent_texts[-1]
+
+
+def test_group_planner_sfw_cleanup_runs_even_when_session_filter_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation = _build_invocation(stream_id="group-sfw-stream")
+    invocation._force_group_planner_sfw = True
+    invocation.get_config = lambda _key, default=None: default
+    monkeypatch.setattr(
+        sdk_runtime_module.session_state,
+        "is_nsfw_filter_enabled",
+        lambda *_args, **_kwargs: False,
+    )
+
+    cleaned = invocation._sanitize_prompt_for_sfw_mode(
+        "rating:general, solo, 1girl, bikini, cleavage, seductive, city street"
+    )
+
+    assert "rating:general" in cleaned
+    assert "city street" in cleaned
+    assert "bikini" not in cleaned
+    assert "cleavage" not in cleaned
+    assert "seductive" not in cleaned

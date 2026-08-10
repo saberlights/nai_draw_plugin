@@ -164,6 +164,10 @@ HELP_DOC: HelpDoc = HelpDoc(
             items=(
                 ("/nai st", "开启管理员模式"),
                 ("/nai sp", "关闭管理员模式"),
+                (
+                    "/nai planner [on|off]",
+                    "查看 / 开关 Planner 生图（仅管理员，会话级，默认开启）",
+                ),
                 ("/nai ban <用户ID>", "拉黑指定用户"),
                 ("/nai unban <用户ID>", "取消拉黑"),
                 ("/nai banlist", "查看黑名单"),

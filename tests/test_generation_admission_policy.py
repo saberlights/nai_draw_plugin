@@ -221,3 +221,26 @@ def test_zero_intervals_allow_immediate_generation() -> None:
     assert policy.evaluate_action(
         stream_id="stream-1", config=config, user_text="今天天气真不错"
     ).should_generate is True
+
+
+def test_admin_bypass_skips_throttle_but_not_explicit_negative_intent() -> None:
+    policy, _state, _clock = _build_policy()
+    policy.record_success(stream_id="group-stream")
+
+    allowed = policy.evaluate_action(
+        stream_id="group-stream",
+        config=_config(explicit_interval=300, proactive_interval=600),
+        user_text="再来一张自拍",
+        bypass_throttle=True,
+    )
+    blocked = policy.evaluate_action(
+        stream_id="group-stream",
+        config=_config(explicit_interval=300, proactive_interval=600),
+        user_text="别画了",
+        bypass_throttle=True,
+    )
+
+    assert allowed.should_generate is True
+    assert allowed.detail == "管理员豁免图片频率节流"
+    assert blocked.should_generate is False
+    assert blocked.category == "blocked"

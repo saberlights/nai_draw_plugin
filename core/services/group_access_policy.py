@@ -73,9 +73,13 @@ class GroupAccessPolicy:
 
 
 def tool_definition_name(tool_definition: Any) -> str:
-    """Extract a tool name from OpenAI-style or flattened tool definitions."""
+    """Extract a tool name from planner definitions or output items."""
     if not isinstance(tool_definition, dict):
         return ""
+    if tool_definition.get("item_type") == "FunctionCallItem":
+        tool_call = tool_definition.get("tool_call")
+        if isinstance(tool_call, dict):
+            return str(tool_call.get("func_name", "") or "").strip()
     function = tool_definition.get("function")
     if isinstance(function, dict):
         return str(function.get("name", "") or "").strip()

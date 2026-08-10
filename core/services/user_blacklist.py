@@ -6,10 +6,11 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List
 
 from src.common.logger import get_logger
+
+from ..data_paths import plugin_data_path
 
 logger = get_logger("nai_draw_plugin")
 
@@ -19,7 +20,7 @@ class UserBlacklistService:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._storage_path = Path(__file__).resolve().parents[2] / "data" / "user_blacklist.json"
+        self._storage_path = plugin_data_path("user_blacklist.json")
         self._entries: Dict[str, Dict[str, str]] = {}
         self._load()
 

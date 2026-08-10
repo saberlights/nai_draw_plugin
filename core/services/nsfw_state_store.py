@@ -15,13 +15,15 @@ from typing import Dict, Optional
 
 from src.common.logger import get_logger
 
+from ..data_paths import plugin_data_path
+
 logger = get_logger("nai_draw_plugin")
 
 
 class NsfwStateStore:
     """按 ``platform:chat_id`` 持久化 NSFW 过滤开关，跨重启保留。"""
 
-    _DEFAULT_PATH = Path(__file__).resolve().parents[2] / "data" / "nsfw_state.json"
+    _DEFAULT_PATH = plugin_data_path("nsfw_state.json")
 
     def __init__(self, storage_path: Optional[Path] = None) -> None:
         self._lock = threading.RLock()

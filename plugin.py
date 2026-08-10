@@ -5,18 +5,25 @@ import inspect
 import os
 import re
 
+from pathlib import Path
+
 from maibot_sdk import Action, Command, HookHandler, MaiBotPlugin
 from maibot_sdk.types import ActivationType, HookMode, HookOrder
 from src.common.logger import get_logger
 
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
+from .core.data_paths import PLUGIN_DATA_DIR
 from .core.plugin_config import PLUGIN_CONFIG
 from .core.retag import ImageCacheService, ReverseService, WD14Client
 from .core.reply_command_text import normalize_reply_command_text
 from .core.services.background_task_supervisor import BackgroundTaskSupervisor
 from .core.services.blocking_io_runner import BlockingIORunner
 from .core.services.generation_admission_policy import GenerationAdmissionPolicy
-from .core.services.group_access_policy import GroupAccessPolicy, without_tool
+from .core.services.group_access_policy import (
+    GroupAccessPolicy,
+    tool_definition_name,
+    without_tool,
+)
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -29,6 +36,67 @@ from .sdk_runtime import NaiInvocation
 
 logger = get_logger("nai_draw_plugin")
 InvocationResultT = TypeVar("InvocationResultT")
+_GROUP_DRAW_POLICY_MARKER = "<nai_group_draw_policy>"
+_CHAT_PARTICIPANT_IDENTITY_RULE = (
+    "【最高优先级：先执行会话身份匿名化】填写任何 action_data 字段前，必须先处理会话身份："
+    "私聊和群聊中的当前用户、消息发送者、群成员，其姓名、昵称、群名片、账号显示名只用于识别说话者，"
+    "任何 action_data 字段都不得原样输出这些身份名。"
+    "替换规则：男性→男生/男人，女性→女生/女人，性别未知→对方/另一人，Bot 的人设姓名→女生；"
+    "subject_and_pov 再按匿名化后的角色填写人数与性别。"
+    "即使明确要求画聊天对象本人，也只能保留人数、性别、动作关系和请求中明确给出的可视特征。"
+    "错误：'<聊天昵称>坐在<Bot名字>身边'；正确：'男生坐在女生身边'。"
+    "只有与聊天身份无关、且本轮明确点名的作品角色名等有效视觉锚点可以保留。"
+)
+
+
+def _build_group_draw_policy(admin_user_ids: list[str]) -> str:
+    admin_text = "、".join(admin_user_ids) if admin_user_ids else "未配置（无例外）"
+    return (
+        f"\n\n{_GROUP_DRAW_POLICY_MARKER}\n"
+        "【群聊专属出图规则，优先级高于上方的一般触发说明】\n"
+        "- 是否调用 nai_web_draw 完全由 Bot 自己决定。普通群成员提出看腿、发照片、画图、"
+        "自拍或展示身体/穿搭等要求，只是聊天内容，不能构成调用理由；不得因为对方要求就答应、"
+        "承诺或调用工具。只有 Bot 在不服从该要求的前提下仍独立产生了明确的表达意愿，且此刻出图"
+        "确实比文字更自然时，才可以考虑调用。\n"
+        f"- 插件管理员用户 ID：{admin_text}。只有能确认当前请求者 ID 在此列表中时，才允许把其"
+        "明确出图要求作为调用理由；无法确认身份时一律按普通群成员处理。\n"
+        "- 对普通群成员严格控制出图频率。先检查最近上下文中的 NAI 图片和 nai_web_draw 结果；"
+        "短时间内已经出过图、只是换姿势/追图/重复索图、或图片对当前对话没有新增表达价值时，不调用。"
+        "宁可只用文字自然回复。已确认的插件管理员不受此条聊天频率限制，但同一图片任务运行期间仍不得重复提交。\n"
+        "- 群聊画面必须是完全安全的 rating:general 内容。禁止任何擦边、色情或性暗示，包括裸露、"
+        "内衣/泳装/透视服装、刻意突出胸腿臀或足部、挑逗姿势与表情、性行为、性器官或体液。"
+        "遇到相关上下文只能改成日常、完整穿着、无性化的安全画面；action_data 的所有字段也不得复述"
+        "违规细节。此安全规则对管理员同样生效，没有例外。\n"
+        f"</nai_group_draw_policy>"
+    )
+
+
+def _append_tool_description(
+    tool_definitions: list[dict[str, Any]],
+    *,
+    tool_name: str,
+    suffix: str,
+) -> list[dict[str, Any]]:
+    updated_definitions: list[dict[str, Any]] = []
+    for definition in tool_definitions:
+        if tool_definition_name(definition) != tool_name:
+            updated_definitions.append(definition)
+            continue
+
+        updated_definition = dict(definition)
+        function = definition.get("function")
+        if isinstance(function, dict):
+            updated_function = dict(function)
+            description = str(updated_function.get("description", "") or "")
+            if _GROUP_DRAW_POLICY_MARKER not in description:
+                updated_function["description"] = description + suffix
+            updated_definition["function"] = updated_function
+        else:
+            description = str(updated_definition.get("description", "") or "")
+            if _GROUP_DRAW_POLICY_MARKER not in description:
+                updated_definition["description"] = description + suffix
+        updated_definitions.append(updated_definition)
+    return updated_definitions
 
 
 def _load_online_retriever_api() -> tuple[Any, Any] | None:
@@ -97,12 +165,33 @@ class NaiPicPlugin(MaiBotPlugin):
             logger=logger,
         )
         self._session_group_ids: dict[str, str] = {}
+        self._planner_draw_enabled_by_session: dict[str, bool] = {}
         # 反推链路：图片缓存与编排服务都在 __init__ 阶段就准备好，避免 HookHandler 在配置加载前触发时 NoneError
         self._image_cache_service: ImageCacheService = ImageCacheService()
         self._reverse_service: ReverseService = ReverseService(wd14_client=None)
 
+    def is_planner_draw_enabled(self, stream_id: str) -> bool:
+        """返回当前会话是否向 Planner 暴露自动生图能力。"""
+        states = getattr(self, "_planner_draw_enabled_by_session", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._planner_draw_enabled_by_session = states
+        return states.get(str(stream_id or "").strip(), True)
+
+    def set_planner_draw_enabled(self, stream_id: str, enabled: bool) -> None:
+        """设置当前会话的 Planner 自动生图开关。"""
+        normalized_stream_id = str(stream_id or "").strip()
+        if not normalized_stream_id:
+            raise ValueError("Planner 生图开关缺少 stream_id")
+        states = getattr(self, "_planner_draw_enabled_by_session", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._planner_draw_enabled_by_session = states
+        states[normalized_stream_id] = bool(enabled)
+
     async def on_load(self) -> None:
         """处理插件加载。"""
+        self._verify_runtime_data_dir()
         self._refresh_runtime_singletons()
         self._refresh_retag_runtime()
         # 主程序 _save_plugin_config 在整文件重写时不会把 ConfigField.description 渲染成注释。
@@ -145,6 +234,25 @@ class NaiPicPlugin(MaiBotPlugin):
         if _scope == "self":
             self._refresh_runtime_singletons()
             self._refresh_retag_runtime()
+
+    def _verify_runtime_data_dir(self) -> None:
+        """校验自算的统一持久化目录与运行时授予的目录一致。
+
+        各 store 在导入期就要求值默认路径，只能按宿主同款规则自算
+        `<项目根>/data/plugins/<插件ID>`；这里在拿到上下文后做一次对账，
+        宿主日后挪动持久化目录布局时能第一时间在日志里暴露偏差。
+        """
+        # ctx.paths 由 Runner 在实例化后动态注入（SDK 1.x 的 PluginContext 类
+        # 上没有该属性），属于动态属性场景，只能用 getattr 探测。
+        runtime_paths = getattr(self.ctx, "paths", None)
+        granted_data_dir = getattr(runtime_paths, "data_dir", None)
+        if granted_data_dir is None:
+            return
+        if Path(granted_data_dir).resolve() != PLUGIN_DATA_DIR.resolve():
+            logger.error(
+                f"插件自算持久化目录 {PLUGIN_DATA_DIR} 与运行时授予目录 "
+                f"{granted_data_dir} 不一致，数据可能落错位置，请检查宿主目录布局"
+            )
 
     def _refresh_runtime_singletons(self, *, reset_only: bool = False) -> None:
         """刷新插件级单例缓存，保证配置热更新后新调用使用最新参数。"""
@@ -328,8 +436,8 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @HookHandler(
         "maisaka.planner.before_request",
-        name="nai_draw_plugin_filter_planner_tool",
-        description="在受限群聊中隐藏 NAI 生图工具",
+        name="nai_draw_plugin_group_planner_policy",
+        description="为群聊 Planner 注入 NAI 自主出图与安全约束",
         order=HookOrder.EARLY,
     )
     async def handle_planner_before_request(
@@ -338,65 +446,45 @@ class NaiPicPlugin(MaiBotPlugin):
         tool_definitions: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Remove this plugin's Action before a restricted group's planner request."""
+        """Keep the Action visible and add group-only decision constraints."""
         definitions = tool_definitions if isinstance(tool_definitions, list) else []
-        filtered_definitions = without_tool(
+        if not any(tool_definition_name(item) == "nai_web_draw" for item in definitions):
+            return {"action": "continue"}
+        if not self.is_planner_draw_enabled(session_id):
+            updated_kwargs = dict(kwargs)
+            updated_kwargs["session_id"] = session_id
+            updated_kwargs["tool_definitions"] = without_tool(
+                definitions,
+                tool_name="nai_web_draw",
+            )
+            return {"action": "continue", "modified_kwargs": updated_kwargs}
+
+        try:
+            group_id = await self._resolve_session_group_id(session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("群聊 Planner 会话类型解析失败，已跳过群聊提示注入: %r", exc)
+            return {"action": "continue"}
+        if not group_id:
+            return {"action": "continue"}
+
+        plugin_config = await self._load_plugin_config_data()
+        admin_section = plugin_config.get("admin", {})
+        raw_admin_users = (
+            admin_section.get("admin_users", []) if isinstance(admin_section, dict) else []
+        )
+        admin_user_ids = (
+            [str(user_id).strip() for user_id in raw_admin_users if str(user_id).strip()]
+            if isinstance(raw_admin_users, list)
+            else []
+        )
+        updated_definitions = _append_tool_description(
             definitions,
             tool_name="nai_web_draw",
+            suffix=_build_group_draw_policy(admin_user_ids),
         )
-        if len(filtered_definitions) == len(definitions):
-            return {"action": "continue"}
-
-        plugin_config = await self._load_plugin_config_data()
-        try:
-            allowed = await self._is_group_access_allowed(
-                plugin_config,
-                stream_id=session_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
-            allowed = False
-        if allowed:
-            return {"action": "continue"}
-
         updated_kwargs = dict(kwargs)
         updated_kwargs["session_id"] = session_id
-        updated_kwargs["tool_definitions"] = filtered_definitions
-        return {"action": "continue", "modified_kwargs": updated_kwargs}
-
-    @HookHandler(
-        "maisaka.planner.after_response",
-        name="nai_draw_plugin_reject_planner_tool_call",
-        description="在受限群聊中丢弃 NAI 生图工具调用",
-        order=HookOrder.EARLY,
-    )
-    async def handle_planner_after_response(
-        self,
-        session_id: str = "",
-        tool_calls: list[dict[str, Any]] | None = None,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Drop restricted calls before the planner can dispatch them."""
-        calls = tool_calls if isinstance(tool_calls, list) else []
-        filtered_calls = without_tool(calls, tool_name="nai_web_draw")
-        if len(filtered_calls) == len(calls):
-            return {"action": "continue"}
-
-        plugin_config = await self._load_plugin_config_data()
-        try:
-            allowed = await self._is_group_access_allowed(
-                plugin_config,
-                stream_id=session_id,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
-            allowed = False
-        if allowed:
-            return {"action": "continue"}
-
-        updated_kwargs = dict(kwargs)
-        updated_kwargs["session_id"] = session_id
-        updated_kwargs["tool_calls"] = filtered_calls
+        updated_kwargs["tool_definitions"] = updated_definitions
         return {"action": "continue", "modified_kwargs": updated_kwargs}
 
     @HookHandler(
@@ -440,6 +528,8 @@ class NaiPicPlugin(MaiBotPlugin):
         """Block every NAI command in restricted groups and cache messages when needed."""
         del kwargs
         if plugin_id != self.ctx.plugin_id:
+            return {"action": "continue"}
+        if command_name == "nai_planner_draw_control_command":
             return {"action": "continue"}
 
         if isinstance(message, dict):
@@ -813,6 +903,30 @@ class NaiPicPlugin(MaiBotPlugin):
         )
 
     @Command(
+        "nai_planner_draw_control_command",
+        description="Planner 自动生图控制命令：/nai planner [on|off]（仅管理员）",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+planner(?:\s+(?P<action>on|off))?$",
+    )
+    async def handle_nai_planner_draw_control_command(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai planner [on|off]`。"""
+        del kwargs
+        action = str((matched_groups or {}).get("action", "") or "").strip().lower()
+        return await self._run_foreground_invocation(
+            stream_id,
+            lambda invocation: invocation.handle_planner_draw_command(action),
+            group_id=group_id,
+            user_id=user_id,
+            matched_groups=matched_groups,
+        )
+
+    @Command(
         "nai_manual_recall_command",
         description="手动撤回图片：/nai 撤回",
         pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+撤回(?:\s+.*)?$",
@@ -863,7 +977,7 @@ class NaiPicPlugin(MaiBotPlugin):
         # vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
         # 所以用 ``(?:\b|[一-鿿])`` 覆盖空格后置和中文后缀两种情形，避免 ``vibe存`` 被
         # 通用命令吞掉（vibe\b 在 latin→CJK 边界不成立）
-        pattern=r"^(?:.*，说：\s*)?/nai(?:\s+|(?=随机(?:自拍)?(?:\s|$)))(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        pattern=r"^(?:.*，说：\s*)?/nai(?:\s+|(?=随机(?:自拍)?(?:\s|$)))(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|planner\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,
@@ -1681,12 +1795,13 @@ class NaiPicPlugin(MaiBotPlugin):
     @Action(
         "nai_web_draw",
         description=(
+            f"{_CHAT_PARTICIPANT_IDENTITY_RULE}"
             "生成图片/照片/自拍/场景图。"
             "核心是把当前聊天情景视觉化；Bot 出镜不等于自拍，"
             "应根据语境选择自拍、第三视角、POV、远景或纯环境等合适画面。"
             "【参数填写优先级】先把语义拆到正确字段，再调用工具；每个字段只填自己的信息，"
             "禁止把一整段中文画面描述复制到 scene_delta。"
-            "action=动作/姿态，emotion=表情/情绪，framing=景别，subject_and_pov=人数与视角，"
+            "action=动作/姿态与女生当前状态，emotion=表情/情绪，framing=景别，subject_and_pov=人数与视角，"
             "scene_delta=仅稳定服装和固定环境，dynamic_scene=临时物件/倒影/天气/时间/光线。"
             "既可以响应用户明确的看图请求，也可以在 bot 自己说出视觉自指/进入情感互动节点时主动跟一张图。"
             "【调用语义 - 重要】本 Action 是 fire-and-forget 异步任务："
@@ -1702,7 +1817,12 @@ class NaiPicPlugin(MaiBotPlugin):
             # 避免一锅炖成关键词堆砌。下游会按字段顺序拼成单行 request；若 Planner
             # 兼容性原因只填了 description，则按整段兜底使用。
             "subject_and_pov": (
-                "【只填主体与视角】格式：'一女' / '一男一女' / '两女'，可加一个视角。"
+                "【先匿名化，再只填主体与视角】不得复述当前用户、发送者或群成员的身份名。"
+                "按画面实际出现的人数和性别填写：'一女' / '一男一女' / '两女'，可加一个视角。"
+                "只要当前情景明确有另一人和 Bot 同框、正在接触或对 Bot 施加动作，就必须把双方都计入，不能把另一人藏在 action 里；"
+                "例如 Bot 为女性且对方为男性时写'一男一女 第三视角'；Bot 性别沿用既有人设和当前情景，不要把示例当成固定答案。"
+                "没有实际入镜的路人、聊天中只被提到但不在画面里的人不要硬加。"
+                "聊天对象的姓名、昵称、群名片和账号显示名一律不能当作主体标签；即使画聊天对象本人，也只写'一男'、'一女'、'男生'、'女生'等人数性别。"
                 "对方观看 bot=POV；bot 明确举手机/前置相机=自拍；旁观叙事=第三视角。"
                 "不要在这里写动作、表情、服装或地点。"
                 "【主体身份】本字段需要区分三种情况："
@@ -1717,10 +1837,16 @@ class NaiPicPlugin(MaiBotPlugin):
                 "'画一张自己'/cosplay/泛指人物 → (a)。"
             ),
             "action": (
-                "【只填动作与姿态】必须用用户原话/reasoning 里的动词，禁止软化；不要写表情、情绪、"
-                "服装、地点或镜头。"
+                "【先匿名化参与者，再填动作、姿态和女生当前可见状态】"
+                "当前用户、发送者或群成员必须先改写成'男生'、'女生'、'对方'等画面角色称谓，Bot 的姓名改写成'女生'；"
+                "必须保留用户原话/reasoning 里的动词，禁止软化或改成泛泛的'互动'；"
+                "先写女生此刻处于什么状态，再写关键动作：状态包括被谁抱住、被按住、被牵着、受伤、跌倒、衣着凌乱等，"
+                "不能只写'站立'而丢掉当前情景。"
+                "多人互动时在同一字段中说清实施方、接收方和动作关系，优先用自然短句，例如'男生从身后抱住女生，女生被抱住并回头看他'；"
+                "实施方和接收方只能用'男生'、'女生'、'对方'等画面角色称谓，不得使用聊天参与者姓名或昵称，也不得输出字面量'Bot'。"
+                "不要用'他们互动'、'有人碰她'这类无法判断主被动的说法。没有第二人时不要凭空添加实施方/接收方。"
                 "如'揉胸'写'揉胸'、不要写'轻捧'；'骑'写'骑乘'、不要写'坐在身上'。"
-                "纯静态画面可写'站立'。例如：'坐着，揉腰'，不要写'坐着，揉腰，嘟嘴'。"
+                "纯静态画面可写'站立'。例如：'女生被男生按在沙发上，男生从上方压住她'，不要改写成'两人亲密互动'。"
             ),
             "emotion": (
                 "【只填表情与情绪】必须贴 reasoning 里的当前心境，不要写动作、服装、地点或镜头，"
@@ -1773,20 +1899,25 @@ class NaiPicPlugin(MaiBotPlugin):
                 "第三视角、POV、自拍只写在 subject_and_pov；不要在这里重复视角，也不要写动作、表情或场景。"
             ),
             "description": (
-                "兜底字段，正常留空。"
+                "兜底字段，正常留空；使用前仍必须先执行会话身份匿名化。"
                 "只有当本轮内容无法拆进上面 6 个字段时，才在这里写一行完整关键词串。"
-                "格式：人数 + 视角 + 动作 + 情绪 + 稳定服装/环境 + 动态场景 + 构图；禁写外貌锚点和画质词。"
+                "格式：人数 + 视角 + 动作 + 情绪 + 稳定服装/环境 + 动态场景 + 构图；"
+                "禁写聊天参与者姓名、昵称、群名片、账号显示名、外貌锚点和画质词。"
                 ),
             "size": "图片尺寸（默认从配置获取）",
         },
         # 用星号把最容易串字段的规则提升到 Planner 注意力最高的区域，并给出可直接模仿的拆分样例。
         action_require=[
+            f"*{_CHAT_PARTICIPANT_IDENTITY_RULE}*",
             "*【字段边界是硬约束，先拆分再调用】*",
-            "错误示例：action='坐着 揉腰 嘟嘴'、framing='中景 第三视角'、scene_delta='夜场后台化妆间……她揉腰……丝袜……'。",
+            "错误示例：action='坐着 揉腰 嘟嘴'、action='他们互动'、framing='中景 第三视角'、scene_delta='夜场后台化妆间……她揉腰……丝袜……'。",
             "正确示例：subject_and_pov='一女 第三视角'；action='坐着，揉腰'；emotion='羞恼，脸红，嘟嘴，疲惫'；",
             "framing='中景'；scene_delta='亮银色弹力亮片面料的高腰修身短裙，窄版剪裁，黑色细腰带，半透明黑色丝袜；"
             "后台化妆间固定镜台、整面镜子、木质抽屉柜和米白墙面'；",
             "dynamic_scene='镜中倒影，夜间暖色灯光，化妆桌上散落刷子和口红'。",
+            "*action 还要还原当前情景里的女生状态：若女生是被抱、被按、被牵、受伤或被迫做某事的一方，必须明写'女生被谁怎么了'，不要只保留对方的主动动词，也不得输出字面量'Bot'。*",
+            "*只要另一人实际入镜或与女生发生动作关系，subject_and_pov 必须按实际人数写全（如'一男一女 第三视角'），并在 action 里标出实施方与接收方；没有第二人时保持单人，不要套多人模板。*",
+            "*多人动作交给下游翻译为 source#（实施方）/target#（接收方）；只有双方都主动时才用 mutual#，不要把被动场景写成 mutual#。*",
             "*scene_delta 不得包含动作/表情/倒影/临时物件；framing 不得包含 POV/第三视角；嘟嘴必须在 emotion。*",
             "*必须由 Planner 先分别决定 outfit_change 和 environment_change（只填枚举，新内容写进 "
             "outfit_new_look / environment_new_look）；Tag LLM 不得猜测稳定区是否变化。*",
@@ -1820,28 +1951,26 @@ class NaiPicPlugin(MaiBotPlugin):
         del kwargs
 
         async def _prepare() -> tuple[bool, str]:
+            if not self.is_planner_draw_enabled(stream_id):
+                return False, "当前会话已关闭 Planner 自动生图"
+
+            resolved_group_id = str(group_id or "").strip()
+            if not resolved_group_id:
+                try:
+                    resolved_group_id = (
+                        await self._resolve_session_group_id(stream_id) or ""
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Planner Action 群聊范围解析失败: %r", exc)
             invocation = await self._create_invocation(
                 stream_id,
                 user_id=user_id,
-                group_id=group_id,
+                group_id=resolved_group_id,
                 action_data=action_data,
                 reasoning=reasoning,
                 source="action",
             )
             try:
-                try:
-                    group_allowed = await self._is_group_access_allowed(
-                        invocation.plugin_config,
-                        stream_id=stream_id,
-                        group_id=group_id or None,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("群聊访问控制解析失败，已按拒绝处理: %r", exc)
-                    group_allowed = False
-                if not group_allowed:
-                    self._close_invocation(invocation)
-                    return False, "当前会话不可使用此工具"
-
                 if not await invocation.ensure_user_not_blacklisted():
                     self._close_invocation(invocation)
                     return False, "黑名单用户"
@@ -1876,7 +2005,7 @@ class NaiPicPlugin(MaiBotPlugin):
             return True, (
                 "图片任务已提交后台，图片由插件异步发送到会话，本次 tool_result 不包含 image 内容；"
                 "请不要调用 send_image 引用本次 call_id，也不要 wait，按文字正常推进对话即可；"
-                "本轮或后续调用回复工具时，建议在 reference_info 里用一句话简述刚画的图"
+                "本轮或后续调用回复工具时，建议在 reply_reference 里用一句话简述刚画的图"
                 "（谁、穿着、在哪、做什么），让回复自然衔接图片内容"
                 + invocation.render_visual_state_for_planner()
             )

@@ -36,6 +36,7 @@ class VisualContinuityResult:
     stable: StableVisualTags
     recognized: bool = False
     failure: str = ""
+    structured: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,9 @@ _MAX_CARDS_PER_KIND = 12
 _RATING_TAGS = frozenset(
     {"rating:general", "rating:sensitive", "rating:questionable", "rating:explicit"}
 )
+_POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
+_FEMALE_IDENTITY_TAGS = frozenset({"girl", "woman", "female"})
+_GLOBAL_PERSON_TAG_RE = re.compile(r"^(?:solo|\d+girls?|\d+boys?|\d+others?|\d+boy \d+girl)$")
 
 # Planner 枚举与常见口语的整句匹配表：只在全句命中时生效，
 # 更复杂的自由文本一律降级为 auto，交给 Tag LLM 判定。
@@ -349,6 +353,115 @@ def _raw_section_mode(raw_section: Any) -> str:
     return str(raw_section.get("mode", "keep") or "keep").strip().lower()
 
 
+def _resolve_multi_prompt(
+    dynamic: dict[str, Any],
+    current_state: StableVisualTags,
+    *,
+    include_outfit: bool,
+    stable_normalized: frozenset[str],
+) -> tuple[str, dict[str, Any] | None, str]:
+    """把 v4 multi 的全局与人物 Tag 分开，固定外观只归属显式 Bot 角色。"""
+
+    if _as_tags(dynamic.get("action")) or _as_tags(dynamic.get("emotion")):
+        return "", None, "multi:unscoped_character_tags"
+    raw_people = dynamic.get("people")
+    if not isinstance(raw_people, list):
+        return "", None, "multi:people_missing"
+    if len(raw_people) < 2:
+        return "", None, "multi:people_too_few"
+
+    raw_positions = dynamic.get("positions", [])
+    if raw_positions is None:
+        raw_positions = []
+    if not isinstance(raw_positions, list):
+        return "", None, "multi:positions_invalid"
+    if raw_positions and len(raw_positions) != len(raw_people):
+        return "", None, "multi:positions_length_mismatch"
+    positions = [str(value or "").strip().upper() for value in raw_positions]
+    if any(not _POSITION_GRID_RE.fullmatch(value) for value in positions):
+        return "", None, "multi:positions_invalid"
+
+    characters: list[dict[str, str]] = []
+    bot_indices: list[int] = []
+    for index, raw_person in enumerate(raw_people):
+        if not isinstance(raw_person, dict):
+            return "", None, "multi:person_invalid"
+        role = str(raw_person.get("role", "") or "").strip().lower()
+        if role not in {"bot", "other"}:
+            return "", None, "multi:invalid_role"
+        if role == "bot":
+            bot_indices.append(index)
+
+        if not isinstance(raw_person.get("subject"), list):
+            return "", None, "multi:person_subject_missing"
+        if not isinstance(raw_person.get("action", []), list) or not isinstance(
+            raw_person.get("emotion", []), list
+        ):
+            return "", None, "multi:person_invalid"
+        person_subject = _as_tags(raw_person.get("subject"))
+        if not person_subject:
+            return "", None, "multi:person_subject_missing"
+        person_dynamic = (
+            *person_subject,
+            *_as_tags(raw_person.get("action")),
+            *_as_tags(raw_person.get("emotion")),
+        )
+        if any(
+            tag.lower() in _RATING_TAGS
+            or _GLOBAL_PERSON_TAG_RE.fullmatch(_normalize_stable_tag(tag))
+            for tag in person_dynamic
+        ):
+            return "", None, "multi:global_tag_in_person"
+
+        def _person_tags(tags: Iterable[str]) -> tuple[str, ...]:
+            return tuple(
+                tag
+                for tag in tags
+                if _normalize_stable_tag(tag) not in stable_normalized
+            )
+
+        character_prompt = _join_tags((
+            _person_tags(person_subject),
+            current_state.outfit if include_outfit and role == "bot" else (),
+            _person_tags(_as_tags(raw_person.get("action"))),
+            _person_tags(_as_tags(raw_person.get("emotion"))),
+        ))
+        characters.append({
+            "prompt": character_prompt,
+            "negative_prompt": "",
+            "position": positions[index] if positions else "",
+        })
+
+    if include_outfit and not bot_indices:
+        return "", None, "multi:bot_missing"
+    if len(bot_indices) > 1:
+        return "", None, "multi:bot_ambiguous"
+    if bot_indices:
+        bot_subject = _as_tags(raw_people[bot_indices[0]].get("subject"))
+        if _normalize_stable_tag(bot_subject[0]) not in _FEMALE_IDENTITY_TAGS:
+            return "", None, "multi:bot_not_female"
+
+    global_text = _join_tags((
+        _as_tags(dynamic.get("subject")),
+        current_state.environment,
+        _as_tags(dynamic.get("scene")),
+        _as_tags(dynamic.get("framing")),
+    ))
+    lines = [f"{global_text},"]
+    lines.extend(
+        f"char{index}:{character['prompt']},"
+        for index, character in enumerate(characters, start=1)
+    )
+    structured: dict[str, Any] = {
+        "global_text": global_text,
+        "characters": characters,
+        "has_coords": bool(positions),
+    }
+    if bot_indices:
+        structured["bot_character_index"] = bot_indices[0]
+    return "\n".join(lines), structured, ""
+
+
 def render_visual_continuity_context(
     stable: StableVisualTags | None,
     *,
@@ -423,6 +536,11 @@ def resolve_visual_continuity(
         return VisualContinuityResult("", previous_state, failure="not_json")
     if payload.get("version") != 4:
         return VisualContinuityResult("", previous_state, failure="wrong_version")
+    output_format = str(payload.get("format", "single") or "single").strip().lower()
+    if output_format not in {"single", "multi"}:
+        return VisualContinuityResult(
+            "", previous_state, recognized=True, failure="invalid_format"
+        )
 
     dynamic = payload.get("dynamic")
     stable = payload.get("stable")
@@ -513,6 +631,24 @@ def resolve_visual_continuity(
             if _normalize_stable_tag(tag) not in stable_normalized
         )
 
+    if output_format == "multi":
+        prompt, structured, failure = _resolve_multi_prompt(
+            dynamic,
+            current_state,
+            include_outfit=include_outfit,
+            stable_normalized=stable_normalized,
+        )
+        if failure:
+            return VisualContinuityResult(
+                "", previous_state, recognized=True, failure=failure
+            )
+        return VisualContinuityResult(
+            prompt,
+            current_state,
+            recognized=True,
+            structured=structured,
+        )
+
     prompt = _join_tags(
         (
             _dynamic_tags(dynamic.get("subject")),
@@ -532,12 +668,28 @@ def resolve_visual_continuity(
 _TOP_FAILURE_HINTS = {
     "not_json": "响应不是可解析的 JSON，必须只输出一行 version=4 JSON，不要任何解释或前后缀。",
     "wrong_version": "JSON 的 version 字段必须是数字 4。",
+    "invalid_format": "format 只能是 single 或 multi；画面有两个以上人物时必须使用 multi。",
     "missing_sections": "JSON 缺少 dynamic 或 stable 对象，两者都必须是对象。",
     "missing_rating_subject": "dynamic.subject 的第一个元素必须是唯一的 rating:* tag。",
     "stable_change_ignored": (
         "Planner 已声明稳定区发生变化，stable.outfit / stable.environment 不能都用 keep；"
         "请为发生变化的稳定区输出 replace（或库中已有同款时 switch）。"
     ),
+}
+
+_MULTI_FAILURE_HINTS = {
+    "people_missing": "multi 必须提供 dynamic.people 人物对象数组。",
+    "people_too_few": "multi 的 dynamic.people 至少需要两个独立人物对象。",
+    "person_invalid": "dynamic.people 每项必须是含 role/subject/action/emotion 的对象和 Tag 数组。",
+    "invalid_role": "每个人物 role 只能是 bot 或 other，且 Bot 女生必须明确标为 bot。",
+    "bot_missing": "Bot 出镜的 multi 必须恰有一个 role=bot 的女生人物段。",
+    "bot_ambiguous": "multi 只能有一个 role=bot，不能把多个人物都标为 Bot。",
+    "bot_not_female": "role=bot 的人物 subject 第一个身份 Tag 必须是 girl、woman 或 female。",
+    "person_subject_missing": "每个人物必须提供非空 subject，首项写 girl/boy/woman/man 等身份 Tag。",
+    "global_tag_in_person": "rating 和总人数 Tag 只能放 dynamic.subject，不能放进人物段。",
+    "unscoped_character_tags": "multi 的顶层 action/emotion 必须为空，动作和情绪分别写入对应人物段。",
+    "positions_invalid": "positions 只能为空数组或与人物对应的 A1-E5 坐标数组。",
+    "positions_length_mismatch": "非空 positions 必须与 dynamic.people 等长。",
 }
 
 _SECTION_FAILURE_HINTS = {
@@ -578,6 +730,8 @@ def describe_visual_failure(failure: str) -> str:
     if hint:
         return hint
     kind, _, code = failure.partition(":")
+    if kind == "multi" and code in _MULTI_FAILURE_HINTS:
+        return _MULTI_FAILURE_HINTS[code]
     label = _SECTION_LABELS.get(kind)
     template = _SECTION_FAILURE_HINTS.get(code)
     if label and template:

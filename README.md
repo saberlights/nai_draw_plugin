@@ -104,6 +104,7 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai art [编号]` | 查看/切换画师风格预设 |
 | `/nai models` | 拉取 NewAPI 网关实时可用模型清单 |
 | `/nai nsfw [on/off]` | 查看 / 切换 NSFW 过滤（会话级，切换仅管理员） |
+| `/nai planner [on/off]` | 查看 / 切换当前会话 Planner 生图（仅管理员，默认开启；关闭后 Planner 不再看到 `nai_web_draw`） |
 | `/nai pt on/off` | 切换提示词显示 |
 | `/nai tag on/off` | 开关 Danbooru 检索结果回显 |
 | `/nai on/off` | 切换自动撤回（仅管理员） |
@@ -112,7 +113,7 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai ban <用户ID>` / `/nai unban <用户ID>` / `/nai banlist` | 管理黑名单（仅管理员） |
 | `/nai help` | 帮助 |
 
-`set` / `size` / `nsfw` 都是**会话级**且**运行时临时**，重启后回退到配置默认值。
+`set` / `size` / `nsfw` / `planner` 都是**会话级**且**运行时临时**；`planner` 重启后默认开启，其余项回退到配置默认值。
 
 **i2i** 走「引用回复一张图」链路（或同条消息附图）；插件按「命令携图 → 引用回引 → 流内最近图」优先级解析。
 
@@ -120,13 +121,19 @@ default_model = "nai-diffusion-4-5-full"
 `/nai vibe选 <名字1> [<名字2>...]` 设定本会话默认图（vibe 最多 4 张、ref 最多 1 张），
 之后 `/nai vibe <描述>` 直接用默认图；也可以 `/nai vibe @<名字1> [@<名字2>...] <描述>`
 单次指定。群聊按 `group_id` 共享群图库且群间隔离，私聊按 `user_id` 隔离；每个归属的单库
-默认上限为 20 张。物理图片分别落在
-`data/named_refs/(groups|users)/<sha256>/(vibe|ref)/<名字>.<ext>`，
-可以用文件管理器直接看；选定状态落在 `data/named_refs/selection.json`，跨重启保留。
+默认上限为 20 张。所有持久化数据统一落在 MaiBot 根目录下的
+`data/plugins/saberlights.nai-draw-plugin/`（宿主为插件分配的统一持久化目录，
+旧版 `plugins/nai_draw_plugin/data/` 的存量数据首次加载时自动整体迁移过去）。物理图片分别落在
+`data/plugins/saberlights.nai-draw-plugin/named_refs/(groups|users)/<sha256>/(vibe|ref)/<名字>.<ext>`，
+可以用文件管理器直接看；选定状态落在同目录 `named_refs/selection.json`，跨重启保留。
 
-`vibe` 的 `cache_id` 缓存落在 `data/vibe_cache.db`，同图同 info_extracted 重发会改写
+`vibe` 的 `cache_id` 缓存落在统一持久化目录的 `vibe_cache.db`，同图同 info_extracted 重发会改写
 为 cache_id 复用态省图片编码 + 全量命中省 1 anlas 流量附加费；服务端 cache_id 被淘汰
 （§20.3.1 400）时自动清掉本地 stale 条目并提示用户重试。
+
+群聊访问黑/白名单会禁止受限群中的普通 `/nai` 业务命令；`/nai planner [on/off]`
+是唯一控制面例外，因此插件管理员仍可在黑名单群中关闭或重新开启 Planner 生图。
+该命令仍要求发送者明确列在 `admin.admin_users` 中。
 
 ## 配置
 
@@ -231,12 +238,12 @@ related_limit = 20
 show_nsfw = true
 popularity_weight = 0.15
 
-# local（需要先构建 data/danbooru_tags.json + 配置 embedding 模型）
+# local（需要先构建统一持久化目录下的 danbooru_tags.json + 配置 embedding 模型）
 top_k = 50
 min_score = 0.6
 ```
 
-`local` 模式首次使用：`python core/utils/tag_data_builder.py` 构建 tag 数据 + `model_config.toml` 配 embedding 模型（如 `bge-m3`），首次会全量 embed 5481 个 tag。
+`local` 模式首次使用：在插件根目录执行 `python -m core.utils.tag_data_builder` 构建 tag 数据 + `model_config.toml` 配 embedding 模型（如 `bge-m3`），首次会全量 embed 5481 个 tag。
 
 ### 图片反推
 
@@ -383,6 +390,11 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v1.12.0 (2026-07-31)
+- **持久化数据迁往宿主统一目录**：全部落盘数据（named_refs 图库、vibe_cache.db、visual_continuity.json、nsfw_state.json、user_blacklist.json、danbooru_tags.json 与 embedding 缓存）从插件源码目录 `plugins/nai_draw_plugin/data/` 迁移到宿主分配的 `data/plugins/saberlights.nai-draw-plugin/`；首次加载时自动整体搬迁存量数据并移除旧目录，宿主的"旧式数据目录"启动警告随之消失。若统一目录已有同名条目则不覆盖、保留原位并在日志指名，留待人工处置
+- 新增 `core/data_paths.py` 作为所有 store 默认路径的唯一来源，`on_load` 时与运行时授予的 `ctx.paths.data_dir` 对账，目录布局漂移会在日志里报错暴露
+- `tag_data_builder` 改为 `python -m core.utils.tag_data_builder` 方式运行（输出路径跟随统一持久化目录）
 
 ### v1.11.0 (2026-07-30)
 - **Bot 情景图视觉连续性（服装/场景固定与切换）整体落地**：Tag LLM 输出 v4 分区 JSON（dynamic 动态区 + stable 稳定区），服装与环境稳定 Tag 由程序逐字复用与合成，杜绝 LLM 每轮重译导致的服装/场景漂移；replace 建立的每套服装/环境进入卡片库（各 12 张，LRU 保护当前在用的卡），可随时 switch 逐字切回

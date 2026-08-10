@@ -71,6 +71,7 @@ class PromptGenerationWorkflow:
         send_text: TextSender,
         show_tag_candidates: bool,
         log_prefix: str,
+        force_sfw: bool = False,
     ) -> None:
         self._config = config
         self._stream_id = stream_id
@@ -78,6 +79,7 @@ class PromptGenerationWorkflow:
         self._send_text = send_text
         self._show_tag_candidates = show_tag_candidates
         self._log_prefix = log_prefix
+        self._force_sfw = bool(force_sfw)
 
     async def generate(
         self,
@@ -101,7 +103,7 @@ class PromptGenerationWorkflow:
         output_format = str(
             generator_config.get("output_format", "json") or "json"
         ).strip().lower()
-        nsfw_filter_enabled = session_state.is_nsfw_filter_enabled(
+        nsfw_filter_enabled = self._force_sfw or session_state.is_nsfw_filter_enabled(
             "stream",
             self._stream_id,
             self._get_config,
@@ -262,7 +264,7 @@ class PromptGenerationWorkflow:
             return None
 
         structured_payload = (
-            None
+            continuity_result.structured
             if continuity_result is not None
             else resolve_multi_character_payload(response, cleaned_prompt)
         )

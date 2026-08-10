@@ -140,6 +140,22 @@ def test_tag_show_command_pattern_matches_plain_invocation() -> None:
         assert match.group("action") == expected_action
 
 
+def test_planner_draw_switch_pattern_is_not_consumed_by_generic_draw() -> None:
+    patterns = _load_command_patterns()
+    planner_switch = _compile(patterns["nai_planner_draw_control_command"])
+    generic_draw = _compile(patterns["nai_draw"])
+
+    for sample, expected_action in [
+        ("/nai planner", None),
+        ("/nai planner on", "on"),
+        ("/nai planner off", "off"),
+    ]:
+        match = planner_switch.match(sample)
+        assert match is not None
+        assert match.group("action") == expected_action
+        assert generic_draw.match(sample) is None
+
+
 # ── 命名图库子命令 pattern ───────────────────────────────────────────────
 
 

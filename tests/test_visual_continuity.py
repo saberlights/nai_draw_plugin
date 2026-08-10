@@ -46,6 +46,73 @@ def test_keep_reuses_exact_stable_tags_while_dynamic_tags_change() -> None:
     assert "wooden shelves" not in result.prompt
 
 
+def test_multi_keeps_bot_girl_and_boy_in_separate_character_prompts() -> None:
+    previous = StableVisualTags(
+        outfit=("white blouse", "navy pleated skirt"),
+        environment=("hotel room", "warm bedside lamp"),
+    )
+    response = json.dumps({
+        "version": 4,
+        "format": "multi",
+        "intent": "normal",
+        "dynamic": {
+            "subject": ["rating:sensitive", "1boy 1girl"],
+            "action": [],
+            "emotion": [],
+            "scene": ["quiet atmosphere"],
+            "framing": ["close-up"],
+            "people": [
+                {
+                    "role": "bot",
+                    "subject": ["girl"],
+                    "action": ["target#kissed", "clutching clothes"],
+                    "emotion": ["closed eyes", "blush", "shy"],
+                },
+                {
+                    "role": "other",
+                    "subject": ["boy"],
+                    "action": ["source#kissing"],
+                    "emotion": [],
+                },
+            ],
+            "positions": ["D3", "B3"],
+        },
+        "stable": {
+            "outfit": {"mode": "keep", "key": "", "tags": []},
+            "environment": {"mode": "keep", "key": "", "tags": []},
+        },
+    })
+
+    result = resolve_visual_continuity(response, previous=previous)
+
+    assert result.failure == ""
+    assert result.structured is not None
+    assert result.structured["global_text"] == (
+        "rating:sensitive, 1boy 1girl, hotel room, warm bedside lamp, "
+        "quiet atmosphere, close-up"
+    )
+    assert result.structured["bot_character_index"] == 0
+    assert result.structured["has_coords"] is True
+    characters = result.structured["characters"]
+    assert characters == [
+        {
+            "prompt": (
+                "girl, white blouse, navy pleated skirt, target#kissed, "
+                "clutching clothes, closed eyes, blush, shy"
+            ),
+            "negative_prompt": "",
+            "position": "D3",
+        },
+        {
+            "prompt": "boy, source#kissing",
+            "negative_prompt": "",
+            "position": "B3",
+        },
+    ]
+    assert "white blouse" not in characters[1]["prompt"]
+    assert "target#kissed" not in characters[1]["prompt"]
+
+
 def test_replace_creates_new_stable_outfit_and_environment_tags() -> None:
     response = (
         '{"version":4,"format":"single","intent":"portrait",'
