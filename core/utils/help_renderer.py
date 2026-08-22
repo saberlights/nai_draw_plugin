@@ -126,7 +126,7 @@ HELP_DOC: HelpDoc = HelpDoc(
             ),
             hint=(
                 "模型代号：3=V3, f3=Furry V3, 4c=V4 Curated, 4=V4 Full, "
-                "4.5c=V4.5 Curated, 4.5=V4.5 Full。会话级，重启回落默认。"
+                "4.5c=V4.5 Curated, 4.5=V4.5 Full, 5=V5 Full。会话级，重启回落默认。"
             ),
         ),
         HelpSection(

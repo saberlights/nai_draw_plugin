@@ -258,6 +258,8 @@ class SessionStateManager:
         """根据模型名解析画师串配置节。"""
         if "nai-diffusion-3" in model_name:
             return "model_nai3"
+        if "nai-diffusion-5" in model_name:
+            return "model_nai4_5"
         if "nai-diffusion-4-5" in model_name:
             return "model_nai4_5"
         if "nai-diffusion-4" in model_name:

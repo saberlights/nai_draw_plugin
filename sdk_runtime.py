@@ -2330,6 +2330,7 @@ class NaiInvocation(ModelConfigMixin):
             "4": "nai-diffusion-4-full",
             "4.5c": "nai-diffusion-4-5-curated",
             "4.5": "nai-diffusion-4-5-full",
+            "5": "nai-diffusion-5-full",
         }
         size_mappings = {
             "竖": "832x1216",
@@ -2411,12 +2412,13 @@ class NaiInvocation(ModelConfigMixin):
                     "4c - nai-diffusion-4-curated\n"
                     "4 - nai-diffusion-4-full\n"
                     "4.5c - nai-diffusion-4-5-curated\n"
-                    "4.5 - nai-diffusion-4-5-full"
+                    "4.5 - nai-diffusion-4-5-full\n"
+                    "5 - nai-diffusion-5-full"
                 )
                 return True, "显示模型列表", True
 
             if param not in model_mappings:
-                await self.send_text("❌ 无效的模型代号，可用值：3 / f3 / 4c / 4 / 4.5c / 4.5")
+                await self.send_text("❌ 无效的模型代号，可用值：3 / f3 / 4c / 4 / 4.5c / 4.5 / 5")
                 return False, "无效的模型代号", True
 
             model_name = model_mappings[param]
@@ -2431,6 +2433,8 @@ class NaiInvocation(ModelConfigMixin):
             )
             if "nai-diffusion-3" in current_model:
                 config_section = "model_nai3"
+            elif "nai-diffusion-5" in current_model:
+                config_section = "model_nai4_5"
             elif "nai-diffusion-4-5" in current_model:
                 config_section = "model_nai4_5"
             elif "nai-diffusion-4" in current_model:

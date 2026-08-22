@@ -774,6 +774,7 @@ class PluginConfigDefinition:
                     "nai-diffusion-4-full",
                     "nai-diffusion-4-5-curated",
                     "nai-diffusion-4-5-full",
+                    "nai-diffusion-5-full",
                 ],
                 description="可用模型列表；填字符串数组，每项需与服务方 /v1/models 返回的 id 一致，供 /nai set 切换"
             ),

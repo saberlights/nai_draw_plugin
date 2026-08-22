@@ -141,6 +141,9 @@ class ModelConfigMixin:
         if "nai-diffusion-3" in model_name:
             config_section = "model_nai3"
             logger.debug(f"{self._log_prefix} 检测到 NAI V3 模型，使用 {config_section} 配置")
+        elif "nai-diffusion-5" in model_name:
+            config_section = "model_nai4_5"
+            logger.debug(f"{self._log_prefix} 检测到 NAI V5 模型，复用 {config_section} 配置")
         elif "nai-diffusion-4-5" in model_name:
             config_section = "model_nai4_5"
             logger.debug(f"{self._log_prefix} 检测到 NAI V4.5 模型，使用 {config_section} 配置")
