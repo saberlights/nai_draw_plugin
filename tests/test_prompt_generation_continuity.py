@@ -84,9 +84,9 @@ def test_visual_continuity_workflow_preserves_multi_character_payload() -> None:
         '"action":[],"emotion":[],"scene":["hotel room"],'
         '"framing":["close-up"],"people":['
         '{"role":"bot","subject":["girl"],'
-        '"action":["target#kissed"],"emotion":["blush"]},'
+        '"action":["target#kiss"],"emotion":["blush"]},'
         '{"role":"other","subject":["boy"],'
-        '"action":["source#kissing"],"emotion":[]}],"positions":[]},'
+        '"action":["source#kiss"],"emotion":[]}],"positions":[]},'
         '"stable":{"outfit":{"mode":"replace","key":"white_blouse_set",'
         '"tags":["white blouse","navy pleated skirt"]},'
         '"environment":{"mode":"keep","key":"","tags":[]}}}'
@@ -178,6 +178,53 @@ def test_workflow_reuses_cached_stable_tags_and_only_accepts_new_dynamic_tags() 
     assert "<visual_continuity_context>" in generator.prompts[0]
     assert "navy ribbed cardigan" in generator.prompts[0]
     assert "old pose" not in generator.prompts[0]
+
+
+def test_workflow_exposes_effects_and_last_camera_to_next_generation() -> None:
+    stream_id = "visual-effects-context-test"
+    previous = StableVisualTags(
+        outfit=("white blouse",),
+        environment=("entryway",),
+        effects=("wet hair",),
+        scene_effects=("folded umbrella by door",),
+        last_framing=("medium shot", "from front"),
+    )
+    response = (
+        '{"version":4,"format":"single","intent":"portrait",'
+        '"dynamic":{"subject":["rating:sensitive","solo","1girl"],'
+        '"action":["removing shoes"],"emotion":[],"scene":[],'
+        '"framing":["full body","from side"]},'
+        '"stable":{"outfit":{"mode":"keep","tags":[]},'
+        '"environment":{"mode":"keep","tags":[]},'
+        '"effects":{"mode":"keep","subject":[],"scene":[]}}}'
+    )
+    generator = _FakeTextGenerator(response)
+    workflow = PromptGenerationWorkflow(
+        config={"prompt_generator": {"output_format": "json"}, "tag_retriever": {}},
+        stream_id=stream_id,
+        text_generator=generator,
+        send_text=_ignore_text,
+        show_tag_candidates=False,
+        log_prefix="test",
+    )
+    session_state.clear_transient_generation_state(stream_id)
+    session_state.set_visual_continuity(stream_id, previous)
+
+    try:
+        result = asyncio.run(workflow.generate(
+            "女生回到门厅脱鞋",
+            allow_inherit=True,
+            use_visual_continuity=True,
+        ))
+    finally:
+        session_state.clear_transient_generation_state(stream_id)
+
+    assert result is not None
+    assert "当前跨图临时效果：wet hair" in generator.prompts[0]
+    assert "当前场景附着效果：folded umbrella by door" in generator.prompts[0]
+    assert "上一张实际镜头：medium shot, from front" in generator.prompts[0]
+    assert result.visual_continuity is not None
+    assert result.visual_continuity.last_framing == ("full body", "from side")
     assert "保留其余标签" not in generator.prompts[0]
     assert "blue sweater" not in result.text
 

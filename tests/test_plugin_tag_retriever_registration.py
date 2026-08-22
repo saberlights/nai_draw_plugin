@@ -99,6 +99,7 @@ from plugins.nai_draw_plugin.core.services.background_task_supervisor import (
 from plugins.nai_draw_plugin.core.services.generation_admission_policy import (
     AdmissionDecision,
 )
+from plugins.nai_draw_plugin.core.services.visual_continuity import StableVisualTags
 from plugins.nai_draw_plugin.plugin import NaiPicPlugin
 
 
@@ -1014,7 +1015,57 @@ def test_private_planner_does_not_receive_group_draw_policy(
         )
     )
 
-    assert result == {"action": "continue"}
+    assert result["action"] == "continue"
+    updated_definitions = result["modified_kwargs"]["tool_definitions"]
+    assert len(updated_definitions) == 1
+    description = updated_definitions[0]["function"]["description"]
+    assert "单帧视觉导演协议" in description
+    assert "action 必须写成关系行" in description
+    assert "`A → B：动作`（有向互动）" in description
+    assert "禁止'被'字句和'他/她'代词" in description
+    assert "自身动作只能用 `A：动作`" in description
+    assert "同一物理地点仅发生昼夜、天气或光线变化" in description
+    assert "framing 只能填一个景别或构图" in description
+    assert "刚睡醒造成的蓬松乱发" in description
+    assert "特写看不见睡衣时 outfit_change 仍为 unchanged" in description
+    assert "emotion 可以留空" in description
+    assert "自拍表示女生本人持手机/相机" in description
+    assert "乳交就写乳交、口交就写口交、足交就写足交" in description
+    assert "脱下一件或多件衣物也必须 outfit_change=replace" in description
+    assert "当前仍穿着的完整集合" in description
+    assert "全部衣物都已脱下时才 clear" in description
+    assert "群聊专属出图规则" not in description
+
+
+def test_planner_receives_committed_effects_and_last_camera(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin._session_group_ids = {"private-visual-state": ""}
+    stable = StableVisualTags(
+        effects=("wet hair", "tear streaks"),
+        scene_effects=("coat on chair",),
+        last_framing=("medium shot", "from front"),
+    )
+    monkeypatch.setattr(
+        plugin_module.session_state,
+        "get_visual_continuity",
+        lambda *_args, **_kwargs: stable,
+    )
+
+    result = asyncio.run(plugin.handle_planner_before_request(
+        session_id="private-visual-state",
+        tool_definitions=[{
+            "type": "function",
+            "function": {"name": "nai_web_draw", "description": "生成图片。"},
+        }],
+    ))
+
+    description = result["modified_kwargs"]["tool_definitions"][0]["function"]["description"]
+    assert "当前跨图临时效果：wet hair, tear streaks" in description
+    assert "当前场景附着效果：coat on chair" in description
+    assert "上一张实际镜头：medium shot, from front" in description
+    assert description.count(plugin_module._PLANNER_VISUAL_STATE_MARKER) == 1
 
 
 def test_group_scope_can_be_resolved_from_all_platform_chat_streams() -> None:
@@ -1184,6 +1235,41 @@ def test_action_guard_allows_direct_invocation_in_restricted_group(
     assert list(plugin._active_invocations) == []
 
 
+def test_private_action_scope_is_passed_to_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugin = object.__new__(NaiPicPlugin)
+    plugin.ctx = types.SimpleNamespace(send=_DummySend())
+    plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
+    plugin._active_invocations = WeakSet()
+    plugin._session_group_ids = {"private-action-stream": ""}
+    invocation = _DummyInvocation()
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_create_invocation(*_args: Any, **kwargs: Any) -> _DummyInvocation:
+        captured_kwargs.update(kwargs)
+        plugin._active_invocations.add(invocation)
+        return invocation
+
+    async def handle_action() -> tuple[bool, str]:
+        return True, "sent"
+
+    invocation.handle_action = handle_action
+    monkeypatch.setattr(plugin, "_create_invocation", fake_create_invocation)
+
+    async def scenario() -> tuple[bool, str]:
+        result = await plugin.handle_nai_web_draw(stream_id="private-action-stream")
+        await asyncio.sleep(0)
+        await plugin._background_tasks.shutdown()
+        return result
+
+    result = asyncio.run(scenario())
+
+    assert result[0] is True
+    assert captured_kwargs["group_id"] == ""
+    assert captured_kwargs["private_chat"] is True
+
+
 def test_planner_draw_switch_off_rejects_direct_action_before_creating_invocation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1201,3 +1287,59 @@ def test_planner_draw_switch_off_rejects_direct_action_before_creating_invocatio
     )
 
     assert result == (False, "当前会话已关闭 Planner 自动生图")
+
+
+def _nai_web_draw_action_parameters() -> dict[str, str]:
+    """从源码里取 action_parameters 字面量，避开 SDK 装饰器的运行期依赖。"""
+
+    source = (Path(__file__).resolve().parents[1] / "plugin.py").read_text(encoding="utf-8")
+    start = source.index("{", source.index("action_parameters={"))
+    depth = 0
+    for index in range(start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return eval(source[start:index + 1])  # noqa: S307 - 纯字面量
+    raise AssertionError("未找到 action_parameters 字面量")
+
+
+def test_action_field_demands_relation_lines_instead_of_prose() -> None:
+    """Planner 的 action 必须产出显式关系行，翻译 LLM 才不需要还原被动语态。"""
+
+    action = _nai_web_draw_action_parameters()["action"]
+
+    assert "必须写成关系行" in action
+    assert "`A → B：动作`" in action
+    assert "`A ↔ B：动作`" in action
+    assert "`A：动作`" in action
+    # 代词与被字句是方向翻转的直接来源，必须显式禁止
+    assert "禁止使用'被'字句" in action
+    assert "主语永远是施动方" in action
+    assert "禁止使用'他/她/他的/她的'等代词" in action
+    # 自身动作写成箭头句会被下游翻成 source#，绑到另一个角色身上
+    assert "自身动作必须用 `A：动作` 句型" in action
+    assert "箭头句只用于真的作用到另一个人身上的动作" in action
+
+
+def test_action_field_examples_obey_their_own_rules() -> None:
+    """示例本身不能出现被字句或代词，否则等于教 Planner 违规。"""
+
+    action = _nai_web_draw_action_parameters()["action"]
+    examples = action[action.index("正确示例："):action.index("错误示例：")]
+
+    assert "被" not in examples
+    for pronoun in ("他的", "她的"):
+        assert pronoun not in examples
+    assert "`男生 → 女生：从身后抱住`" in examples
+
+
+def test_emotion_field_caps_competing_expressions() -> None:
+    """一张脸放不下 5 个互相竞争的情绪，堆叠会把表情糊掉。"""
+
+    emotion = _nai_web_draw_action_parameters()["emotion"]
+
+    assert "最多写 3 个词" in emotion
+    assert "必须能同时出现在同一张脸上" in emotion
+    assert "只保留本帧最主导的那一个" in emotion

@@ -210,6 +210,43 @@ def test_action_cooldowns_use_their_own_intervals() -> None:
     assert proactive.should_generate is False
 
 
+def test_private_chat_skips_time_cooldown_after_success() -> None:
+    policy, _state, _clock = _build_policy()
+    policy.record_success(stream_id="private-stream")
+
+    explicit = policy.evaluate_action(
+        stream_id="private-stream",
+        config=_config(explicit_interval=300, proactive_interval=600),
+        user_text="再来一张自拍",
+        private_chat=True,
+    )
+    proactive = policy.evaluate_action(
+        stream_id="private-stream",
+        config=_config(explicit_interval=300, proactive_interval=600),
+        user_text="今天天气真不错",
+        private_chat=True,
+    )
+
+    assert explicit.should_generate is True
+    assert proactive.should_generate is True
+    assert explicit.detail == "私聊不受图片频率节流限制"
+
+
+def test_private_chat_still_blocks_explicit_negative_intent() -> None:
+    policy, _state, _clock = _build_policy()
+    policy.record_success(stream_id="private-stream")
+
+    decision = policy.evaluate_action(
+        stream_id="private-stream",
+        config=_config(explicit_interval=300, proactive_interval=600),
+        user_text="别画了",
+        private_chat=True,
+    )
+
+    assert decision.should_generate is False
+    assert decision.category == "blocked"
+
+
 def test_zero_intervals_allow_immediate_generation() -> None:
     policy, _state, _clock = _build_policy()
     config = _config(explicit_interval=0, proactive_interval=0)

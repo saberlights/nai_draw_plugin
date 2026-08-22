@@ -47,6 +47,43 @@ _CHAT_PARTICIPANT_IDENTITY_RULE = (
     "错误：'<聊天昵称>坐在<Bot名字>身边'；正确：'男生坐在女生身边'。"
     "只有与聊天身份无关、且本轮明确点名的作品角色名等有效视觉锚点可以保留。"
 )
+_VISUAL_DIRECTOR_POLICY_MARKER = "<nai_visual_director_policy>"
+_PLANNER_VISUAL_STATE_MARKER = "<nai_planner_visual_state>"
+_VISUAL_DIRECTOR_POLICY = (
+    f"\n\n{_VISUAL_DIRECTOR_POLICY_MARKER}\n"
+    "【单帧视觉导演协议】调用 nai_web_draw 前，先从当前剧情和 Planner reasoning 中选定一个"
+    "可以被相机定格的静态瞬间，不要把整段剧情压成关键词。用 visual_plan 写三项："
+    "moment=这一帧正在发生的事实；must_show=证明情景成立且必须可见的 2~4 个画面证据；"
+    "exclude=因镜头、遮挡、背面或画面范围而不可见，或不属于这一帧的内容。"
+    "must_show 只写能落到画面里的事实，exclude 不能用来偷偷改变剧情；没有明确证据时宁可留空，"
+    "不要凭空增加人物、动作或道具。visual_plan 是给下游提示词 LLM 的导演笔记，不是英文 tag，"
+    "不得复制到 action、scene_delta 或最终提示词。moment 只能写镜头按下时正在发生的一帧，"
+    "禁止写成'醒来→看到消息→拍照→发送'之类的前因后果或连续流程。画面必须是一个静态截面：一个主体动作、"
+    "当下表情和一个主要互动关系；先检查人数、施动方/接收方、镜头可见范围和肢体是否物理可行，"
+    "再提交 Action。每个字段必须是短语或短句，不能把完整画面描述塞进 action："
+    "action 必须写成关系行，每行一条关系，只允许 `A → B：动作`（有向互动）、`A ↔ B：动作`（双向互动）、"
+    "`A：动作`（自身动作）三种句型；A、B 只用'女生'、'男生'、'对方'等画面角色称谓。"
+    "禁止'被'字句和'他/她'代词：'女生被男生抱住'必须写成 `男生 → 女生：抱住`，主语永远是施动方。"
+    "自身动作只能用 `A：动作`，绝不能写成箭头句——自己揉胸写 `女生：揉自己的胸`，"
+    "因为下游会把箭头句翻译成 NAI 的 source#/target# 角色绑定，自身动作一旦写成箭头句就会被绑到另一个人身上，"
+    "画出'对方在做'或方向互换的错图。服装写入 outfit_new_look，表情写入 emotion，"
+    "时间/天气/光线/临时物件写入 dynamic_scene。同一物理地点仅发生昼夜、天气或光线变化时，"
+    "environment_change 必须为 unchanged，不得 switch/replace，也不得填写 environment_new_look。"
+    "framing 只能填一个景别或构图；自拍/POV/第三视角只能放 subject_and_pov。"
+    "镜头裁切或 exclude 只表示本帧看不见，不表示事实已经解除：特写看不见睡衣时 outfit_change 仍为 unchanged。"
+    "脱下一件或多件衣物也必须 outfit_change=replace，无论是本人主动脱下还是被他人脱下；"
+    "outfit_new_look 写当前仍穿着的完整集合；全部衣物都已脱下时才 clear，且此时不能还有任何穿着物。"
+    "脱下后留在床、椅或地面的衣物写入 effect_new_state 的场景附着物。衣物仍在身上、只是掀起/拉开/局部移位时不算脱下，"
+    "服装保持 unchanged，持续的穿着状态用 effect_change 管理。若 framing/exclude 看不见脸和上身，emotion 可以留空，"
+    "不要把'宠溺'、'幸福'等不可见心理直接翻译成表情 tag；只保留脚趾、手势、姿态等可见身体反馈。"
+    "自拍表示女生本人持手机/相机或面对镜子自拍；POV 表示镜头是观看者或另一人的视线；第三视角表示画外相机。"
+    "仅写'对着镜头'不足以判定自拍，必须按实际拍摄方式选择。"
+    "私聊成人向情景已明确建立具体性行为时必须使用行为原名：乳交就写乳交、口交就写口交、足交就写足交，"
+    "写成 `女生 → 男生：用胸部乳交` 这样的关系行，说清用哪个身体部位；不得软化成'亲密互动''取悦''贴近'。"
+    "不得凭空新增情景没有建立的性行为。"
+    "刚睡醒造成的蓬松乱发、泪痕、湿发等若下一张仍会存在，使用 effect_change 管理。\n"
+    f"</nai_visual_director_policy>"
+)
 
 
 def _build_group_draw_policy(admin_user_ids: list[str]) -> str:
@@ -71,11 +108,32 @@ def _build_group_draw_policy(admin_user_ids: list[str]) -> str:
     )
 
 
+def _build_planner_visual_state(stable: Any) -> str:
+    if stable is None:
+        return ""
+    effects = ", ".join(stable.effects) or "无"
+    scene_effects = ", ".join(stable.scene_effects) or "无"
+    last_framing = ", ".join(stable.last_framing) or "无"
+    return (
+        f"\n\n{_PLANNER_VISUAL_STATE_MARKER}\n"
+        "【已提交的视觉状态，只用于本轮决策】\n"
+        f"- 当前跨图临时效果：{effects}\n"
+        f"- 当前场景附着效果：{scene_effects}\n"
+        f"- 上一张实际镜头：{last_framing}\n"
+        "临时效果仍成立则 effect_change=unchanged；首次出现或有增减则 replace，并在 "
+        "effect_new_state 写人物效果和场景附着物的当前完整状态；已全部解除则 clear。"
+        "用户和情景未指定镜头、且不损失 visual_plan.must_show 时，可选择不同但合适的景别或朝向；"
+        "明确要求同镜头时保持，不得为了变化牺牲剧情证据。\n"
+        f"</nai_planner_visual_state>"
+    )
+
+
 def _append_tool_description(
     tool_definitions: list[dict[str, Any]],
     *,
     tool_name: str,
     suffix: str,
+    marker: str = _GROUP_DRAW_POLICY_MARKER,
 ) -> list[dict[str, Any]]:
     updated_definitions: list[dict[str, Any]] = []
     for definition in tool_definitions:
@@ -88,12 +146,12 @@ def _append_tool_description(
         if isinstance(function, dict):
             updated_function = dict(function)
             description = str(updated_function.get("description", "") or "")
-            if _GROUP_DRAW_POLICY_MARKER not in description:
+            if marker not in description:
                 updated_function["description"] = description + suffix
             updated_definition["function"] = updated_function
         else:
             description = str(updated_definition.get("description", "") or "")
-            if _GROUP_DRAW_POLICY_MARKER not in description:
+            if marker not in description:
                 updated_definition["description"] = description + suffix
         updated_definitions.append(updated_definition)
     return updated_definitions
@@ -446,7 +504,7 @@ class NaiPicPlugin(MaiBotPlugin):
         tool_definitions: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Keep the Action visible and add group-only decision constraints."""
+        """Keep the Action visible and add visual director/group decision constraints."""
         definitions = tool_definitions if isinstance(tool_definitions, list) else []
         if not any(tool_definition_name(item) == "nai_web_draw" for item in definitions):
             return {"action": "continue"}
@@ -459,13 +517,36 @@ class NaiPicPlugin(MaiBotPlugin):
             )
             return {"action": "continue", "modified_kwargs": updated_kwargs}
 
+        updated_definitions = _append_tool_description(
+            definitions,
+            tool_name="nai_web_draw",
+            suffix=_VISUAL_DIRECTOR_POLICY,
+            marker=_VISUAL_DIRECTOR_POLICY_MARKER,
+        )
+
+        stable = session_state.get_visual_continuity(session_id, ttl=0)
+        planner_state = _build_planner_visual_state(stable)
+        if planner_state:
+            updated_definitions = _append_tool_description(
+                updated_definitions,
+                tool_name="nai_web_draw",
+                suffix=planner_state,
+                marker=_PLANNER_VISUAL_STATE_MARKER,
+            )
+
         try:
             group_id = await self._resolve_session_group_id(session_id)
         except Exception as exc:  # noqa: BLE001
             logger.error("群聊 Planner 会话类型解析失败，已跳过群聊提示注入: %r", exc)
-            return {"action": "continue"}
+            updated_kwargs = dict(kwargs)
+            updated_kwargs["session_id"] = session_id
+            updated_kwargs["tool_definitions"] = updated_definitions
+            return {"action": "continue", "modified_kwargs": updated_kwargs}
         if not group_id:
-            return {"action": "continue"}
+            updated_kwargs = dict(kwargs)
+            updated_kwargs["session_id"] = session_id
+            updated_kwargs["tool_definitions"] = updated_definitions
+            return {"action": "continue", "modified_kwargs": updated_kwargs}
 
         plugin_config = await self._load_plugin_config_data()
         admin_section = plugin_config.get("admin", {})
@@ -478,9 +559,10 @@ class NaiPicPlugin(MaiBotPlugin):
             else []
         )
         updated_definitions = _append_tool_description(
-            definitions,
+            updated_definitions,
             tool_name="nai_web_draw",
             suffix=_build_group_draw_policy(admin_user_ids),
+            marker=_GROUP_DRAW_POLICY_MARKER,
         )
         updated_kwargs = dict(kwargs)
         updated_kwargs["session_id"] = session_id
@@ -788,6 +870,7 @@ class NaiPicPlugin(MaiBotPlugin):
         reasoning: str = "",
         text: str = "",
         source: str = "command",
+        private_chat: bool | None = None,
     ) -> NaiInvocation:
         """构造一次命令或 Action 调用的运行上下文。"""
         if self._background_tasks.is_closing:
@@ -806,6 +889,7 @@ class NaiPicPlugin(MaiBotPlugin):
             reasoning=reasoning,
             text=text,
             source=source,
+            private_chat=private_chat,
         )
         self._active_invocations.add(invocation)
         return invocation
@@ -1800,8 +1884,9 @@ class NaiPicPlugin(MaiBotPlugin):
             "核心是把当前聊天情景视觉化；Bot 出镜不等于自拍，"
             "应根据语境选择自拍、第三视角、POV、远景或纯环境等合适画面。"
             "【参数填写优先级】先把语义拆到正确字段，再调用工具；每个字段只填自己的信息，"
-            "禁止把一整段中文画面描述复制到 scene_delta。"
-            "action=动作/姿态与女生当前状态，emotion=表情/情绪，framing=景别，subject_and_pov=人数与视角，"
+            "禁止把一整段中文画面描述复制到 action 或 scene_delta。"
+            "visual_plan=静态瞬间与可见证据，action=动作关系行（`A → B：动作` / `A ↔ B：动作` / `A：动作`），"
+            "emotion=表情/情绪，framing=景别，subject_and_pov=人数与视角，"
             "scene_delta=仅稳定服装和固定环境，dynamic_scene=临时物件/倒影/天气/时间/光线。"
             "既可以响应用户明确的看图请求，也可以在 bot 自己说出视觉自指/进入情感互动节点时主动跟一张图。"
             "【调用语义 - 重要】本 Action 是 fire-and-forget 异步任务："
@@ -1813,9 +1898,16 @@ class NaiPicPlugin(MaiBotPlugin):
         activation_type=ActivationType.ALWAYS,
         parallel_action=True,
         action_parameters={
-            # 六个结构化字段：每个字段只承担一类信息，强制 Planner 分维度思考，
+            # visual_plan 先选择单帧和可见证据；其它结构化字段各自承担一类信息，
+            # 强制 Planner 分维度思考，
             # 避免一锅炖成关键词堆砌。下游会按字段顺序拼成单行 request；若 Planner
             # 兼容性原因只填了 description，则按整段兜底使用。
+            "visual_plan": (
+                "【先选静态瞬间，再拆字段】固定写成 moment=...；must_show=...；exclude=...。"
+                "moment 只描述这一帧定格时正在发生的事实；must_show 列出 2~4 个必须在镜头中"
+                "看见、能证明当前情景的视觉证据；exclude 列出因 framing/遮挡/背面而不可见或不属于本帧的内容。"
+                "不要写剧情总结、心理分析、画质词或英文 tag；没有可靠证据时留空，不要编造。"
+            ),
             "subject_and_pov": (
                 "【先匿名化，再只填主体与视角】不得复述当前用户、发送者或群成员的身份名。"
                 "按画面实际出现的人数和性别填写：'一女' / '一男一女' / '两女'，可加一个视角。"
@@ -1823,7 +1915,8 @@ class NaiPicPlugin(MaiBotPlugin):
                 "例如 Bot 为女性且对方为男性时写'一男一女 第三视角'；Bot 性别沿用既有人设和当前情景，不要把示例当成固定答案。"
                 "没有实际入镜的路人、聊天中只被提到但不在画面里的人不要硬加。"
                 "聊天对象的姓名、昵称、群名片和账号显示名一律不能当作主体标签；即使画聊天对象本人，也只写'一男'、'一女'、'男生'、'女生'等人数性别。"
-                "对方观看 bot=POV；bot 明确举手机/前置相机=自拍；旁观叙事=第三视角。"
+                "对方观看 bot、镜头位于观看者眼前且 bot 没有持机=POV；bot 明确持手机/相机或照镜子拍摄=自拍；"
+                "画外相机记录 bot=第三视角。仅有'对着镜头'不能自动判定自拍，必须看谁在持机和镜头位于谁的视线。"
                 "不要在这里写动作、表情、服装或地点。"
                 "【主体身份】本字段需要区分三种情况："
                 "(a) bot 自己出镜（包括 bot cos 某角色，出镜的还是 bot）→ 正常写 '一女' 等；"
@@ -1837,21 +1930,44 @@ class NaiPicPlugin(MaiBotPlugin):
                 "'画一张自己'/cosplay/泛指人物 → (a)。"
             ),
             "action": (
-                "【先匿名化参与者，再填动作、姿态和女生当前可见状态】"
-                "当前用户、发送者或群成员必须先改写成'男生'、'女生'、'对方'等画面角色称谓，Bot 的姓名改写成'女生'；"
-                "必须保留用户原话/reasoning 里的动词，禁止软化或改成泛泛的'互动'；"
-                "先写女生此刻处于什么状态，再写关键动作：状态包括被谁抱住、被按住、被牵着、受伤、跌倒、衣着凌乱等，"
-                "不能只写'站立'而丢掉当前情景。"
-                "多人互动时在同一字段中说清实施方、接收方和动作关系，优先用自然短句，例如'男生从身后抱住女生，女生被抱住并回头看他'；"
-                "实施方和接收方只能用'男生'、'女生'、'对方'等画面角色称谓，不得使用聊天参与者姓名或昵称，也不得输出字面量'Bot'。"
-                "不要用'他们互动'、'有人碰她'这类无法判断主被动的说法。没有第二人时不要凭空添加实施方/接收方。"
-                "如'揉胸'写'揉胸'、不要写'轻捧'；'骑'写'骑乘'、不要写'坐在身上'。"
-                "纯静态画面可写'站立'。例如：'女生被男生按在沙发上，男生从上方压住她'，不要改写成'两人亲密互动'。"
+                "【只填动作关系，必须写成关系行，禁止写散文】"
+                "每行一条关系，行间用换行或分号分隔，只允许下面三种句型：\n"
+                "  `A → B：动作`  有向互动，A 是施动方，B 是接收方；\n"
+                "  `A ↔ B：动作`  双向互动，两人同时互相做同一件事；\n"
+                "  `A：动作`      单人自身动作或姿态，没有第二个受动方。\n"
+                "A、B 只能是'女生'、'男生'、'对方'等画面角色称谓：当前用户、发送者、群成员按性别改写，"
+                "Bot 的人设姓名一律写成'女生'；禁止使用聊天参与者姓名、昵称、群名片，也禁止输出字面量'Bot'。"
+                "【硬性约束】禁止使用'被'字句：'女生被男生抱住'必须写成 `男生 → 女生：抱住`，"
+                "主语永远是施动方，方向由箭头表达。禁止使用'他/她/他的/她的'等代词，每行都要重新写出角色称谓。"
+                "每行只写一个动作，动作部分只写肢体动作、姿态和接触关系，不写人数、视角、服装、肤色、光线、环境或表情。"
+                "自身动作必须用 `A：动作` 句型，不能写成箭头句：自己揉胸写 `女生：揉自己的胸`，"
+                "抱住自己写 `女生：抱住自己`；箭头句只用于真的作用到另一个人身上的动作。"
+                "接收方的可见反应另起一行自身句，并把代词换成角色称谓："
+                "'女生：回头看他' 要写成 '女生：回头看向男生'。"
+                "【动词必须直译】保留用户原话/reasoning 里的动词，禁止软化或泛化成'互动'、'亲密'、'贴近'。"
+                "'揉胸'写'揉胸'不写'轻捧'；'骑'写'骑乘'不写'坐在身上'。"
+                "私聊成人向情景已经明确是乳交、口交、足交或其它具体性行为时，必须原样写出行为名称，"
+                "并写清用哪个身体部位；乳交不能写成'胸部贴近'，口交不能写成'用嘴取悦'，"
+                "足交不能写成'用脚挑逗'。只有当前情景确实建立了该行为时才写，不得自动升级或新增。"
+                "【关系必须写全】只要另一人实际入镜或与女生发生动作关系，就必须有对应的箭头行；"
+                "女生处于被抱住、被按住、被牵着、受伤、跌倒等状态时，该状态必须写成以对方为主语的箭头行，"
+                "不能只写女生'站立'而丢掉当前情景。没有第二人时只写自身句，不得凭空补出施动方或接收方。"
+                "正确示例：\n"
+                "  `男生 → 女生：从身后抱住`\n"
+                "  `男生 → 女生：隔着衣服揉胸`\n"
+                "  `女生：抓住男生的手腕按在自己胸口`\n"
+                "  `女生：双腿夹紧`\n"
+                "错误示例：'女生被男生按在沙发上，男生从上方压住她'（用了被字句和代词）、"
+                "'两人亲密互动'（泛化）、'女生坐着 揉腰 嘟嘴 穿着丝袜'（混入表情和服装）。"
             ),
             "emotion": (
                 "【只填表情与情绪】必须贴 reasoning 里的当前心境，不要写动作、服装、地点或镜头，"
                 "不要默认套'迷离咬唇'。"
+                "最多写 3 个词，且必须能同时出现在同一张脸上；'害羞 得意'、'情动 忍耐' 这类互相竞争的"
+                "情绪只保留本帧最主导的那一个，堆叠越多脸越糊。"
                 "示例：'不情愿 害羞'、'撒娇 期待'、'紧张 微微低头'、'慵懒 半眯眼'。"
+                "如果 framing/exclude 看不见脸和上身，只保留能从当前可见部位读出的情绪或身体反馈；"
+                "无法视觉验证时留空，不要把'宠溺''幸福''起床气'直接编成 smile/blush 等面部 tag。"
                 "无明显情绪可留空。"
             ),
             "scene_delta": (
@@ -1860,10 +1976,12 @@ class NaiPicPlugin(MaiBotPlugin):
                 "若使用本字段，只写稳定设计，不写动作、表情、姿态、镜头或临时散落物。"
             ),
             "outfit_change": (
-                "【Planner 先判定服装变化，只填枚举】unchanged=服装确实没变；clear=本轮不可见；"
+                "【Planner 先判定服装变化，只填枚举】unchanged=服装事实没有改变，或只是本帧被景别/遮挡裁掉；"
+                "replace=穿着集合发生任何增减或换装，包括本人主动脱下一件、被他人脱下一件、只剩部分衣物；"
+                "clear=全部衣物都已脱下且当前没有任何仍穿着的服装/鞋袜，绝不能因为本轮看不见就 clear；"
                 "switch=换回之前穿过的某套（可写 switch:<服装库 key>，key 见上一次画图回执的"
                 "'视觉连续性状态'；不记得 key 就只写 switch，把口语描述放进 outfit_new_look）；"
-                "replace=应当换新衣服。"
+                "衣物仍在身体上、只是掀起/拉开/局部移位不改变服装集合，保持 unchanged，并用 effect_change 表示持续状态。"
                 "判定标准看情景不看措辞：聊天进入睡觉/洗澡/回家/出门/运动等会自然换装的生活节点时，"
                 "即使没人明说换衣服也必须 replace 或 switch（深夜上床=睡衣，回家=家居服，出门=外出装）；"
                 "只有动作、构图、镜头变化而情景未变时才写 unchanged。"
@@ -1871,6 +1989,8 @@ class NaiPicPlugin(MaiBotPlugin):
             ),
             "outfit_new_look": (
                 "【仅 outfit_change=replace/switch 时填】replace：新服装的完整中文描述；"
+                "若 replace 原因是脱下一件或多件衣物，必须写当前仍穿着的完整集合，不写已经脱下的衣物；"
+                "已脱衣物若留在床上、椅上或地面，改写进 effect_new_state 的场景附着物。"
                 "用户指定了款式颜色材质就忠实保留，用户没指定就由你来设计——"
                 "给一套贴合情景与人设、有记忆点的具体穿搭（配色、材质、剪裁、小配饰都有着落），"
                 "睡衣/家居服也要有质感细节，避免每次都是千篇一律的基础款。"
@@ -1881,22 +2001,39 @@ class NaiPicPlugin(MaiBotPlugin):
                 "switch=回到之前出现过的地点（可写 switch:<环境库 key>；不记得 key 就只写 switch，"
                 "把口语描述放进 environment_new_look）；replace=人物到了新场所。"
                 "'我到家了''去洗澡''躺床上了'这类表述都意味着场所已变，必须 replace 或 switch；"
+                "但人物一直在同一间卧室/浴室/客厅，仅从夜晚变清晨、灯光变阳光、天气或室内明暗改变，"
+                "物理地点没有变化，必须 unchanged；这些变化只写 dynamic_scene。"
                 "unchanged 时下游逐字复用上一轮环境 Tag；"
                 "动态灯光、天气、烟雾、倒影和临时散落物放 dynamic_scene，不算环境变化。"
             ),
             "environment_new_look": (
                 "【仅 environment_change=replace/switch 时填】replace：新固定环境的完整中文描述"
-                "（空间布局、固定物件、材质、配色）；switch：想回到哪个地点的口语描述。其余情况留空。"
+                "（空间布局、固定物件、材质、配色）；switch：想回到哪个地点的口语描述。"
+                "禁止写清晨/深夜、阳光/灯光、天气和即时凌乱程度；environment_change=unchanged 时必须留空。"
+            ),
+            "effect_change": (
+                "【Planner 先判定跨图临时效果，只填枚举】unchanged=湿透、撕裂、污渍、泪痕、"
+                "凌乱状态或持续持物等效果仍完整成立；replace=首次出现或效果有增减；"
+                "clear=已经清洗、换装、放下物品、恢复或转场而解除。"
+                "被脱下后留在床、椅或地面的衣物属于场景附着物；首次出现或位置/数量变化时用 replace。"
+                "普通动作、姿态、瞬时表情、光线和烟雾不属于跨图效果。"
+            ),
+            "effect_new_state": (
+                "【仅 effect_change=replace 时填】写当前仍成立的完整临时效果集合，不只写本轮增量；"
+                "区分人物效果和场景附着物，例如'人物：头发和衬衫被雨淋湿；场景：折叠伞放在门边'。"
+                "其余情况留空。"
             ),
             "dynamic_scene": (
                 "*【只填动态场景】* 本轮短暂变化的临时物件、倒影、天气、时间、灯光、烟雾、"
                 "凌乱物品和即时氛围；不要写服装、固定家具、人物名、动作、表情或景别。"
                 "例如：'镜中倒影，夜间暖色灯光，化妆桌上散落的刷子和口红'。"
+                "只写可见事实；'空气清新'、气味、触感和心理氛围等相机不可见内容不得填写。"
                 "这些内容不进入稳定环境卡片，每轮可以变化。"
             ),
             "framing": (
-                "【只填景别/构图】只写一个景别或构图词：近景/特写/中景/全身/胸部以上/俯视/仰视/侧面。"
-                "第三视角、POV、自拍只写在 subject_and_pov；不要在这里重复视角，也不要写动作、表情或场景。"
+                "【只填一个景别或构图】只允许：近景/特写/中景/全身/胸部以上/俯视/仰视/侧面之一。"
+                "禁止用斜杠拼接多个值；第三视角、POV、自拍只写在 subject_and_pov。"
+                "例如自拍近景应写 subject_and_pov='一女 自拍'、framing='近景'，绝不能写 framing='近景/自拍 POV'。"
             ),
             "description": (
                 "兜底字段，正常留空；使用前仍必须先执行会话身份匿名化。"
@@ -1909,18 +2046,62 @@ class NaiPicPlugin(MaiBotPlugin):
         # 用星号把最容易串字段的规则提升到 Planner 注意力最高的区域，并给出可直接模仿的拆分样例。
         action_require=[
             f"*{_CHAT_PARTICIPANT_IDENTITY_RULE}*",
+            "*先完成 visual_plan（moment / must_show / exclude），再填写其它字段；它是导演笔记，不是最终 tag。*",
             "*【字段边界是硬约束，先拆分再调用】*",
-            "错误示例：action='坐着 揉腰 嘟嘴'、action='他们互动'、framing='中景 第三视角'、scene_delta='夜场后台化妆间……她揉腰……丝袜……'。",
-            "正确示例：subject_and_pov='一女 第三视角'；action='坐着，揉腰'；emotion='羞恼，脸红，嘟嘴，疲惫'；",
+            "*每个字段必须是短语或短句；action 若已经像完整画面描述、含服装/光线/表情/人数/视角，必须先拆开再调用。*",
+            "*action 必须写成关系行，一行一条关系，只允许三种句型：`A → B：动作`（有向互动）、"
+            "`A ↔ B：动作`（双向互动）、`A：动作`（自身动作）。禁止'被'字句，禁止'他/她'代词，"
+            "每行主语都是施动方，方向由箭头表达。*",
+            "错误示例：action='坐着 揉腰 嘟嘴'、action='他们互动'、action='女生被男生按在沙发上，男生从上方压住她'、"
+            "framing='中景 第三视角'、scene_delta='夜场后台化妆间……她揉腰……丝袜……'。",
+            "正确示例：subject_and_pov='一女 第三视角'；action='女生：坐着；女生：揉腰'；emotion='羞恼，疲惫'；",
             "framing='中景'；scene_delta='亮银色弹力亮片面料的高腰修身短裙，窄版剪裁，黑色细腰带，半透明黑色丝袜；"
             "后台化妆间固定镜台、整面镜子、木质抽屉柜和米白墙面'；",
             "dynamic_scene='镜中倒影，夜间暖色灯光，化妆桌上散落刷子和口红'。",
-            "*action 还要还原当前情景里的女生状态：若女生是被抱、被按、被牵、受伤或被迫做某事的一方，必须明写'女生被谁怎么了'，不要只保留对方的主动动词，也不得输出字面量'Bot'。*",
-            "*只要另一人实际入镜或与女生发生动作关系，subject_and_pov 必须按实际人数写全（如'一男一女 第三视角'），并在 action 里标出实施方与接收方；没有第二人时保持单人，不要套多人模板。*",
-            "*多人动作交给下游翻译为 source#（实施方）/target#（接收方）；只有双方都主动时才用 mutual#，不要把被动场景写成 mutual#。*",
+            "*双人互动的正确拆法：action='男生 → 女生：按在沙发上；男生 → 女生：从上方压住；女生：抬头看向他'，"
+            "而不是写成一段含'被'字的散文。*",
+            "*自身动作绝不能写成箭头句：自己揉胸写 `女生：揉自己的胸`、抱住自己写 `女生：抱住自己`。"
+            "下游会把箭头句翻译成 NAI 的 source#/target# 角色绑定，自身动作写成箭头句会被绑到另一个人身上，"
+            "画出'对方在做'或主被动互换的错图。*",
+            "*只要另一人实际入镜或与女生发生动作关系，subject_and_pov 必须按实际人数写全（如'一男一女 第三视角'），"
+            "并且 action 里必须有对应的箭头行；没有第二人时只写自身句，不要套多人模板。*",
+            "*女生处于被抱、被按、被牵、受伤或被迫做某事的一方时，该关系必须写成以对方为主语的箭头行"
+            "（如 `男生 → 女生：从身后抱住`），不能只保留对方的动词、也不能只写女生'站立'而丢掉当前情景；"
+            "不得输出字面量'Bot'。*",
+            "*箭头行会翻译成两侧同名的 source#/target# 绑定，双向行翻译成 mutual#；"
+            "只有双方都主动时才用 `↔`，不要把单向动作写成双向。*",
             "*scene_delta 不得包含动作/表情/倒影/临时物件；framing 不得包含 POV/第三视角；嘟嘴必须在 emotion。*",
+            "*同一物理地点的昼夜、天气和光线变化不是换环境：environment_change=unchanged，"
+            "environment_new_look 留空，变化只写 dynamic_scene。*",
+            "*镜头看不见不等于事实解除：close-up/特写只拍脚、手或局部身体时，服装仍 unchanged；"
+            "exclude 是画面减法，不是状态清除指令。*",
+            "*脱下一件或多件衣物也必须 outfit_change=replace：outfit_new_look 写当前仍穿着的完整集合；"
+            "全部衣物都已脱下时才 clear。脱下的衣物留在床/椅/地面时，用 effect_change=replace 并写入场景附着物。"
+            "仍穿在身上但只是掀起、拉开或局部移位则 outfit unchanged，持续状态归 effect_change。*",
+            "*私聊成人向动作禁止委婉化：乳交就写乳交、口交就写口交、足交就写足交，"
+            "写成 `女生 → 男生：用胸部乳交` 这样的箭头行并写清身体部位；禁止改成'亲密互动/取悦/贴近/挑逗'。"
+            "只忠实保留已建立行为，不得自行升级或增加新的性行为。*",
+            "*情绪必须可由当前画面验证，最多 3 个词且能同时出现在同一张脸上；"
+            "'害羞 得意'、'情动 忍耐' 这类互相竞争的情绪只保留最主导的一个。"
+            "特写没有脸和上身时 emotion 留空，或只写脚趾蜷缩、手部迟疑等可见身体反馈，"
+            "不要把'宠溺/幸福/起床气'直接变成 smile、blush 等不可见面部 tag。*",
+            "*自拍/POV 判定看拍摄者：本人持手机/相机或照镜子拍=自拍；镜头在观看者眼前且本人未持机=POV；"
+            "画外相机=第三视角。仅写'对着镜头'不够判定自拍。*",
+            "*只拍被窝里伸出的脚的晨光特写示例：subject_and_pov='一女 自拍'（确有手机/相机）或'一女 POV'（观看者视线）；"
+            "action='女生：把一只脚从被窝伸向镜头；女生：脚趾微微蜷缩'；emotion=''；outfit_change='unchanged'；"
+            "environment_change='unchanged'；framing='特写'；dynamic_scene='晨光透过窗帘，被子卷在脚边'。*",
+            "*自拍近景的固定拆法：subject_and_pov='一女 自拍'；"
+            "action='女生：半坐着；女生：一手揉眼睛；女生：另一手举手机自拍'；"
+            "emotion='困倦，微笑'；dynamic_scene='晨光从窗帘缝隙照入，被子堆在身后'；framing='近景'。"
+            "禁止把这五项重新合成一段放进 action。*",
             "*必须由 Planner 先分别决定 outfit_change 和 environment_change（只填枚举，新内容写进 "
             "outfit_new_look / environment_new_look）；Tag LLM 不得猜测稳定区是否变化。*",
+            "*同时决定 effect_change：只延续剧情尚未解除的跨图临时效果；replace 时 effect_new_state "
+            "必须写当前完整状态，解除后 clear，不得把普通动作或瞬时表情永久化。*",
+            "*visual_plan 必须先于其它字段完成：moment 只能选一个静态截面，must_show 只列本帧可见的剧情证据，"
+            "exclude 负责镜头减法；不要把连续动作、不可见身体部位或未入镜人物写进最终画面。*",
+            "*连续配图中，若当前情景未指定镜头且不损失 must_show，优先换一个合适景别或朝向；"
+            "用户明确要求同角度时保持，不能为了变化而变化。*",
             "*服装环境要跟着生活节点走：睡觉=睡衣、洗澡=浴巾浴袍、回家=家居服、出门=外出装；"
             "节点已发生而画面服装还停在上一个情景是错误，必须用 outfit_change=replace/switch 更新。*",
             "可以触发的典型时机：",
@@ -1933,8 +2114,10 @@ class NaiPicPlugin(MaiBotPlugin):
             "bot 想以一张近照/自拍作为情感回应",
             "不触发：纯知识问答、技术讨论、bot 这一轮明显走理性解释/代码/列点风格的回复，"
             "或者用户明确拒绝出图（'不要画''别画图'）",
-            "节奏建议：自然搭图，不刷屏。短间隔内连发要克制；但 bot 自己开口提到视觉细节时不要犹豫——"
-            "比起'刚发过图，先不发'，更应该判断'这句话本身配图是否自然'。",
+            "私聊触发可以更积极：只要用户明确要图，或 bot 这一轮有独立的视觉表达价值，"
+            "即使刚发过图、仍在同一场景、只是换姿势/角度，也可以连续提出不同配图；"
+            "不要仅因短间隔就压制。每个图片任务仍受同会话并发控制，已有任务运行期间不要重复提交。"
+            "群聊按下方群聊专属规则处理。",
         ],
         associated_types=["text"],
     )
@@ -1955,17 +2138,22 @@ class NaiPicPlugin(MaiBotPlugin):
                 return False, "当前会话已关闭 Planner 自动生图"
 
             resolved_group_id = str(group_id or "").strip()
+            private_chat = False
             if not resolved_group_id:
                 try:
-                    resolved_group_id = (
-                        await self._resolve_session_group_id(stream_id) or ""
-                    )
+                    resolved_scope = await self._resolve_session_group_id(stream_id)
+                    if resolved_scope is not None:
+                        resolved_group_id = resolved_scope
+                        private_chat = not bool(resolved_scope)
                 except Exception as exc:  # noqa: BLE001
                     logger.error("Planner Action 群聊范围解析失败: %r", exc)
+            else:
+                private_chat = False
             invocation = await self._create_invocation(
                 stream_id,
                 user_id=user_id,
                 group_id=resolved_group_id,
+                private_chat=private_chat,
                 action_data=action_data,
                 reasoning=reasoning,
                 source="action",

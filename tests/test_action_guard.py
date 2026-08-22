@@ -285,8 +285,8 @@ def test_command_multi_bot_scene_sends_two_characters_and_only_styles_girl() -> 
             {
                 "global_text": "rating:sensitive, 1boy 1girl, hotel room",
                 "characters": [
-                    {"prompt": "girl, target#kissed, blush", "negative_prompt": "", "position": ""},
-                    {"prompt": "boy, source#kissing", "negative_prompt": "", "position": ""},
+                    {"prompt": "girl, target#kiss, blush", "negative_prompt": "", "position": ""},
+                    {"prompt": "boy, source#kiss", "negative_prompt": "", "position": ""},
                 ],
                 "has_coords": False,
             },
@@ -331,7 +331,7 @@ def test_command_multi_bot_scene_sends_two_characters_and_only_styles_girl() -> 
     assert "black hair" in characters[0]["prompt"]
     assert "blue eyes" in characters[0]["prompt"]
     assert "black hair" not in characters[1]["prompt"]
-    assert characters[1]["prompt"] == "boy, source#kissing"
+    assert characters[1]["prompt"] == "boy, source#kiss"
 
 
 def test_action_multi_bot_scene_preserves_boy_appearance_and_only_styles_bot_girl(
@@ -369,12 +369,12 @@ def test_action_multi_bot_scene_preserves_boy_appearance_and_only_styles_bot_gir
                 "global_text": "rating:sensitive, 1boy 1girl, hotel room",
                 "characters": [
                     {
-                        "prompt": "boy, short black hair, green eyes, source#kissing",
+                        "prompt": "boy, short black hair, green eyes, source#kiss",
                         "negative_prompt": "",
                         "position": "",
                     },
                     {
-                        "prompt": "girl, brown hair, blue eyes, target#kissed, blush",
+                        "prompt": "girl, brown hair, blue eyes, target#kiss, blush",
                         "negative_prompt": "",
                         "position": "",
                     },
@@ -431,11 +431,11 @@ def test_action_multi_bot_scene_preserves_boy_appearance_and_only_styles_bot_gir
     assert isinstance(characters, list) and len(characters) == 2
     assert "short black hair" in characters[0]["prompt"]
     assert "green eyes" in characters[0]["prompt"]
-    assert "source#kissing" in characters[0]["prompt"]
+    assert "source#kiss" in characters[0]["prompt"]
     assert "silver hair" not in characters[0]["prompt"]
     assert "silver hair" in characters[1]["prompt"]
     assert "violet eyes" in characters[1]["prompt"]
-    assert "target#kissed" in characters[1]["prompt"]
+    assert "target#kiss" in characters[1]["prompt"]
     assert "brown hair" not in characters[1]["prompt"]
     assert "blue eyes" not in characters[1]["prompt"]
 
@@ -540,6 +540,9 @@ def test_action_commits_visual_continuity_only_after_image_delivery(
     candidate = StableVisualTags(
         outfit=("pale cyan silk qipao", "high side slit", "black leather shoes"),
         environment=("film set", "light stand", "black blackout cloth"),
+        effects=("wet hair", "tear streaks"),
+        scene_effects=("coat on chair",),
+        last_framing=("full body", "from side"),
         outfit_key="pale_cyan_qipao_set",
         environment_key="film_set",
     )

@@ -61,6 +61,7 @@ class GenerationAdmissionPolicy:
         user_text: str = "",
         user_text_age_seconds: float | None = None,
         reasoning: str = "",
+        private_chat: bool = False,
         bypass_throttle: bool = False,
     ) -> AdmissionDecision:
         """根据用户原话、Planner reasoning 与冷却状态评估 Action。"""
@@ -85,7 +86,9 @@ class GenerationAdmissionPolicy:
             explicit_request = reasoning_implies_explicit_request(reasoning_text)
 
         category = "explicit" if explicit_request else "proactive"
-        if bypass_throttle:
+        if private_chat:
+            allowed, detail = True, "私聊不受图片频率节流限制"
+        elif bypass_throttle:
             allowed, detail = True, "管理员豁免图片频率节流"
         else:
             allowed, detail = self._check_interval(

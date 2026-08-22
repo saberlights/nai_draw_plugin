@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 
@@ -22,6 +22,9 @@ class StableVisualTags:
 
     outfit: tuple[str, ...] = ()
     environment: tuple[str, ...] = ()
+    effects: tuple[str, ...] = ()
+    scene_effects: tuple[str, ...] = ()
+    last_framing: tuple[str, ...] = field(default=(), compare=False)
     outfit_key: str = ""
     environment_key: str = ""
     outfits: tuple[VisualTagCard, ...] = ()
@@ -72,6 +75,8 @@ _RATING_TAGS = frozenset(
 _POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
 _FEMALE_IDENTITY_TAGS = frozenset({"girl", "woman", "female"})
 _GLOBAL_PERSON_TAG_RE = re.compile(r"^(?:solo|\d+girls?|\d+boys?|\d+others?|\d+boy \d+girl)$")
+# NAI v4 的角色互动绑定前缀；两侧必须挂同名 action tag 才能绑成一次互动。
+_INTERACTION_PREFIXES = frozenset({"source", "target", "mutual"})
 
 # Planner 枚举与常见口语的整句匹配表：只在全句命中时生效，
 # 更复杂的自由文本一律降级为 auto，交给 Tag LLM 判定。
@@ -142,6 +147,7 @@ def parse_visual_change_directives(
     for kind, mode_field, look_field in (
         ("outfit", "outfit_change", "outfit_new_look"),
         ("environment", "environment_change", "environment_new_look"),
+        ("effects", "effect_change", "effect_new_state"),
     ):
         directive = parse_visual_change_directive(
             action_data.get(mode_field),
@@ -201,6 +207,47 @@ def _normalize_stable_tag(tag: str) -> str:
 
 def _find_card(cards: tuple[VisualTagCard, ...], key: str) -> VisualTagCard | None:
     return next((card for card in cards if card.key == key), None)
+
+
+def _collect_interaction_bindings(
+    people_tags: Iterable[Iterable[str]],
+) -> dict[tuple[str, str], set[int]]:
+    """按人物索引归集 source#/target#/mutual# 绑定，key 为 (前缀, 归一化动作)。"""
+
+    bindings: dict[tuple[str, str], set[int]] = {}
+    for index, tags in enumerate(people_tags):
+        for tag in tags:
+            prefix, separator, action = _normalize_stable_tag(tag).partition("#")
+            action = action.strip()
+            if not separator or not action or prefix not in _INTERACTION_PREFIXES:
+                continue
+            bindings.setdefault((prefix, action), set()).add(index)
+    return bindings
+
+
+def _interaction_binding_failure(people_tags: Iterable[Iterable[str]]) -> str:
+    """校验 NAI 互动前缀是否成对，未成对即判失败。
+
+    NAI 只有在两个人物段出现**同名** action tag 时才能把它们绑成同一次互动
+    （官方示例是 ``source#hug`` 配 ``target#hug``）。历史规则曾要求施动方写现在
+    分词、接收方写过去分词，产出 ``source#groping`` / ``target#groped`` 这类永远
+    配不上的组合；NAI 于是把两侧当成互不相关的独立描述，谁对谁做变成随机，
+    实测还会整体互换或让接收方自己对自己做。同理，自身动作被误加 ``source#``
+    （如 ``source#groping own breasts``）也会因为找不到对家而把动作绑到别人身上。
+    这里做确定性校验，配不上就打回重写，不做静默兜底。
+    """
+
+    bindings = _collect_interaction_bindings(people_tags)
+    for (prefix, action), holders in bindings.items():
+        if prefix == "mutual":
+            if len(holders) < 2:
+                return "interaction_mutual_unpaired"
+            continue
+        opposite = "target" if prefix == "source" else "source"
+        # 对家必须是另一个人物段：同一人物同时写 source# 和 target# 不构成互动
+        if not (bindings.get((opposite, action), set()) - holders):
+            return "interaction_unpaired"
+    return ""
 
 
 def _remember_card(
@@ -343,6 +390,46 @@ def _resolve_directive_section(
     return _SectionOutcome(previous_tags, previous_key, cards, failure="invalid_mode")
 
 
+def _resolve_effects(
+    raw_section: Any,
+    previous_subject: tuple[str, ...],
+    previous_scene: tuple[str, ...],
+    directive: VisualChangeDirective | None,
+) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    """解析会跨图延续但不进入服装/环境卡片库的临时效果。"""
+
+    if directive is not None and directive.mode == "keep":
+        return previous_subject, previous_scene, ""
+    if directive is not None and directive.mode == "clear":
+        return (), (), ""
+    if directive is not None and directive.mode == "switch":
+        return previous_subject, previous_scene, "invalid_mode"
+
+    if not isinstance(raw_section, dict):
+        if directive is not None and directive.mode in {"replace", "auto"}:
+            return previous_subject, previous_scene, "replace_not_translated"
+        return previous_subject, previous_scene, ""
+
+    mode = str(raw_section.get("mode", "keep") or "keep").strip().lower()
+    subject = _as_tags(raw_section.get("subject")) or _as_tags(raw_section.get("tags"))
+    scene = _as_tags(raw_section.get("scene"))
+    if directive is not None and directive.mode == "replace":
+        return (
+            (subject, scene, "")
+            if subject or scene
+            else (previous_subject, previous_scene, "replace_not_translated")
+        )
+    if mode == "keep" and directive is None:
+        return previous_subject, previous_scene, ""
+    if mode == "clear":
+        return (), (), ""
+    if mode != "replace":
+        return previous_subject, previous_scene, "invalid_mode"
+    if not subject and not scene:
+        return previous_subject, previous_scene, "replace_incomplete"
+    return subject, scene, ""
+
+
 def _join_tags(groups: Iterable[tuple[str, ...]]) -> str:
     return ", ".join(tag for group in groups for tag in group)
 
@@ -383,6 +470,7 @@ def _resolve_multi_prompt(
 
     characters: list[dict[str, str]] = []
     bot_indices: list[int] = []
+    people_dynamic_tags: list[tuple[str, ...]] = []
     for index, raw_person in enumerate(raw_people):
         if not isinstance(raw_person, dict):
             return "", None, "multi:person_invalid"
@@ -412,6 +500,7 @@ def _resolve_multi_prompt(
             for tag in person_dynamic
         ):
             return "", None, "multi:global_tag_in_person"
+        people_dynamic_tags.append(person_dynamic)
 
         def _person_tags(tags: Iterable[str]) -> tuple[str, ...]:
             return tuple(
@@ -423,6 +512,7 @@ def _resolve_multi_prompt(
         character_prompt = _join_tags((
             _person_tags(person_subject),
             current_state.outfit if include_outfit and role == "bot" else (),
+            current_state.effects if include_outfit and role == "bot" else (),
             _person_tags(_as_tags(raw_person.get("action"))),
             _person_tags(_as_tags(raw_person.get("emotion"))),
         ))
@@ -441,9 +531,14 @@ def _resolve_multi_prompt(
         if _normalize_stable_tag(bot_subject[0]) not in _FEMALE_IDENTITY_TAGS:
             return "", None, "multi:bot_not_female"
 
+    binding_failure = _interaction_binding_failure(people_dynamic_tags)
+    if binding_failure:
+        return "", None, f"multi:{binding_failure}"
+
     global_text = _join_tags((
         _as_tags(dynamic.get("subject")),
         current_state.environment,
+        current_state.scene_effects,
         _as_tags(dynamic.get("scene")),
         _as_tags(dynamic.get("framing")),
     ))
@@ -473,6 +568,10 @@ def render_visual_continuity_context(
     outfit = ", ".join(current.outfit) if include_outfit else "（本轮 Bot 不出镜）"
     outfit = outfit or "（尚无缓存）"
     environment = ", ".join(current.environment) or "（尚无缓存）"
+    effects = ", ".join(current.effects) if include_outfit else "（本轮 Bot 不出镜）"
+    effects = effects or "（无）"
+    scene_effects = ", ".join(current.scene_effects) or "（无）"
+    last_framing = ", ".join(current.last_framing) or "（无）"
     outfit_library = "; ".join(
         f"{card.key}=[{', '.join(card.tags)}]" for card in current.outfits
     ) if include_outfit else "（本轮 Bot 不出镜）"
@@ -485,9 +584,12 @@ def render_visual_continuity_context(
         "这是当前聊天流已经使用过的稳定 NovelAI Tag；它们不是普通参考文本。\n"
         f"当前服装：key={current.outfit_key or 'none'}；Tag={outfit}\n"
         f"当前环境：key={current.environment_key or 'none'}；Tag={environment}\n"
+        f"当前跨图临时效果：{effects}\n"
+        f"当前场景附着效果：{scene_effects}\n"
+        f"上一张实际镜头：{last_framing}\n"
         f"已知服装库：{outfit_library}\n"
         f"已知环境库：{environment_library}\n"
-        "如果 planner_visual_request 提供 outfit_change / environment_change，变化判断已经由 Planner 完成；"
+        "如果 planner_visual_request 提供 outfit_change / environment_change / effect_change，变化判断已经由 Planner 完成；"
         "严格遵守 Planner 的决定。程序会逐字复用 unchanged 区域的缓存 Tag，并忽略本轮对它的任何同义改写。\n"
         "Planner 声明 switch 但没有给出库中 key 时，由你根据描述从上方库中选定唯一匹配的 key 输出 mode=switch；"
         "库中确实没有对应项时改用 mode=replace 依据描述重建完整 Tag。\n"
@@ -506,6 +608,10 @@ def render_visual_continuity_context(
         "服装稳定区描述颜色、材质、剪裁、结构、纹样、扣件、鞋袜和配饰等可见设计；"
         "环境稳定区描述空间布局、固定物件、材质和配色。"
         "动作、表情、姿态、构图、镜头、当下天气、时间和光线只写入 dynamic。\n"
+        "人物临时效果只保存剧情尚未解除且跨图可见的湿透、撕裂、污渍、泪痕、凌乱状态或持续持物；"
+        "放在桌椅地面等处、下一张仍存在的物品写入场景附着效果。"
+        "普通动作和瞬时表情不得写入。上一张镜头只用于柔性避免连续同构图；"
+        "用户或当前情景明确要求同一镜头时必须服从，不得强制变化。\n"
         "</visual_continuity_context>"
     )
 
@@ -530,6 +636,7 @@ def resolve_visual_continuity(
         directives = {
             "outfit": directives.get("outfit", VisualChangeDirective("keep")),
             "environment": directives.get("environment", VisualChangeDirective("keep")),
+            "effects": directives.get("effects", VisualChangeDirective("keep")),
         }
     payload = _parse_response_json(response)
     if payload is None:
@@ -557,6 +664,7 @@ def resolve_visual_continuity(
 
     raw_outfit = stable.get("outfit")
     raw_environment = stable.get("environment")
+    raw_effects = stable.get("effects")
     if not include_outfit:
         # Bot 不出镜：服装状态原样穿透，不参与本轮画面
         outfit_outcome = _SectionOutcome(
@@ -591,6 +699,21 @@ def resolve_visual_continuity(
             "", previous_state, recognized=True,
             failure=f"environment:{environment_outcome.failure}",
         )
+    if include_outfit:
+        effects_outcome, scene_effects_outcome, effects_failure = _resolve_effects(
+            raw_effects,
+            previous_state.effects,
+            previous_state.scene_effects,
+            directives.get("effects") if directives is not None else None,
+        )
+    else:
+        effects_outcome = previous_state.effects
+        scene_effects_outcome = previous_state.scene_effects
+        effects_failure = ""
+    if effects_failure:
+        return VisualContinuityResult(
+            "", previous_state, recognized=True, failure=f"effects:{effects_failure}"
+        )
     if include_outfit and not outfit_outcome.tags and not outfit_outcome.cleared:
         # Bot 出镜时服装稳定区必须建立，否则下一轮无从"逐字复用"
         return VisualContinuityResult(
@@ -609,6 +732,9 @@ def resolve_visual_continuity(
     current_state = StableVisualTags(
         outfit=outfit_outcome.tags,
         environment=environment_outcome.tags,
+        effects=effects_outcome,
+        scene_effects=scene_effects_outcome,
+        last_framing=_as_tags(dynamic.get("framing")),
         outfit_key=outfit_outcome.key,
         environment_key=environment_outcome.key,
         outfits=outfit_outcome.cards,
@@ -619,7 +745,12 @@ def resolve_visual_continuity(
         normalized
         for normalized in (
             _normalize_stable_tag(tag)
-            for tag in (*current_state.outfit, *current_state.environment)
+            for tag in (
+                *current_state.outfit,
+                *current_state.environment,
+                *current_state.effects,
+                *current_state.scene_effects,
+            )
         )
         if normalized
     )
@@ -653,9 +784,11 @@ def resolve_visual_continuity(
         (
             _dynamic_tags(dynamic.get("subject")),
             current_state.outfit if include_outfit else (),
+            current_state.effects if include_outfit else (),
             _dynamic_tags(dynamic.get("action")),
             _dynamic_tags(dynamic.get("emotion")),
             current_state.environment,
+            current_state.scene_effects,
             _dynamic_tags(dynamic.get("scene")),
             _dynamic_tags(dynamic.get("framing")),
         )
@@ -690,6 +823,16 @@ _MULTI_FAILURE_HINTS = {
     "unscoped_character_tags": "multi 的顶层 action/emotion 必须为空，动作和情绪分别写入对应人物段。",
     "positions_invalid": "positions 只能为空数组或与人物对应的 A1-E5 坐标数组。",
     "positions_length_mismatch": "非空 positions 必须与 dynamic.people 等长。",
+    "interaction_unpaired": (
+        "互动绑定没有配对：每个 source#<tag> 必须在另一个人物段有逐字同名的 target#<tag>，反之亦然。"
+        "禁止施动方用现在分词、接收方用过去分词（source#groping / target#groped 是错的），"
+        "两侧必须是同一个 Danbooru tag，只有前缀不同（source#groping / target#groping）。"
+        "自身动作（自己揉胸、抱住自己等）不属于互动，必须去掉前缀写成裸 tag。"
+    ),
+    "interaction_mutual_unpaired": (
+        "mutual#<tag> 表示双方同时互相做同一件事，必须在至少两个人物段同时出现同名 mutual# tag；"
+        "只有一方主动时改写成 source#/target# 同名配对。"
+    ),
 }
 
 _SECTION_FAILURE_HINTS = {
@@ -720,7 +863,17 @@ _SECTION_FAILURE_HINTS = {
     ),
 }
 
-_SECTION_LABELS = {"outfit": "服装", "environment": "环境"}
+_SECTION_LABELS = {
+    "outfit": "服装",
+    "environment": "环境",
+    "effects": "跨图临时效果",
+}
+
+_EFFECT_FAILURE_HINTS = {
+    "invalid_mode": "stable.effects.mode 只能是 keep / replace / clear，临时效果不支持 switch。",
+    "replace_incomplete": "replace 临时效果时必须在 stable.effects.subject / scene 至少输出一组当前完整效果 Tag。",
+    "replace_not_translated": "Planner 已声明临时效果变化；请用 replace 输出当前完整效果 Tag，或状态已解除时用 clear。",
+}
 
 
 def describe_visual_failure(failure: str) -> str:
@@ -732,6 +885,8 @@ def describe_visual_failure(failure: str) -> str:
     kind, _, code = failure.partition(":")
     if kind == "multi" and code in _MULTI_FAILURE_HINTS:
         return _MULTI_FAILURE_HINTS[code]
+    if kind == "effects" and code in _EFFECT_FAILURE_HINTS:
+        return _EFFECT_FAILURE_HINTS[code]
     label = _SECTION_LABELS.get(kind)
     template = _SECTION_FAILURE_HINTS.get(code)
     if label and template:

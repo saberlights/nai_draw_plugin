@@ -13,6 +13,7 @@ def test_config_definition_exposes_defaults_and_webui_from_one_schema() -> None:
     webui = PLUGIN_CONFIG.webui_schema(plugin_id="nai_draw_plugin")
 
     assert defaults["model"]["nai_proxy_mode"] == "direct"
+    assert "nai-diffusion-5-full" in defaults["model"]["available_models"]
     assert "wd14_spaces" not in defaults["retag"]
     assert webui["sections"]["model"]["fields"]["api_key"]["ui_type"] == "password"
     assert webui["sections"]["retag"]["fields"]["wd14_spaces"]["hidden"] is True

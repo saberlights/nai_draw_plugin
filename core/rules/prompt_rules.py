@@ -96,11 +96,63 @@ Rating → 人数（1girl/2girls/solo）→ **镜头框图（framing，三档互
 - 光影标签必须放最后，禁止散落到中间
 - 一个动作只用一个最准确的词，禁止堆叠近义词
 
-### 当前状态与动作关系
+### 当前状态与动作关系（NAI 互动绑定语法，出错率最高）
 
-- 用户请求或 Planner 的 `action` 里如果写了女生当前状态（这里的女生指 Bot 出镜角色，例如“女生被男生从身后抱住”“女生被按在沙发上”），必须把这个状态保留到对应人物段，不能只输出施动者的主动动作。
-- “谁实施、谁接收”优先按语义拆分：实施方写 `source#` + 现在分词，接收方写 `target#` + 过去分词；不要把“被……”改写成模糊的 `hugging` / `touching`，也不要把单向动作写成 `mutual#`。
-- `action` 使用自然语言描述关系时，先根据人物身份、相对位置和被动语态判断对应人物，再翻译成互动 Tag；没有明确第二人时不得自行补出另一角色。
+- Planner 的 `action` 用固定关系行给出，一行一条关系，逐行翻译，不要自行合并或重组：
+  - `A → B：动作`：有向互动，A 是施动方，B 是接收方。
+  - `A ↔ B：动作`：双向互动，两人都在主动做同一件事。
+  - `A：动作`：单人自身动作或姿态，画面里没有第二个受动方。
+  关系行中的 A、B 只会是“女生”“男生”“对方”等画面角色称谓，按它对应到 people 里的人物段。
+- `source#` / `target#` / `mutual#` 是 NAI 的角色绑定前缀，**两侧必须是同一个 Danbooru tag，只有前缀不同**：
+  - `A → B：抱住` → A 的人物段写 `source#hug`，B 的人物段写 `target#hug`。
+  - `A ↔ B：拥抱` → 双方人物段都写 `mutual#hug`。
+  两侧 tag 名一旦不一致，NAI 就无法把两个人物段绑成同一次互动，方向会随机化甚至完全互换。
+- **严禁施动方用现在分词、接收方用过去分词**。下列写法全部错误，绑定必然失效：
+  `source#hugging` / `target#hugged`、`source#holding hand` / `target#held by hand`、
+  `source#patting head` / `target#head patted`。
+  正确写法是两侧完全同名：`source#hug` / `target#hug`、`source#head pat` / `target#head pat`。
+- 前缀后面只能跟真实存在的 Danbooru 动作 tag。禁止为了凑“被动形态”编造 `hair_petted`、
+  `held_by_waist`、`touched_on_thigh`、`whispered_to`、`pulled` 这类不存在的词。
+- `A：动作` 的自身动作**禁止**加任何绑定前缀，直接写裸 tag。抱住自己、咬自己的嘴唇、
+  遮住自己的身体都属于自身动作；给它们加 `source#` 会让 NAI 把动作绑到另一个角色身上，
+  画成“对方在做”或“自己对自己做”的错图。
+- 接收方除了 `target#` 互动本体，还要照常写出可见反应的裸 tag（被抱住的姿态、闭眼、脸红、身体前倾、
+  抓紧衣角等）；Bot 女生作为接收方时这些反应不能丢失。
+- 没有第二个人物时不得凭空补出接收方，也不得使用任何绑定前缀。
+- 程序会校验绑定配对：每个 `source#X` 必须在另一个人物段有同名 `target#X`，`mutual#X` 必须至少出现在两个人物段。
+  配不上的会被打回重写，所以写之前先确认两侧 tag 名逐字相同。
+
+### 单帧视觉导演与可见性自检
+
+- `<planner_visual_request>` 的字段位置可能串位。先按所有字段的真实内容理解完整画面，再按内容的真实语义重新归类；
+  不得因为某句话位于 `action` 就把其中的服装、表情、人数、视角、光线或环境全部当动作翻译，也不得重复输出。
+  `subject_and_pov` 只提供人数和拍摄视角，`action` 只提取姿态、肢体动作和互动关系，`emotion` 只提取表情，
+  `dynamic_scene` 只提取相机可见的时间、天气、光线与临时物件，`framing` 只取一个不矛盾的景别/构图。
+- 服装和环境变化控制字段优先级最高：`outfit_change=unchanged` 时，即使 `action` 又描述衣服，也必须逐字复用缓存服装，
+  不得建立或改写新服装；`environment_change=unchanged` 时逐字复用固定环境。同一物理地点的昼夜、天气、光线和即时凌乱程度
+  只属于 `dynamic_scene`，不构成环境 switch/replace；相机不可见的气味、清新感、触感和心理氛围不得生成 tag。
+- 镜头裁切、遮挡和 `exclude` 只做本帧可见性减法，不改变跨图事实：特写看不见睡衣时仍按 `outfit_change=unchanged` 复用，
+  一件或多件衣物真的从身体上脱下时必须按 `outfit_change=replace` 重建当前仍穿着的完整集合；全部衣物都已脱下、
+  没有任何穿着物时才接受 `clear`。衣物仍在身体上、只是掀起/拉开/局部移位时继续复用服装，持续状态写入 effects。
+  同理，不要因为脸在镜头外就清除人物状态。
+  `clear` 只表示事实已解除，不表示本轮因 framing 或遮挡看不见；不可见但仍成立的状态必须继续保留。
+- `emotion` 必须能从当前可见部位验证；若特写只露脚、手或局部身体且没有脸，允许为空，或只保留脚趾蜷缩、手部迟疑等可见反馈，
+  不要把“宠溺”“幸福”“起床气”等不可见心理直接翻译成 `smile`、`blush` 等面部 tag。
+- 自拍/POV/第三视角按拍摄者判定：本人持手机/相机或照镜子拍摄才是 selfie；镜头位于观看者眼前且主体未持机是 POV；
+  画外相机记录主体是第三视角。仅有“对着镜头”不能自动判定 selfie。
+- `<planner_visual_request>` 中的 `visual_plan` 是上游 Planner 选定的单帧导演笔记，优先读取
+  `moment` 决定“这一张图截取哪一个静态瞬间”，再用 `must_show` 保留能证明当前情景成立的可见事实。
+- `must_show` 不是剧情摘要：只把确实能在当前镜头中看见的主体、动作关系、关键道具或环境证据落成 tag；
+  不要用泛化的 `interaction`、`scene` 或氛围词替代它。`exclude` 是镜头减法，列出的不可见、被遮挡、
+  已经结束或不属于本帧的内容不得出现在最终 prompt。
+- 一张图必须是静态截面：最多保留一个主动作和一个主要互动关系。连续动作（例如“先站起再奔跑”）
+  只选当前定格的一项；若 `moment` 写了“醒来、看到消息、拍照、发送”等前因后果，只保留镜头按下时的可见状态，
+  不把看消息或发送图片翻译进画面。动作、受力方向、支撑点和持物关系必须在空间上可行，不能让一只手同时完成互斥动作。
+- 先按人数与施动方/接收方拆分人物，再按 framing 做可见性减法；不得为了保留 `must_show` 而叠加互斥景别，
+  也不得把镜头外的人物、身体部位或服装细节硬塞进画面。
+- 可见性减法删除 Tag 后，把有限细节预算重新分配给本帧仍可见的关键表情、服装材质、动作接触点、
+  道具关系和环境证据；不存在固定 Tag 数配额，禁止为了补数量编造新元素或堆叠近义词。
+- `visual_plan` 里的中文导演笔记只用于理解和取舍，禁止原样输出到英文 tag、JSON 数组、人物段或解释文本。
 
 ### 5. 视角减法
 
@@ -384,6 +436,26 @@ _NSFW_CAPABILITY = """
 - 准确使用身体部位、动作、体位标签
 - 多人 NSFW 场景必须用 `source#`/`target#`/`mutual#` 区分主被动
 - 状态描写（堕落进程、催眠状态等）通过眼睛、表情、身体标记体现
+- 已明确建立的具体性行为必须直译，不得语义降级：乳交就是乳交，口交就是口交，足交就是足交；
+  不得降级成“亲密互动”“取悦”“贴近”“挑逗”等泛化词，也不得只输出身体靠近而丢失行为本身。
+- 使用准确 Danbooru 行为 tag：乳交用 `paizuri`；口对阴茎用 `fellatio`，口对外阴用 `cunnilingus`；足交用 `footjob`。
+  同时根据上下文保留实施方、接收方、接触部位与 `source#`/`target#` 关系，不能把主被动写反。
+- 性行为 tag 的绑定同样遵守“两侧同名、只换前缀”：施动方 `source#paizuri`，接收方 `target#paizuri`；
+  `fellatio`、`cunnilingus`、`footjob` 同理。禁止编造 `paizured`、`fellated` 等被动形态，那会让绑定失效、主被动随机化。
+- 自慰、自己揉胸等只作用于自身的动作不是互动，直接写裸 tag（如 `masturbation`、`grabbing own breast`），
+  禁止加 `source#`/`target#` 前缀，否则会被绑到对方身上画成对方在做。
+- 直白不等于升级：只忠实翻译用户、剧情或 Planner 已经明确建立的行为，不得新增上下文没有建立的性行为、参与者或癖好。
+
+### 成人向视觉吸引力（仅限明确成年角色）
+
+- 不要只机械翻译裸露或性行为；在不改变人物、剧情和显式程度的前提下，让画面具有明确的成人向视觉吸引力。
+- 用户未指定服装细节且本轮允许新建设计时，可按角色气质与场合选择少量协调元素：贴身或高腰剪裁、露肩/露背/开衩、蕾丝或薄纱、吊带与吊袜带、长筒袜、首饰等；优先形成一套完整设计，不要把清单全部堆上。
+- 已有服装或连续性状态已锁定时，禁止为了媚宅效果换成另一套衣服。只补当前情景真实造成且镜头可见的穿着状态，如衣摆掀起、肩带滑落、纽扣解开、衣料湿透或贴身；剧情没有发生就不得擅自增加。
+- 根据本帧动作补充可见的身体与生理反馈，如 blush、sweat、trembling、arched back、muscle tension、skin indentation、clothes tension；只选受力和情绪确实支持的项，不要把所有反应套在每张图上。
+- 让视线、面向、姿态和 framing 共同服务本轮视觉重点；重点是腿、袜、鞋或全身穿搭时用 full body，重点是表情或上身互动时用 close-up/upper body，禁止靠互斥构图重复强调。
+- 身体、衣物和道具必须形成可验证的接触关系：手在做什么、碰到哪里、衣物为何处于当前状态、物体由谁持有都要一致；一只手不能同时执行互斥动作。
+- 对最重要的一个动作或视觉细节可适度加权，其余保持层级。删除不可见 Tag 后，把细节预算投向仍可见的表情、材质、接触点、身体反馈与环境证据，不得为凑 Tag 数编造新元素。
+- 成人向增强不等于自动升级内容：不得把暧昧/内衣画面擅自升级为露点，不得把裸露画面擅自升级为性行为，也不得新增用户和当前剧情没有建立的参与者、性行为或癖好。
 </nsfw_capability>
 """.strip()
 
@@ -532,10 +604,10 @@ JSON 元素结构规则:
 
 VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
 <output_instruction>
-你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序确定性复用服装和环境 Tag。
+你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序确定性复用服装、环境与跨图临时效果 Tag。
 
 输出格式（version=4）：
-{"version":4,"format":"single|multi","intent":"normal|selfie|portrait","dynamic":{"subject":[...],"action":[...],"emotion":[...],"scene":[...],"framing":[...],"people":[{"role":"bot|other","subject":[...],"action":[...],"emotion":[...]}],"positions":[...]},"stable":{"outfit":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]},"environment":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]}}}
+{"version":4,"format":"single|multi","intent":"normal|selfie|portrait","dynamic":{"subject":[...],"action":[...],"emotion":[...],"scene":[...],"framing":[...],"people":[{"role":"bot|other","subject":[...],"action":[...],"emotion":[...]}],"positions":[...]},"stable":{"outfit":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]},"environment":{"mode":"keep|switch|replace|clear","key":"...","tags":[...]},"effects":{"mode":"keep|replace|clear","subject":[...],"scene":[...]}}}
 
 字段规则：
 - version: 固定 4。
@@ -544,12 +616,13 @@ VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
 - dynamic.subject: rating tag、人数、主体身份及本轮临时人物状态；第一个元素必须是唯一的 rating tag。
 - single 时 dynamic.action / emotion 写主体动作和表情；multi 时两者必须为 []，动作与情绪分别写入对应 people 人物段。
 - multi 的 dynamic.people 每项必须含 role、subject、action、emotion；Bot 女生恰有一个且 role="bot"，其他人物 role="other"。subject 首项写 girl/boy/woman/man 等身份 Tag，禁止放 rating 和总人数 Tag。
-- multi 互动必须拆分到双方：施动方写 source# 动作，接收方写 target# 状态；Bot 女生的被动反应、闭眼、脸红等不能丢失。
+- multi 互动必须拆分到双方，并且两侧使用**同一个** Danbooru tag、只换前缀：施动方写 `source#<tag>`，接收方写 `target#<tag>`，双向互动双方都写 `mutual#<tag>`。禁止写成 `source#groping` / `target#groped` 这类分词不一致的形态，也禁止编造 `paizured`、`held_by_waist` 等不存在的被动词。自身动作（自己揉胸、抱住自己等）不得加任何前缀。Bot 女生的被动反应、闭眼、脸红等照常写裸 tag，不能丢失。
 - multi 的 positions 可省略或用 []；非空时必须与 people 等长，每项为 A1-E5 坐标。
-- 程序只把 stable.outfit 注入 role="bot" 的女生人物段，绝不注入其他人物；stable.environment、rating、总人数、场景和 framing 只进入全局段。
+- 程序只把 stable.outfit 与 stable.effects 注入 role="bot" 的女生人物段，绝不注入其他人物；stable.environment、rating、总人数、场景和 framing 只进入全局段。
 - dynamic.framing: 只写镜头构图。
 - dynamic.scene: 只写会自然变化的天气、时间、光线、氛围和临时物件。
 - stable.outfit / stable.environment: 只写跨图片需要保持一致的服装设计与环境结构。
+- stable.effects: 只写剧情尚未解除、下一张仍应可见的临时效果；subject 放 Bot 人物的湿透/撕裂/污渍、泪痕、凌乱状态或持续持物，scene 放已经留在桌椅地面等位置、下一张仍存在的物品。普通动作、姿态、瞬时表情、光线和烟雾不得进入。
 
 稳定区四种模式（Planner 的 outfit_change / environment_change 决定优先；Planner 未提供对应字段时由你根据上下文判断，没有明确变化必须用 keep——但聊天进入睡觉/洗澡/回家/出门/运动等自然换装节点视为明确变化，应换成合情景的服装与场所）：
 - keep（对应 Planner 的 unchanged）：程序逐字复用上一轮缓存 Tag；stable 对应区 tags 输出 []，不要重新翻译或改写。
@@ -558,6 +631,17 @@ VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
   Planner 只给了口语描述而没给 key 时，由你从库中选定唯一匹配的 key；库中没有匹配项时改用 replace 依据描述重建。
 - replace：为发生变化的稳定区生成完整新 Tag；key 用简短稳定的英文 snake_case 新标识，不能复用库中已有 key，也不能只写变化量；另一稳定区保持原状。
 - clear：清空对应稳定区；key 为空字符串，tags 输出 []。
+
+`clear` 只表示事实已解除，不表示本轮因 framing 或遮挡看不见；不可见但仍成立的服装、环境和临时效果必须 keep。
+脱下一件或多件衣物也属于服装集合变化，必须 replace，并输出当前仍穿在身上的完整服装集合；
+全部衣物都已脱下且没有任何穿着物时才 clear。脱下后留在床上、椅上或地面的衣物不再属于 stable.outfit，
+应写入 stable.effects.scene；衣物仍穿在身上、只是掀起/拉开/滑落时保持 outfit keep，并按需更新 stable.effects.subject。
+
+临时效果模式（Planner 的 effect_change 决定优先）：
+- keep：效果没有变化，subject/scene 输出 []，程序逐字复用缓存。
+- replace：效果首次出现或发生增减，subject/scene 输出当前仍成立的完整效果集合，不是只写增量；不使用 key，至少一组非空。
+- clear：效果已经通过清洗、换装、取回/移走物品、恢复或转场等方式全部解除，subject/scene 输出 []。
+- 临时效果不进入服装/环境卡片库，不支持 switch；Bot 不出镜时程序原样保留但不注入本轮画面。
 
 稳定区通用约束：
 - 已知库中存在合适项时禁止 replace 或创造近义 key，必须 switch；同一 key 永远对应同一串 Tag。
@@ -573,7 +657,7 @@ VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
 JSON 元素规则：
 - 所有数组元素只能是最终英文 Danbooru tag 或单个权重表达，禁止自然语言句子。
 - 每个元素只能含一个 tag，禁止元素内部含逗号。
-- 禁止在 dynamic 重复 outfit/environment 的稳定 Tag。
+- 禁止在 dynamic 重复 outfit/environment/effects 的连续性 Tag。
 - 禁止输出 JSON 之外的任何字符，禁止用 ``` 包裹，禁止空响应。
 </output_instruction>
 """.strip()
@@ -640,6 +724,8 @@ def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
 <visual_continuity_priority>
 本模板用于跨图连续性，稳定区规则优先于上方通用的“适度补充/默认 1-2 个服装词”建议。
 首次建立服装时必须输出完整、具体、可见的整套穿搭 Tag；若服装没有明确变化则只用 keep，禁止为了动作或构图改写稳定 Tag。
+每轮仍须先按 visual_plan 选定一个静态瞬间；连续性只延续稳定事实，不得把上一轮已结束的动作、临时物件或情绪带入本帧。
+上一张实际镜头仅用于柔性变化：当用户和当前情景没有指定镜头，且不损失 must_show 证据时，优先换一个仍然合适的景别或朝向；不得为了不同而不同，也不得覆盖明确构图要求。
 </visual_continuity_priority>
 """.strip()
 

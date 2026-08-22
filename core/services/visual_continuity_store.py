@@ -96,6 +96,9 @@ class VisualContinuityStore:
             "updated_at": updated_at,
             "outfit": list(stable.outfit),
             "environment": list(stable.environment),
+            "effects": list(stable.effects),
+            "scene_effects": list(stable.scene_effects),
+            "last_framing": list(stable.last_framing),
             "outfit_key": stable.outfit_key,
             "environment_key": stable.environment_key,
             "outfits": [
@@ -111,6 +114,9 @@ class VisualContinuityStore:
         return StableVisualTags(
             outfit=cls._as_tag_tuple(record.get("outfit")),
             environment=cls._as_tag_tuple(record.get("environment")),
+            effects=cls._as_tag_tuple(record.get("effects")),
+            scene_effects=cls._as_tag_tuple(record.get("scene_effects")),
+            last_framing=cls._as_tag_tuple(record.get("last_framing")),
             outfit_key=str(record.get("outfit_key") or ""),
             environment_key=str(record.get("environment_key") or ""),
             outfits=cls._as_cards(record.get("outfits")),

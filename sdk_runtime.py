@@ -310,6 +310,7 @@ class NaiInvocation(ModelConfigMixin):
         reasoning: str = "",
         text: str = "",
         source: str = "command",
+        private_chat: bool | None = None,
     ) -> None:
         self.plugin = plugin
         self.ctx = plugin.ctx
@@ -322,6 +323,9 @@ class NaiInvocation(ModelConfigMixin):
         self.reasoning = str(reasoning or "")
         self.text = str(text or "")
         self.source = source
+        self._private_chat = (
+            not bool(self.group_id) if private_chat is None else bool(private_chat)
+        )
         self._force_group_planner_sfw = bool(self.group_id and source == "action")
         self.log_prefix = "nai_draw_plugin"
         self._generation_admission_policy = plugin._generation_admission_policy
@@ -926,11 +930,11 @@ class NaiInvocation(ModelConfigMixin):
 
         if not send_ok:
             logger.warning(
-                "%s 图片发送返回失败，可能是适配器超时（图片可能仍在后台发送中）",
+                "%s 图片发送返回失败，未收到任何成功投递回执",
                 self.log_prefix,
             )
-            # NapCat 适配器在处理大图片时可能超时（30s），但图片会在后台继续发送
-            # 保留 pending 记录以支持后续撤回，假定发送成功继续后续流程
+            discard_pending_plugin_image_send(self.stream_id, self._last_send_timestamp)
+            return False, "发送失败", True
 
         self._generation_admission_policy.record_success(
             stream_id=self.stream_id,
@@ -2266,6 +2270,9 @@ class NaiInvocation(ModelConfigMixin):
             "user_text": user_text,
             "user_text_age_seconds": age_seconds,
             "reasoning": reasoning,
+            "private_chat": bool(
+                getattr(self, "_private_chat", not bool(getattr(self, "group_id", "")))
+            ),
         }
         if getattr(self, "_force_group_planner_sfw", False) and self._is_configured_plugin_admin():
             policy_kwargs["bypass_throttle"] = True

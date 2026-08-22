@@ -3,8 +3,8 @@
 
 Planner 把生图请求拆成 6 个结构化字段（``subject_and_pov`` / ``action`` / ``emotion``
 / ``scene_delta`` / ``dynamic_scene`` / ``framing``）加一个自由文本 ``description``，
-以及稳定区变化决定（``outfit_change`` / ``environment_change`` 枚举 +
-``*_new_look`` 描述）。提到这里独立成模块是为了能脱离 sdk_runtime 重型 import
+以及连续性变化决定（服装、环境、跨图临时效果）和 ``visual_plan`` 单帧导演信息。
+提到这里独立成模块是为了能脱离 sdk_runtime 重型 import
 单测，避免下游决策只看到结构化字段而漏掉 ``description`` 里的关键锚点
 （如具体角色名、服装款式、场景细节）。
 """
@@ -12,6 +12,7 @@ Planner 把生图请求拆成 6 个结构化字段（``subject_and_pov`` / ``act
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Iterable
 
 from ..services.visual_continuity import parse_visual_change_directives
@@ -29,11 +30,14 @@ STRUCTURED_DESCRIPTION_FIELDS = (
 PLANNER_STABLE_CHANGE_FIELDS = (
     "outfit_change",
     "environment_change",
+    "effect_change",
 )
 PLANNER_STABLE_LOOK_FIELDS = (
     "outfit_new_look",
     "environment_new_look",
+    "effect_new_state",
 )
+VISUAL_PLAN_FIELDS = ("visual_plan",)
 
 
 # Planner 在 ``subject_and_pov`` 里声明"本轮画的是指定角色（非 bot 出镜）"用的约定 token。
@@ -99,7 +103,7 @@ def compose_description_from_action_payload(
     # unchanged / switch:<key> 等控制 token 属于控制信道，不得混入数据信道，
     # 否则会污染 Danbooru 检索 query 与图片 caption。
     directives = parse_visual_change_directives(action_data) or {}
-    for kind in ("outfit", "environment"):
+    for kind in ("outfit", "environment", "effects"):
         directive = directives.get(kind)
         if directive is not None and directive.description:
             structured_parts.append(directive.description)
@@ -109,21 +113,46 @@ def compose_description_from_action_payload(
     return " ".join(parts).strip()
 
 
+def _residual_beyond_structured(effective: str, flattened: str) -> str:
+    """取出 ``effective`` 里结构化字段没有覆盖的补充文本。
+
+    上游会往 description 追加 ``一女 肖像照`` 这类 self-image 意图 token，使
+    ``effective`` 与拍平串不再逐字相等。历史实现据此把**整段拍平串**重新写回
+    payload，且排在结构化字段之前——Tag LLM 第一手读到的就成了字段边界已被抹平、
+    同一份内容重复两遍的版本，正好抵消本模块保留字段边界的目的，实测会让
+    动作、表情、服装互相串味。这里只保留差集，重复部分交给结构化字段表达。
+    """
+
+    if not effective:
+        return ""
+    if effective == flattened:
+        return ""
+    if not flattened:
+        return effective
+    index = effective.find(flattened)
+    if index < 0:
+        # 定位不到结构化基线说明上游做了改写，宁可重复也不丢失锚点
+        return effective
+    residual = f"{effective[:index]} {effective[index + len(flattened):]}"
+    return re.sub(r"\s+", " ", residual).strip()
+
+
 def render_action_payload_for_prompt(
     action_data: Dict[str, Any],
     *,
     effective_description: str = "",
 ) -> str:
-    """保留 Planner 字段边界，供下游 Tag LLM 判断稳定区与动态区。"""
+    """保留 Planner 字段边界，供下游 Tag LLM 判断稳定区与动态区。
+
+    字段顺序即下游阅读顺序：先给单帧导演笔记，再给各自封闭的结构化字段和稳定区
+    决定，最后才是自由文本兜底，避免无边界长串抢在字段前面定调。
+    """
 
     payload: Dict[str, str] = {}
-    effective = str(effective_description or "").strip()
-    flattened = compose_description_from_action_payload(action_data)
-    if effective and effective != flattened:
-        payload["effective_description"] = effective
-    description = str(action_data.get("description", "") or "").strip()
-    if description:
-        payload["description"] = description
+    for key in VISUAL_PLAN_FIELDS:
+        value = str(action_data.get(key, "") or "").strip()
+        if value:
+            payload[key] = value
     for key in STRUCTURED_DESCRIPTION_FIELDS:
         value = str(action_data.get(key, "") or "").strip()
         if value:
@@ -132,6 +161,15 @@ def render_action_payload_for_prompt(
         value = str(action_data.get(key, "") or "").strip()
         if value:
             payload[key] = value
+    description = str(action_data.get("description", "") or "").strip()
+    if description:
+        payload["description"] = description
+    residual = _residual_beyond_structured(
+        str(effective_description or "").strip(),
+        compose_description_from_action_payload(action_data),
+    )
+    if residual:
+        payload["extra_request"] = residual
     if not payload:
         return ""
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)

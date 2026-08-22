@@ -237,6 +237,8 @@ def test_preflight_action_guard_returns_typed_cached_policy_decision(
     invocation = object.__new__(NaiInvocation)
     invocation.plugin_config = {"action_guard": {"enabled": True}}
     invocation.stream_id = "stream-guard"
+    invocation.group_id = ""
+    invocation._private_chat = True
     invocation.reasoning = "用户要求看图"
     invocation._generation_admission_policy = policy
     invocation._cached_action_trigger_assessment = None
@@ -262,8 +264,32 @@ def test_preflight_action_guard_returns_typed_cached_policy_decision(
             "user_text": "别画了",
             "user_text_age_seconds": 12.5,
             "reasoning": "用户要求看图",
+            "private_chat": True,
         }
     ]
+
+
+def test_preflight_action_guard_marks_group_invocation_as_non_private(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = _RecordingAdmissionPolicy()
+    invocation = object.__new__(NaiInvocation)
+    invocation.plugin_config = {"action_guard": {"enabled": True}}
+    invocation.stream_id = "group-stream"
+    invocation.group_id = "group-100"
+    invocation._private_chat = False
+    invocation.reasoning = "此刻适合配图"
+    invocation._generation_admission_policy = policy
+    invocation._cached_action_trigger_assessment = None
+
+    async def fake_fetch(*, lookback: int = 6) -> tuple[str, float]:
+        return "今天真热闹", 1.0
+
+    monkeypatch.setattr(invocation, "_fetch_last_user_text_with_age", fake_fetch)
+
+    asyncio.run(invocation.preflight_action_guard())
+
+    assert policy.action_calls[0]["private_chat"] is False
 
 
 def test_retrieve_tag_candidates_uses_online_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -774,6 +800,51 @@ def test_send_base64_image_result_propagates_send_failure() -> None:
 
     assert result is False
     assert send_calls == [("image", "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB")]
+
+
+def test_send_image_result_does_not_record_failed_base64_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocation = _build_image_send_invocation()
+    discarded: list[tuple[str, float]] = []
+    schedule_calls: list[bool] = []
+
+    async def failed_send_custom(
+        _message_type: str,
+        _content: str,
+        *,
+        display_message: str = "",
+        storage_message: bool = True,
+    ) -> bool:
+        del display_message, storage_message
+        return False
+
+    async def fake_schedule() -> None:
+        schedule_calls.append(True)
+
+    monkeypatch.setattr(
+        sdk_runtime_module,
+        "remember_pending_plugin_image_send",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        sdk_runtime_module,
+        "discard_pending_plugin_image_send",
+        lambda stream_id, send_timestamp: discarded.append((stream_id, send_timestamp)),
+    )
+    invocation.send_custom = failed_send_custom
+    invocation._schedule_auto_recall = fake_schedule
+    invocation._build_image_display_message = lambda _desc="": "[nai-image]"
+
+    result = asyncio.run(invocation._send_image_result(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB",
+        "test",
+    ))
+
+    assert result == (False, "发送失败", True)
+    assert discarded == [("stream-1", invocation._last_send_timestamp)]
+    assert invocation._generation_admission_policy.success_calls == []
+    assert schedule_calls == []
 
 
 def test_download_remote_image_as_base64_skips_generation_request_url() -> None:

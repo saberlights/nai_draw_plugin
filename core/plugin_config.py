@@ -1250,12 +1250,12 @@ class PluginConfigDefinition:
             "explicit_request_min_interval_seconds": ConfigField(
                 type=int,
                 default=5,
-                description="用户原话含明确画图/自拍/肖像/追图等强信号时的最小间隔；单位秒，可填正整数；默认 5 秒仅防同秒重复触发"
+                description="群聊中用户原话含明确画图/自拍/肖像/追图等强信号时的最小间隔；单位秒；私聊不使用时间间隔节流"
             ),
             "proactive_min_interval_seconds": ConfigField(
                 type=int,
                 default=10,
-                description="bot 主动判断要发图时的最小间隔；单位秒，可填正整数；默认 10 秒，给 Planner 两轮 reasoning 之间一点缓冲"
+                description="群聊中 bot 主动判断要发图时的最小间隔；单位秒；私聊不使用时间间隔节流"
             ),
             "weak_negative_ttl_seconds": ConfigField(
                 type=int,

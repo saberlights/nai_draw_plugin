@@ -147,6 +147,29 @@ class ArtistPresetConfigTest(unittest.TestCase):
         self.assertEqual(model_config["nai_artist_prompt"], "artist:a")
         self.assertEqual(model_config["negative_prompt_add"], "model-default-negative")
 
+    def test_v5_model_reuses_v45_config_and_artist_preset(self):
+        host = _DummyModelConfigHost({
+            "model": {
+                "base_url": "https://example.com",
+                "default_model": "nai-diffusion-5-full",
+            },
+            "model_nai4_5": {
+                "nai_size": "1216x832",
+                "negative_prompt_add": "v45-negative",
+                "artist_presets": [
+                    {"name": "风格A", "prompt": "artist:v45"},
+                ],
+                "default_artist_preset": 1,
+            },
+        })
+
+        model_config = host._get_model_config()
+
+        self.assertEqual(model_config["default_model"], "nai-diffusion-5-full")
+        self.assertEqual(model_config["nai_size"], "1216x832")
+        self.assertEqual(model_config["nai_artist_prompt"], "artist:v45")
+        self.assertEqual(model_config["negative_prompt_add"], "v45-negative")
+
     def test_model_config_can_apply_artist_preset_for_direct_tag_command(self):
         host = _DummyModelConfigHost({
             "model": {

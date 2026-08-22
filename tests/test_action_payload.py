@@ -11,6 +11,7 @@ from plugins.nai_draw_plugin.core.utils.action_payload import (
     BOT_ABSENT_TOKEN,
     NAMED_CHARACTER_TOKEN,
     STRUCTURED_DESCRIPTION_FIELDS,
+    VISUAL_PLAN_FIELDS,
     compose_description_from_action_payload,
     is_bot_absent_intent,
     is_named_character_intent,
@@ -145,6 +146,35 @@ def test_render_action_payload_for_prompt_preserves_field_boundaries():
     assert rendered.endswith("</planner_visual_request>")
 
 
+def test_render_action_payload_keeps_visual_plan_separate_from_tag_fields():
+    rendered = render_action_payload_for_prompt({
+        "visual_plan": (
+            "moment=女生刚把热茶递到男生手边；"
+            "must_show=茶杯接触、女生回头微笑；exclude=上一秒的开门动作"
+        ),
+        "subject_and_pov": "一男一女 第三视角",
+        "action": "女生递茶，男生接住",
+    })
+
+    assert '"visual_plan":' in rendered
+    assert "must_show=茶杯接触" in rendered
+    assert '"action": "女生递茶，男生接住"' in rendered
+
+
+def test_visual_plan_is_not_part_of_flat_tag_request():
+    action_data = {
+        "visual_plan": "moment=递茶；must_show=茶杯；exclude=开门",
+        "subject_and_pov": "一男一女 第三视角",
+        "action": "女生递茶",
+    }
+
+    assert compose_description_from_action_payload(action_data) == "一男一女 第三视角 女生递茶"
+
+
+def test_visual_plan_field_constant_is_stable():
+    assert VISUAL_PLAN_FIELDS == ("visual_plan",)
+
+
 def test_render_action_payload_omits_duplicate_flat_description():
     """结构化字段已经完整时，不再用同义扁平串稀释字段边界。"""
 
@@ -176,6 +206,22 @@ def test_render_action_payload_includes_planner_stable_change_decisions():
 
     assert '"outfit_change": "replace: 淡青色丝绸旗袍，肉色丝袜，复古黑色皮鞋"' in rendered
     assert '"environment_change": "unchanged"' in rendered
+
+
+def test_effect_directive_is_structured_but_only_description_reaches_tag_query():
+    action_data = {
+        "subject_and_pov": "一女 第三视角",
+        "effect_change": "replace",
+        "effect_new_state": "人物：头发和衬衫被雨淋湿；场景：折叠伞放在门边",
+    }
+
+    flattened = compose_description_from_action_payload(action_data)
+    rendered = render_action_payload_for_prompt(action_data)
+
+    assert "replace" not in flattened
+    assert "头发和衬衫被雨淋湿" in flattened
+    assert '"effect_change": "replace"' in rendered
+    assert '"effect_new_state":' in rendered
 
 
 # ============ is_named_character_intent ============
@@ -246,3 +292,80 @@ def test_bot_absent_intent_only_matches_explicit_subject_token():
         "description": f"文字里偶然提到{BOT_ABSENT_TOKEN}",
     }) is False
     assert is_bot_absent_intent({"subject_and_pov": None}) is False
+
+
+def test_self_image_intent_token_does_not_reinject_whole_flat_blob():
+    """上游追加 self-image token 时，只补差集，不把拍平串整段塞回去。
+
+    回归历史缺陷：description 被追加 '肖像照' 后 effective != flattened，
+    旧实现据此把全部字段拍平的长串写进 payload 且排在结构化字段之前，
+    Tag LLM 第一手读到的就是边界已抹平、内容重复两遍的版本。
+    """
+
+    action_data = {
+        "subject_and_pov": "一女 第三视角",
+        "action": "女生：侧卧在沙发上；女生：单手拿着手机",
+        "emotion": "温柔",
+        "dynamic_scene": "午后柔和光线",
+        "framing": "中景",
+    }
+    flat = compose_description_from_action_payload(action_data)
+
+    rendered = render_action_payload_for_prompt(
+        action_data,
+        effective_description=f"{flat} 肖像照",
+    )
+
+    assert '"extra_request": "肖像照"' in rendered
+    # 拍平串本体不得再出现：动作只能通过 action 字段抵达下游
+    assert flat not in rendered
+    assert '"action": "女生：侧卧在沙发上；女生：单手拿着手机"' in rendered
+    assert rendered.count("侧卧在沙发上") == 1
+    assert rendered.count("温柔") == 1
+
+
+def test_self_image_intent_prefix_is_extracted_as_residual():
+    action_data = {"action": "女生：靠在窗边", "emotion": "慵懒"}
+    flat = compose_description_from_action_payload(action_data)
+
+    rendered = render_action_payload_for_prompt(
+        action_data,
+        effective_description=f"一女 肖像照 {flat}",
+    )
+
+    assert '"extra_request": "一女 肖像照"' in rendered
+    assert rendered.count("靠在窗边") == 1
+
+
+def test_rewritten_effective_description_is_kept_whole():
+    """定位不到结构化基线说明上游做了改写，宁可重复也不能丢锚点。"""
+
+    rendered = render_action_payload_for_prompt(
+        {"subject_and_pov": "一女 第三视角"},
+        effective_description="初音未来 公式服 葱色双马尾",
+    )
+
+    assert '"extra_request": "初音未来 公式服 葱色双马尾"' in rendered
+
+
+def test_visual_plan_leads_payload_and_free_text_trails_it():
+    """字段顺序即阅读顺序：导演笔记在前，无边界自由文本垫底。"""
+
+    rendered = render_action_payload_for_prompt(
+        {
+            "visual_plan": "moment=递茶",
+            "subject_and_pov": "一男一女 第三视角",
+            "action": "女生 → 男生：递茶",
+            "description": "兜底原文",
+        },
+        effective_description="兜底原文 一男一女 第三视角 女生 → 男生：递茶 额外锚点",
+    )
+
+    order = [
+        rendered.index('"visual_plan"'),
+        rendered.index('"subject_and_pov"'),
+        rendered.index('"action"'),
+        rendered.index('"description"'),
+        rendered.index('"extra_request"'),
+    ]
+    assert order == sorted(order)

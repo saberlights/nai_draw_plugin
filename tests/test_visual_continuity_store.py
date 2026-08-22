@@ -37,6 +37,9 @@ def _sample_stable() -> StableVisualTags:
     return StableVisualTags(
         outfit=outfit_card.tags,
         environment=environment_card.tags,
+        effects=("wet hair", "tear streaks"),
+        scene_effects=("coat on chair",),
+        last_framing=("medium shot", "from side"),
         outfit_key=outfit_card.key,
         environment_key=environment_card.key,
         outfits=(outfit_card,),
@@ -72,6 +75,9 @@ def test_ttl_expires_current_look_but_keeps_card_library(tmp_path) -> None:
     assert expired is not None
     assert expired.outfit == ()
     assert expired.environment == ()
+    assert expired.effects == ()
+    assert expired.scene_effects == ()
+    assert expired.last_framing == ()
     assert expired.outfit_key == ""
     assert expired.outfits == stable.outfits
     assert expired.environments == stable.environments

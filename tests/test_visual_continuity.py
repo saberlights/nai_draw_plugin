@@ -46,6 +46,107 @@ def test_keep_reuses_exact_stable_tags_while_dynamic_tags_change() -> None:
     assert "wooden shelves" not in result.prompt
 
 
+def test_effects_are_reused_and_last_framing_tracks_actual_output() -> None:
+    previous = StableVisualTags(
+        outfit=("white blouse",),
+        environment=("entryway",),
+        effects=("wet hair", "wet clothes"),
+        scene_effects=("folded umbrella by door",),
+        last_framing=("medium shot",),
+    )
+    response = json.dumps({
+        "version": 4,
+        "format": "single",
+        "intent": "portrait",
+        "dynamic": {
+            "subject": ["rating:sensitive", "solo", "1girl"],
+            "action": ["removing shoes"],
+            "emotion": ["tired"],
+            "scene": [],
+            "framing": ["full body", "from side"],
+        },
+        "stable": {
+            "outfit": {"mode": "keep", "tags": []},
+            "environment": {"mode": "keep", "tags": []},
+            "effects": {"mode": "keep", "subject": [], "scene": []},
+        },
+    })
+
+    result = resolve_visual_continuity(response, previous=previous)
+
+    assert "wet hair" in result.prompt
+    assert "wet clothes" in result.prompt
+    assert "folded umbrella by door" in result.prompt
+    assert result.stable.effects == previous.effects
+    assert result.stable.scene_effects == previous.scene_effects
+    assert result.stable.last_framing == ("full body", "from side")
+
+
+def test_effect_replace_splits_bot_and_scene_state_then_clear_removes_both() -> None:
+    establish = json.dumps({
+        "version": 4,
+        "format": "single",
+        "intent": "portrait",
+        "dynamic": {
+            "subject": ["rating:sensitive", "solo", "1girl"],
+            "action": ["standing"],
+            "emotion": [],
+            "scene": [],
+            "framing": ["medium shot"],
+        },
+        "stable": {
+            "outfit": {"mode": "replace", "key": "white_blouse", "tags": ["white blouse"]},
+            "environment": {"mode": "replace", "key": "entryway", "tags": ["entryway"]},
+            "effects": {
+                "mode": "replace",
+                "subject": ["wet hair", "tear streaks"],
+                "scene": ["coat on chair"],
+            },
+        },
+    })
+    established = resolve_visual_continuity(establish)
+
+    assert established.failure == ""
+    assert established.stable.effects == ("wet hair", "tear streaks")
+    assert established.stable.scene_effects == ("coat on chair",)
+
+    clear_payload = json.loads(establish)
+    clear_payload["stable"]["outfit"] = {"mode": "keep", "tags": []}
+    clear_payload["stable"]["environment"] = {"mode": "keep", "tags": []}
+    clear_payload["stable"]["effects"] = {
+        "mode": "clear", "subject": [], "scene": []
+    }
+    cleared = resolve_visual_continuity(
+        json.dumps(clear_payload), previous=established.stable
+    )
+
+    assert cleared.stable.effects == ()
+    assert cleared.stable.scene_effects == ()
+    assert "wet hair" not in cleared.prompt
+    assert "coat on chair" not in cleared.prompt
+
+
+def test_legacy_v4_without_effects_keeps_previous_effects() -> None:
+    previous = StableVisualTags(
+        outfit=("white blouse",),
+        effects=("wet hair",),
+        scene_effects=("coat on chair",),
+    )
+    response = (
+        '{"version":4,"format":"single","intent":"portrait",'
+        '"dynamic":{"subject":["rating:general","solo","1girl"],'
+        '"action":[],"emotion":[],"scene":[],"framing":["close-up"]},'
+        '"stable":{"outfit":{"mode":"keep","tags":[]},'
+        '"environment":{"mode":"keep","tags":[]}}}'
+    )
+
+    result = resolve_visual_continuity(response, previous=previous)
+
+    assert result.failure == ""
+    assert result.stable.effects == previous.effects
+    assert result.stable.scene_effects == previous.scene_effects
+
+
 def test_multi_keeps_bot_girl_and_boy_in_separate_character_prompts() -> None:
     previous = StableVisualTags(
         outfit=("white blouse", "navy pleated skirt"),
@@ -65,13 +166,13 @@ def test_multi_keeps_bot_girl_and_boy_in_separate_character_prompts() -> None:
                 {
                     "role": "bot",
                     "subject": ["girl"],
-                    "action": ["target#kissed", "clutching clothes"],
+                    "action": ["target#kiss", "clutching clothes"],
                     "emotion": ["closed eyes", "blush", "shy"],
                 },
                 {
                     "role": "other",
                     "subject": ["boy"],
-                    "action": ["source#kissing"],
+                    "action": ["source#kiss"],
                     "emotion": [],
                 },
             ],
@@ -97,20 +198,56 @@ def test_multi_keeps_bot_girl_and_boy_in_separate_character_prompts() -> None:
     assert characters == [
         {
             "prompt": (
-                "girl, white blouse, navy pleated skirt, target#kissed, "
+                "girl, white blouse, navy pleated skirt, target#kiss, "
                 "clutching clothes, closed eyes, blush, shy"
             ),
             "negative_prompt": "",
             "position": "D3",
         },
         {
-            "prompt": "boy, source#kissing",
+            "prompt": "boy, source#kiss",
             "negative_prompt": "",
             "position": "B3",
         },
     ]
     assert "white blouse" not in characters[1]["prompt"]
-    assert "target#kissed" not in characters[1]["prompt"]
+    assert "target#kiss" not in characters[1]["prompt"]
+
+
+def test_multi_effects_only_attach_to_bot_and_scene_global() -> None:
+    previous = StableVisualTags(
+        outfit=("white blouse",),
+        environment=("hotel room",),
+        effects=("wet hair",),
+        scene_effects=("coat on chair",),
+    )
+    response = json.dumps({
+        "version": 4,
+        "format": "multi",
+        "intent": "normal",
+        "dynamic": {
+            "subject": ["rating:sensitive", "1boy 1girl"],
+            "action": [], "emotion": [], "scene": [],
+            "framing": ["medium shot"],
+            "people": [
+                {"role": "bot", "subject": ["girl"], "action": [], "emotion": []},
+                {"role": "other", "subject": ["boy"], "action": [], "emotion": []},
+            ],
+            "positions": [],
+        },
+        "stable": {
+            "outfit": {"mode": "keep", "tags": []},
+            "environment": {"mode": "keep", "tags": []},
+            "effects": {"mode": "keep", "subject": [], "scene": []},
+        },
+    })
+
+    result = resolve_visual_continuity(response, previous=previous)
+
+    assert result.structured is not None
+    assert "wet hair" in result.structured["characters"][0]["prompt"]
+    assert "wet hair" not in result.structured["characters"][1]["prompt"]
+    assert "coat on chair" in result.structured["global_text"]
 
 
 def test_replace_creates_new_stable_outfit_and_environment_tags() -> None:
@@ -1056,3 +1193,144 @@ def test_describe_visual_failure_gives_actionable_chinese_hint() -> None:
     assert "服装" in describe_visual_failure("outfit:not_established")
     assert "环境" in describe_visual_failure("environment:switch_unknown_key")
     assert describe_visual_failure("unknown_code")  # 未知码也要有兜底指引文本
+
+
+def _multi_response(bot_action: list[str], other_action: list[str]) -> str:
+    """构造一份只有人物动作不同的 multi 响应，其余字段固定合法。"""
+
+    return json.dumps({
+        "version": 4,
+        "format": "multi",
+        "intent": "normal",
+        "dynamic": {
+            "subject": ["rating:explicit", "1boy 1girl"],
+            "action": [],
+            "emotion": [],
+            "scene": [],
+            "framing": ["cowboy shot"],
+            "people": [
+                {
+                    "role": "bot",
+                    "subject": ["girl"],
+                    "action": bot_action,
+                    "emotion": ["blush"],
+                },
+                {
+                    "role": "other",
+                    "subject": ["boy"],
+                    "action": other_action,
+                    "emotion": [],
+                },
+            ],
+            "positions": [],
+        },
+        "stable": {
+            "outfit": {"mode": "keep", "key": "", "tags": []},
+            "environment": {"mode": "keep", "key": "", "tags": []},
+        },
+    })
+
+
+def _stable_with_outfit() -> StableVisualTags:
+    return StableVisualTags(outfit=("white blouse",), environment=("bedroom",))
+
+
+def test_interaction_binding_accepts_identical_tag_on_both_sides() -> None:
+    """NAI 官方约定：source#hug 必须配同名 target#hug，才能绑成一次互动。"""
+
+    result = resolve_visual_continuity(
+        _multi_response(["target#hug", "clutching clothes"], ["source#hug"]),
+        previous=_stable_with_outfit(),
+    )
+
+    assert result.failure == ""
+    characters = result.structured["characters"]
+    assert "target#hug" in characters[0]["prompt"]
+    assert "source#hug" in characters[1]["prompt"]
+
+
+def test_interaction_binding_rejects_participle_mismatch() -> None:
+    """现在分词/过去分词写法配不上，NAI 会把方向随机化，必须打回重写。"""
+
+    result = resolve_visual_continuity(
+        _multi_response(["target#groped"], ["source#groping"]),
+        previous=_stable_with_outfit(),
+    )
+
+    assert result.failure == "multi:interaction_unpaired"
+    assert result.prompt == ""
+    assert result.structured is None
+
+
+def test_interaction_binding_rejects_fabricated_passive_tag() -> None:
+    """target 侧编造 paizured 这类不存在的被动词，同样配不上 source#paizuri。"""
+
+    result = resolve_visual_continuity(
+        _multi_response(["source#paizuri"], ["target#paizured"]),
+        previous=_stable_with_outfit(),
+    )
+
+    assert result.failure == "multi:interaction_unpaired"
+
+
+def test_interaction_binding_rejects_prefixed_self_action() -> None:
+    """自身动作误加 source# 会被 NAI 绑到对方身上，画成“对方在做”。"""
+
+    result = resolve_visual_continuity(
+        _multi_response(
+            ["source#grabbing own breast", "target#hug"],
+            ["source#hug"],
+        ),
+        previous=_stable_with_outfit(),
+    )
+
+    assert result.failure == "multi:interaction_unpaired"
+
+
+def test_interaction_binding_tolerates_underscore_and_weight_wrappers() -> None:
+    """归一化后同名即可绑定：下划线写法与权重外壳不算不一致。"""
+
+    result = resolve_visual_continuity(
+        _multi_response(
+            ["1.2::target#hands_on_waist::"],
+            ["source#hands on waist"],
+        ),
+        previous=_stable_with_outfit(),
+    )
+
+    assert result.failure == ""
+
+
+def test_interaction_binding_requires_two_holders_for_mutual() -> None:
+    lonely = resolve_visual_continuity(
+        _multi_response(["mutual#hug"], ["standing"]),
+        previous=_stable_with_outfit(),
+    )
+    assert lonely.failure == "multi:interaction_mutual_unpaired"
+
+    paired = resolve_visual_continuity(
+        _multi_response(["mutual#hug"], ["mutual#hug"]),
+        previous=_stable_with_outfit(),
+    )
+    assert paired.failure == ""
+
+
+def test_interaction_binding_rejects_self_paired_prefixes_on_one_person() -> None:
+    """同一人物同时写 source# 和 target# 不构成互动，对家必须是另一个人。"""
+
+    result = resolve_visual_continuity(
+        _multi_response(["source#hug", "target#hug"], ["standing"]),
+        previous=_stable_with_outfit(),
+    )
+
+    assert result.failure == "multi:interaction_unpaired"
+
+
+def test_interaction_failure_hints_teach_the_identical_tag_rule() -> None:
+    unpaired = describe_visual_failure("multi:interaction_unpaired")
+    assert "逐字同名" in unpaired
+    assert "source#groping / target#groped 是错的" in unpaired
+    assert "自身动作" in unpaired
+
+    mutual = describe_visual_failure("multi:interaction_mutual_unpaired")
+    assert "至少两个人物段" in mutual
