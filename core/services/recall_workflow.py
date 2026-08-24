@@ -34,8 +34,50 @@ from ..constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 logger = get_logger("nai_draw_plugin")
 _PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 _DEFAULT_DB_PATH = resolve_db_path(_PLUGIN_ROOT / "sdk_runtime.py")
-_DEFAULT_NAPCAT_CONFIG_PATH = _PLUGIN_ROOT.parent / "MaiBot-Napcat-Adapter" / "config.toml"
+_PLUGINS_DIR = _PLUGIN_ROOT.parent
+# 官方适配器的目录名；用户从别处安装时目录名可能不同（如 maibot-team_napcat-adapter），
+# 所以这只是首选猜测，猜不中时由 _discover_napcat_config_path 扫描兜底。
+_DEFAULT_NAPCAT_CONFIG_PATH = _PLUGINS_DIR / "MaiBot-Napcat-Adapter" / "config.toml"
+# 扫描候选目录时的名字特征：同时含 napcat 才认，避免把别的适配器配置读进来
+_NAPCAT_DIR_HINT = "napcat"
 _RECENT_MANUAL_RECALL_IDS: dict[str, dict[str, float]] = {}
+
+
+def _has_napcat_server_section(config_path: Path) -> bool:
+    """确认候选文件确实是 Napcat 适配器配置（含 ``[napcat_server]`` 节）。"""
+    try:
+        with config_path.open("rb") as fp:
+            return isinstance(tomllib.load(fp).get("napcat_server"), dict)
+    except Exception:
+        return False
+
+
+def _discover_napcat_config_path() -> Path:
+    """定位 Napcat 适配器的 config.toml。
+
+    治根：旧实现把适配器目录名硬编码成 ``MaiBot-Napcat-Adapter``，用户装的是
+    ``maibot-team_napcat-adapter`` 之类的名字时直接找不到，直连撤回通道整条失效
+    （日志只有一句"未找到可用的 Napcat 连接配置"，很难联想到是目录名不匹配）。
+    这里先试默认名，再在同级插件目录里按"名字含 napcat + 有 [napcat_server] 节"扫一遍。
+
+    Returns:
+        找到的配置路径；一个都没找到时返回默认路径（调用方按"文件不存在"处理）。
+    """
+    if _DEFAULT_NAPCAT_CONFIG_PATH.is_file():
+        return _DEFAULT_NAPCAT_CONFIG_PATH
+
+    if not _PLUGINS_DIR.is_dir():
+        return _DEFAULT_NAPCAT_CONFIG_PATH
+
+    for entry in sorted(_PLUGINS_DIR.iterdir()):
+        if not entry.is_dir() or _NAPCAT_DIR_HINT not in entry.name.lower():
+            continue
+        candidate = entry / "config.toml"
+        if candidate.is_file() and _has_napcat_server_section(candidate):
+            logger.info("(撤回) 已自动定位 Napcat 适配器配置: %s", candidate)
+            return candidate
+
+    return _DEFAULT_NAPCAT_CONFIG_PATH
 
 
 class RecallWorkflow:
@@ -51,7 +93,7 @@ class RecallWorkflow:
         start_task: Callable[..., asyncio.Task[Any] | None],
         log_prefix: str,
         db_path: str | Path = _DEFAULT_DB_PATH,
-        napcat_config_path: str | Path = _DEFAULT_NAPCAT_CONFIG_PATH,
+        napcat_config_path: str | Path | None = None,
         recent_recall_state: dict[str, dict[str, float]] | None = None,
         wall_clock: Callable[[], float] = time.time,
     ) -> None:
@@ -62,11 +104,25 @@ class RecallWorkflow:
         self._start_task = start_task
         self._log_prefix = str(log_prefix or "nai_draw_plugin")
         self._db_path = Path(db_path)
-        self._napcat_config_path = Path(napcat_config_path)
+        self._napcat_config_path = self._resolve_napcat_config_path(napcat_config_path)
         self._recent_recall_state = (
             _RECENT_MANUAL_RECALL_IDS if recent_recall_state is None else recent_recall_state
         )
         self._wall_clock = wall_clock
+
+    def _resolve_napcat_config_path(self, explicit_path: str | Path | None) -> Path:
+        """决定读哪份 Napcat 适配器配置。
+
+        优先级：构造参数（测试用）→ ``auto_recall.napcat_config_path`` 配置项 → 自动定位。
+        """
+        if explicit_path is not None:
+            return Path(explicit_path)
+
+        configured = str(self._get_config("auto_recall.napcat_config_path", "") or "").strip()
+        if configured:
+            return Path(configured)
+
+        return _discover_napcat_config_path()
 
     async def schedule_auto_recall(
         self,
@@ -323,7 +379,14 @@ class RecallWorkflow:
     async def _try_direct_napcat_action(self, message_id: str) -> bool:
         server_config = self._load_napcat_server_config()
         if server_config is None:
-            logger.warning("%s 未找到可用的 Napcat 连接配置，无法直连撤回", self._log_prefix)
+            # 降到 info：直连只是快捷通道，后面还有 api.call 兜底，撤回未必失败。
+            # 打成 warning 会让"功能正常"的用户每次撤回都看到一条吓人的告警。
+            logger.info(
+                "%s 未找到 Napcat 直连配置(%s)，改走 api.call 通道；"
+                "如需直连可配置 auto_recall.napcat_config_path",
+                self._log_prefix,
+                self._napcat_config_path,
+            )
             return False
 
         headers = (

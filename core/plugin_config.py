@@ -712,7 +712,7 @@ class PluginConfigDefinition:
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.7.0",
+                default="1.8.0",
                 description="插件配置版本号；由插件自行维护，请勿手动修改"
             ),
             "enabled": ConfigField(
@@ -1146,6 +1146,15 @@ class PluginConfigDefinition:
                 type=list,
                 default=[],
                 description="自动撤回会话白名单；填 platform:chat_id 字符串数组，留空数组表示所有会话都允许"
+            ),
+            "napcat_config_path": ConfigField(
+                type=str,
+                default="",
+                description=(
+                    "Napcat 适配器 config.toml 的绝对路径；留空则自动在同级插件目录里查找"
+                    "（目录名含 napcat 且带 [napcat_server] 节）。仅用于直连撤回快捷通道，"
+                    "找不到时会自动改走 api.call 通道，不影响撤回功能"
+                )
             )
         },
         "admin": {

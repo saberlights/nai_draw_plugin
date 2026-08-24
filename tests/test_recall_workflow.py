@@ -34,7 +34,11 @@ if "src.common.logger" not in sys.modules:
     src_package.__path__ = [os.path.join(MAIBOT_ROOT, "src")]
     sys.modules.setdefault("src", src_package)
 
-from plugins.nai_draw_plugin.core.services.recall_workflow import RecallWorkflow
+from plugins.nai_draw_plugin.core.services.recall_workflow import (
+    RecallWorkflow,
+    _discover_napcat_config_path,
+    _has_napcat_server_section,
+)
 from plugins.nai_draw_plugin.runtime_recall import reset_runtime_recall_tracking_state
 
 
@@ -238,3 +242,128 @@ def test_auto_recall_tracks_task_and_deletes_image_matching_send_time(tmp_path: 
     asyncio.run(run_scenario())
 
     assert recalled_ids == [401]
+
+
+def _build_probe_workflow(config: dict, tmp_path: Path) -> RecallWorkflow:
+    """造一个只用来看 _napcat_config_path 解析结果的 workflow。"""
+    async def send_text(text: str, storage_message: bool = True) -> bool:
+        return True
+
+    return RecallWorkflow(
+        config=config,
+        stream_id="stream-1",
+        context=types.SimpleNamespace(),
+        send_text=send_text,
+        start_task=lambda job_factory, **_kwargs: None,
+        log_prefix="test",
+        db_path=tmp_path / "MaiBot.db",
+        recent_recall_state={},
+    )
+
+
+def test_has_napcat_server_section_rejects_unrelated_toml(tmp_path: Path) -> None:
+    """只认带 [napcat_server] 的配置，别的适配器配置不能被误读。"""
+    napcat = tmp_path / "napcat.toml"
+    napcat.write_text('[napcat_server]\nhost = "127.0.0.1"\nport = 3001\n', encoding="utf-8")
+    other = tmp_path / "other.toml"
+    other.write_text('[telegram]\ntoken = "x"\n', encoding="utf-8")
+    broken = tmp_path / "broken.toml"
+    broken.write_text("这不是 toml = = =\n[[[", encoding="utf-8")
+
+    assert _has_napcat_server_section(napcat) is True
+    assert _has_napcat_server_section(other) is False
+    assert _has_napcat_server_section(broken) is False
+    assert _has_napcat_server_section(tmp_path / "nonexistent.toml") is False
+
+
+def test_explicit_config_path_setting_wins(tmp_path: Path) -> None:
+    """配置项 auto_recall.napcat_config_path 指定的路径优先于自动查找。"""
+    custom = tmp_path / "my-adapter" / "config.toml"
+    custom.parent.mkdir()
+    custom.write_text('[napcat_server]\nhost = "10.0.0.1"\nport = 4001\n', encoding="utf-8")
+
+    workflow = _build_probe_workflow(
+        {"auto_recall": {"napcat_config_path": str(custom)}}, tmp_path
+    )
+
+    assert workflow._napcat_config_path == custom
+    # 解析出来的连接信息要真的来自这份自定义配置
+    assert workflow._load_napcat_server_config() == {
+        "ws_url": "ws://10.0.0.1:4001",
+        "token": "",
+        "action_timeout_sec": 15.0,
+    }
+
+
+def test_discovery_finds_differently_named_adapter_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """适配器目录名不是 MaiBot-Napcat-Adapter 时也要能找到。
+
+    回归 bug：目录名被硬编码成 ``MaiBot-Napcat-Adapter``，用户装成
+    ``maibot-team_napcat-adapter`` 就整条直连通道失效，日志只有一句
+    "未找到可用的 Napcat 连接配置"，很难联想到是目录名不匹配。
+    """
+    import plugins.nai_draw_plugin.core.services.recall_workflow as rw
+
+    plugins_dir = tmp_path / "plugins"
+    # 干扰项：名字不含 napcat，且自己也有 config.toml
+    (plugins_dir / "some-other-adapter").mkdir(parents=True)
+    (plugins_dir / "some-other-adapter" / "config.toml").write_text(
+        '[telegram]\ntoken = "x"\n', encoding="utf-8"
+    )
+    target = plugins_dir / "maibot-team_napcat-adapter"
+    target.mkdir()
+    (target / "config.toml").write_text(
+        '[napcat_server]\nhost = "127.0.0.1"\nport = 3001\n', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(rw, "_PLUGINS_DIR", plugins_dir)
+    monkeypatch.setattr(
+        rw, "_DEFAULT_NAPCAT_CONFIG_PATH", plugins_dir / "MaiBot-Napcat-Adapter" / "config.toml"
+    )
+
+    assert _discover_napcat_config_path() == target / "config.toml"
+
+
+def test_discovery_prefers_official_directory_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """官方目录名存在时直接用它，不去扫描。"""
+    import plugins.nai_draw_plugin.core.services.recall_workflow as rw
+
+    plugins_dir = tmp_path / "plugins"
+    official = plugins_dir / "MaiBot-Napcat-Adapter"
+    official.mkdir(parents=True)
+    (official / "config.toml").write_text(
+        '[napcat_server]\nhost = "127.0.0.1"\nport = 3001\n', encoding="utf-8"
+    )
+    other = plugins_dir / "zzz_napcat-adapter"
+    other.mkdir()
+    (other / "config.toml").write_text(
+        '[napcat_server]\nhost = "9.9.9.9"\nport = 9999\n', encoding="utf-8"
+    )
+
+    monkeypatch.setattr(rw, "_PLUGINS_DIR", plugins_dir)
+    monkeypatch.setattr(rw, "_DEFAULT_NAPCAT_CONFIG_PATH", official / "config.toml")
+
+    assert _discover_napcat_config_path() == official / "config.toml"
+
+
+def test_discovery_falls_back_to_default_when_nothing_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个都找不到时返回默认路径，由调用方按"文件不存在"走 api.call 兜底。"""
+    import plugins.nai_draw_plugin.core.services.recall_workflow as rw
+
+    plugins_dir = tmp_path / "plugins"
+    plugins_dir.mkdir()
+    default_path = plugins_dir / "MaiBot-Napcat-Adapter" / "config.toml"
+
+    monkeypatch.setattr(rw, "_PLUGINS_DIR", plugins_dir)
+    monkeypatch.setattr(rw, "_DEFAULT_NAPCAT_CONFIG_PATH", default_path)
+
+    assert _discover_napcat_config_path() == default_path
+    workflow = _build_probe_workflow({}, tmp_path)
+    # 找不到配置时不能抛，只返回 None 让上层走 api.call
+    assert workflow._load_napcat_server_config() is None
