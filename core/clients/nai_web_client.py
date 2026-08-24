@@ -40,8 +40,8 @@ _NAI_CHAT_ENDPOINT: str = "/v1/chat/completions"
 # 网关临时故障的可重试状态码（§15）
 _RETRYABLE_STATUS_CODES: frozenset = frozenset({429, 500, 502, 503, 504})
 
-# 多角色（NewAPI §7）能力检测：仅 nai-diffusion-4 系列稳定支持 `characters[]` / `use_coords`
-_MULTI_CHARACTER_MODEL_KEYWORDS: Tuple[str, ...] = ("nai-diffusion-4",)
+# 多角色（NewAPI §7）能力检测：nai-diffusion-4 / 5 系列支持 `characters[]` / `use_coords`
+_MULTI_CHARACTER_MODEL_KEYWORDS: Tuple[str, ...] = ("nai-diffusion-4", "nai-diffusion-5")
 
 # 多角色 position 字面量 [A-E][1-5]，与 prompt_output_parser 保持一致
 _POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
@@ -546,8 +546,8 @@ class NaiWebClient:
     ) -> Optional[List[Dict[str, Any]]]:
         """按模型嗅探决定是否启用多角色字段。
 
-        非 ``nai-diffusion-4*`` 系列降级为单字符串路径，并打一条 warning 让用户知道
-        发生了静默降级。
+        ``nai-diffusion-4`` / ``nai-diffusion-5`` 之外的系列降级为单字符串路径，并打一条
+        warning 让用户知道发生了静默降级。
 
         Returns:
             支持时返回原列表（可能为 None / 空）；不支持时返回 None。
@@ -983,7 +983,7 @@ class NaiWebClient:
 
         Args:
             characters: 可选的多角色 payload，每项含 ``prompt`` / ``negative_prompt`` / ``position``。
-                仅当模型支持（nai-diffusion-4 系列）时生效；其它模型会自动降级为单字符串路径。
+                仅当模型支持（nai-diffusion-4 / 5 系列）时生效；其它模型会自动降级为单字符串路径。
             i2i_payload: 文档 §20.1 i2i 图生图 payload，含 ``image`` / ``strength`` / ``noise`` / ``seed``。
                 与 ``controlnet`` / ``character_references`` 不互斥，但与 inpaint 互斥（本插件不支持 inpaint）。
             controlnet_payload: 文档 §20.3 Vibe Transfer payload，含 ``images``(最多 4 张)与可选整体 ``strength``。

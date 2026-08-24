@@ -291,6 +291,45 @@ def test_filter_characters_for_model_keeps_v4_series() -> None:
     )
 
 
+def test_filter_characters_for_model_keeps_v5_series() -> None:
+    """V5 支持 §7 多角色，不能被嗅探降级掉。
+
+    回归 bug：白名单只有 ``nai-diffusion-4``，导致 V5 下 ``characters`` 被整体丢弃，
+    inner JSON 只剩 ``global_text``，两个角色段（角色名 + source#/target# 绑定）静默消失。
+    """
+    characters = [{"prompt": "a"}, {"prompt": "b"}]
+    assert (
+        NaiWebClient._filter_characters_for_model("nai-diffusion-5-full", characters)
+        is characters
+    )
+
+
+def test_build_inner_draw_params_keeps_characters_on_v5() -> None:
+    """端到端确认 V5 的 inner JSON 真的带上了 characters/use_order，而不是只剩 global。"""
+    inner = NaiWebClient._build_inner_draw_params(
+        "rating:explicit, 1boy 1girl, city at night",
+        {"default_model": "nai-diffusion-5-full", "nai_size": "竖图"},
+        None,
+        NaiWebClient._filter_characters_for_model(
+            "nai-diffusion-5-full",
+            [
+                {"prompt": "boy, shota, 1.4::source#holding_money::", "position": ""},
+                {
+                    "prompt": "girl, 1.05::aemeath_(wuthering_waves)::, 1.4::target#holding_money::",
+                    "position": "",
+                },
+            ],
+        ),
+    )
+
+    assert [item["prompt"] for item in inner["characters"]] == [
+        "boy, shota, 1.4::source#holding_money::",
+        "girl, 1.05::aemeath_(wuthering_waves)::, 1.4::target#holding_money::",
+    ]
+    assert inner["use_coords"] is False
+    assert inner["use_order"] is True
+
+
 def test_filter_characters_for_model_drops_legacy_models() -> None:
     characters = [{"prompt": "a"}, {"prompt": "b"}]
     assert NaiWebClient._filter_characters_for_model("nai-diffusion-3", characters) is None
