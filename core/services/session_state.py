@@ -22,6 +22,7 @@ from .session_preferences import SessionPreferences
 from .transient_generation_state import TransientGenerationState
 from .visual_continuity import StableVisualTags
 from .visual_continuity_store import visual_continuity_store
+from ..model_capabilities import resolve_config_section
 
 logger = get_logger("nai_draw_plugin")
 
@@ -256,15 +257,7 @@ class SessionStateManager:
     @staticmethod
     def _get_artist_config_section(model_name: str) -> Optional[str]:
         """根据模型名解析画师串配置节。"""
-        if "nai-diffusion-3" in model_name:
-            return "model_nai3"
-        if "nai-diffusion-5" in model_name:
-            return "model_nai4_5"
-        if "nai-diffusion-4-5" in model_name:
-            return "model_nai4_5"
-        if "nai-diffusion-4" in model_name:
-            return "model_nai4"
-        return None
+        return resolve_config_section(model_name)
 
     def _resolve_default_artist_index(
         self,

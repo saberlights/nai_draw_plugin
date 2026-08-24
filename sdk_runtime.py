@@ -28,6 +28,12 @@ from .runtime_recall import (
 from .core.clients.nai_web_client import NaiWebClient
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.mixins.model_config_mixin import ModelConfigMixin
+from .core.model_capabilities import (
+    model_label,
+    resolve_config_section,
+    supports_character_reference,
+    supports_vibe_transfer,
+)
 from .core.rules.selfie_rules import (
     detect_bot_self_image_intent,
     detect_selfie_from_output,
@@ -1667,6 +1673,38 @@ class NaiInvocation(ModelConfigMixin):
             return float(hi)
         return value
 
+    async def _ensure_mode_supported_by_model(self, mode: str) -> bool:
+        """校验当前会话模型是否支持本条图生图模式，不支持则直接回话并拦下。
+
+        ``i2i`` 是所有模型都有的能力，只有 ``ref``（§20.4 角色参考）与 ``vibe``
+        （§20.3 氛围转移）需要门控——例如 V5 目前只提供文生图与图生图。
+        """
+        checkers = {
+            "ref": (supports_character_reference, "角色参考", "ref"),
+            "vibe": (supports_vibe_transfer, "氛围转移", "vibe"),
+        }
+        entry = checkers.get(mode)
+        if entry is None:
+            return True
+
+        is_supported, feature_label, command = entry
+        model_name = self._resolve_active_model_name()
+        if is_supported(model_name):
+            return True
+
+        await self.send_text(
+            f"❌ 当前模型 {model_name}（{model_label(model_name)}）不支持{feature_label}\n"
+            f"请先 /nai set 4.5 切到 V4.5，再用 /nai {command}"
+        )
+        logger.info(
+            "%s /nai %s 被能力门控拦下：模型 %s 不支持%s",
+            self.log_prefix,
+            mode,
+            model_name,
+            feature_label,
+        )
+        return False
+
     async def _run_image_pipeline(
         self,
         *,
@@ -1699,6 +1737,12 @@ class NaiInvocation(ModelConfigMixin):
                 }.get(mode, "/nai i2i 改成森林背景")
                 await self.send_text(f"请输入你想画的内容，例如：{example}")
                 return False, "未提供描述", True
+
+            # 能力门控放在 LLM 之前：当前模型不支持 ref / vibe 时立刻告知用户，
+            # 而不是照常翻译、出图、只在日志里 warning 一句——那样用户只会看到
+            # 一张"参考图没生效"的图，完全不知道是模型不支持。
+            if not await self._ensure_mode_supported_by_model(mode):
+                return False, f"当前模型不支持 {mode}", True
 
             # 按模式收集 normalized image(s)：vibe 走 list，其余走 single
             normalized_images: List[str] = []
@@ -2438,15 +2482,8 @@ class NaiInvocation(ModelConfigMixin):
                 "model.default_model",
                 "nai-diffusion-4-5-full",
             )
-            if "nai-diffusion-3" in current_model:
-                config_section = "model_nai3"
-            elif "nai-diffusion-5" in current_model:
-                config_section = "model_nai4_5"
-            elif "nai-diffusion-4-5" in current_model:
-                config_section = "model_nai4_5"
-            elif "nai-diffusion-4" in current_model:
-                config_section = "model_nai4"
-            else:
+            config_section = resolve_config_section(current_model)
+            if config_section is None:
                 await self.send_text("❌ 当前模型不支持画师串切换")
                 return False, "模型不支持画师串", True
 

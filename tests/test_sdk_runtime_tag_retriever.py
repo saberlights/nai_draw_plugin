@@ -875,9 +875,15 @@ def test_download_remote_image_as_base64_uses_public_client_interface() -> None:
     )
 
     assert result == "cmVtb3RlLWltYWdl"
+    # 合并后的 model_config 会显式带上本次生效的模型，避免客户端再各自兜底一次
     assert calls == [
         (
             "https://cdn.example.com/image.png",
-            invocation.plugin_config["model"],
+            {
+                "base_url": "https://std.loliyc.com",
+                "nai_proxy_mode": "auto",
+                "nai_request_timeout": 321.0,
+                "default_model": "nai-diffusion-4-5-full",
+            },
         )
     ]

@@ -9,6 +9,7 @@ from typing import Dict, Any, Tuple, Optional
 
 from src.common.logger import get_logger
 
+from ..model_capabilities import DEFAULT_MODEL_NAME, resolve_capability
 from ..services.session_state import session_state
 
 logger = get_logger("nai_draw_plugin")
@@ -49,12 +50,7 @@ class ModelConfigMixin:
         platform, chat_id, _ = self._get_chat_identity()
 
         # 获取模型名称（优先使用会话选择）
-        model_name = base_config.get("default_model", "")
-        if platform and chat_id:
-            selected_model = session_state.get_selected_model(platform, chat_id)
-            if selected_model:
-                model_name = selected_model
-                logger.debug(f"{self._log_prefix} 使用会话选定的模型: {selected_model}")
+        model_name = self._resolve_active_model_name()
 
         # 获取版本特定配置
         version_config = self._get_version_config(model_name)
@@ -133,27 +129,36 @@ class ModelConfigMixin:
 
         return merged_config
 
+    def _resolve_active_model_name(self) -> str:
+        """解析本次请求实际生效的模型名（会话选定优先于 ``model.default_model``）。
+
+        提到独立方法是为了让"能力门控"（``/nai ref`` / ``/nai vibe`` 是否被当前模型支持）
+        能在不构造整份 model_config 的前提下拿到同一个答案，避免两处解析逻辑漂移。
+        """
+        model_name = str(self.get_config("model.default_model", "") or "")  # type: ignore[attr-defined]
+        platform, chat_id, _ = self._get_chat_identity()
+        if platform and chat_id:
+            selected_model = session_state.get_selected_model(platform, chat_id)
+            if selected_model:
+                logger.debug(f"{self._log_prefix} 使用会话选定的模型: {selected_model}")
+                return selected_model
+        # 与 NaiWebClient._resolve_model_name 对齐：配置缺失时双方都按同一个兜底模型判断
+        return model_name or DEFAULT_MODEL_NAME
+
     def _get_version_config(self, model_name: str) -> Dict[str, Any]:
         """根据模型名称获取版本特定配置"""
         if not model_name:
             return {}
 
-        if "nai-diffusion-3" in model_name:
-            config_section = "model_nai3"
-            logger.debug(f"{self._log_prefix} 检测到 NAI V3 模型，使用 {config_section} 配置")
-        elif "nai-diffusion-5" in model_name:
-            config_section = "model_nai4_5"
-            logger.debug(f"{self._log_prefix} 检测到 NAI V5 模型，复用 {config_section} 配置")
-        elif "nai-diffusion-4-5" in model_name:
-            config_section = "model_nai4_5"
-            logger.debug(f"{self._log_prefix} 检测到 NAI V4.5 模型，使用 {config_section} 配置")
-        elif "nai-diffusion-4" in model_name:
-            config_section = "model_nai4"
-            logger.debug(f"{self._log_prefix} 检测到 NAI V4 模型，使用 {config_section} 配置")
-        else:
+        capability = resolve_capability(model_name)
+        if capability.config_section is None:
             return {}
 
-        return self.get_config(config_section, {})  # type: ignore[attr-defined]
+        logger.debug(
+            f"{self._log_prefix} 检测到 NAI {capability.label} 模型，"
+            f"使用 {capability.config_section} 配置"
+        )
+        return self.get_config(capability.config_section, {})  # type: ignore[attr-defined]
 
     @property
     def _log_prefix(self) -> str:

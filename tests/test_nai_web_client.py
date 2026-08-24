@@ -336,6 +336,82 @@ def test_filter_characters_for_model_drops_legacy_models() -> None:
     assert NaiWebClient._filter_characters_for_model("nai-diffusion-3-furry", characters) is None
 
 
+def test_resolve_characters_flattens_instead_of_dropping_on_unsupported_model() -> None:
+    """模型不支持 characters[] 时角色段必须拍平回 prompt，绝不能凭空消失。
+
+    回归 bug：旧实现只把 characters 丢成 None，prompt 仍是 global_text，于是
+    ``rating:general, 2girls, / char1:hatsune_miku... / char2:luo_tianyi...``
+    实际只发出了 ``rating:general, 2girls``——角色名与 mutual#hug 全丢，
+    请求照常成功、前置校验也放行，用户只看到一张完全不对的图。
+    """
+    prompt, characters = NaiWebClient._resolve_characters_for_model(
+        "nai-diffusion-3",
+        "rating:general, 2girls",
+        [
+            {"prompt": "girl, 1.05::hatsune_miku::, mutual#hug"},
+            {"prompt": "girl, 1.05::luo_tianyi::, mutual#hug"},
+        ],
+    )
+
+    assert characters is None
+    assert prompt == (
+        "rating:general, 2girls,\n"
+        "char1:girl, 1.05::hatsune_miku::, mutual#hug,\n"
+        "char2:girl, 1.05::luo_tianyi::, mutual#hug,"
+    )
+
+
+def test_resolve_characters_keeps_structured_channel_on_supported_model() -> None:
+    """支持多角色的模型必须原样走结构化通道，不能被拍平。"""
+    characters = [{"prompt": "a"}, {"prompt": "b"}]
+    prompt, effective = NaiWebClient._resolve_characters_for_model(
+        "nai-diffusion-5-full", "global tags", characters
+    )
+
+    assert prompt == "global tags"
+    assert effective is characters
+
+
+def test_unsupported_model_inner_payload_retains_every_character_tag() -> None:
+    """端到端：V3 下 inner JSON 没有 characters 键，但角色 tag 一个都不能少。"""
+    prompt, characters = NaiWebClient._resolve_characters_for_model(
+        "nai-diffusion-3",
+        "rating:general, 2girls",
+        [
+            {"prompt": "girl, 1.05::hatsune_miku::, mutual#hug"},
+            {"prompt": "girl, 1.05::luo_tianyi::, mutual#hug"},
+        ],
+    )
+    inner = NaiWebClient._build_inner_draw_params(
+        prompt,
+        {"default_model": "nai-diffusion-3", "nai_size": "竖图"},
+        None,
+        characters,
+    )
+
+    assert "characters" not in inner
+    for tag in ("hatsune_miku", "luo_tianyi", "mutual#hug", "char1:", "char2:"):
+        assert tag in inner["prompt"]
+    assert NaiWebClient._validate_inner_payload("nai-diffusion-3", inner) is None
+
+
+def test_filter_character_references_only_on_v4_5() -> None:
+    """§20.4 角色参考只有 V4.5 支持；V5 目前只有文生图与图生图，必须被挡下。"""
+    payload = [{"image": "x"}]
+    assert (
+        NaiWebClient._filter_character_references_for_model("nai-diffusion-4-5-full", payload)
+        is payload
+    )
+    assert (
+        NaiWebClient._filter_character_references_for_model("nai-diffusion-5-full", payload)
+        is None
+    )
+    assert (
+        NaiWebClient._filter_character_references_for_model("nai-diffusion-4-full", payload)
+        is None
+    )
+
+
 def test_validate_inner_payload_rejects_bad_position() -> None:
     inner = {
         "prompt": "global",

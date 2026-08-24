@@ -11,6 +11,11 @@ from requests.exceptions import ProxyError
 from src.common.logger import get_logger
 
 from ..utils.image_meta import normalize_image_base64, read_image_dimensions
+from ..model_capabilities import (
+    DEFAULT_MODEL_NAME,
+    supports_character_reference,
+    supports_multi_character,
+)
 from ..services.vibe_cache import (
     compute_image_hash,
     get_vibe_cache_service,
@@ -39,9 +44,6 @@ _NAI_CHAT_ENDPOINT: str = "/v1/chat/completions"
 
 # 网关临时故障的可重试状态码（§15）
 _RETRYABLE_STATUS_CODES: frozenset = frozenset({429, 500, 502, 503, 504})
-
-# 多角色（NewAPI §7）能力检测：nai-diffusion-4 / 5 系列支持 `characters[]` / `use_coords`
-_MULTI_CHARACTER_MODEL_KEYWORDS: Tuple[str, ...] = ("nai-diffusion-4", "nai-diffusion-5")
 
 # 多角色 position 字面量 [A-E][1-5]，与 prompt_output_parser 保持一致
 _POSITION_GRID_RE = re.compile(r"^[A-E][1-5]$")
@@ -240,7 +242,7 @@ class NaiWebClient:
     @staticmethod
     def _resolve_model_name(model_config: Dict[str, Any]) -> str:
         model_name = str(model_config.get("default_model") or "").strip()
-        return model_name or "nai-diffusion-4-5-full"
+        return model_name or DEFAULT_MODEL_NAME
 
     # ========== 请求构造 ==========
 
@@ -476,8 +478,7 @@ class NaiWebClient:
         """character_references 只对 V4.5 模型生效（文档 §20.4），其它模型自动降级。"""
         if not payload:
             return None
-        lowered = str(model_name or "").lower()
-        if "nai-diffusion-4-5" in lowered:
+        if supports_character_reference(model_name):
             return payload
         logger.warning(
             f"{log_prefix} (NewAPI) 模型 {model_name!r} 不支持 character_references，"
@@ -546,22 +547,66 @@ class NaiWebClient:
     ) -> Optional[List[Dict[str, Any]]]:
         """按模型嗅探决定是否启用多角色字段。
 
-        ``nai-diffusion-4`` / ``nai-diffusion-5`` 之外的系列降级为单字符串路径，并打一条
-        warning 让用户知道发生了静默降级。
+        不支持 ``characters[]`` 的模型返回 None，调用方**必须**改走
+        :meth:`_resolve_characters_for_model` 把角色段拍平回 prompt，否则角色信息会丢。
 
         Returns:
             支持时返回原列表（可能为 None / 空）；不支持时返回 None。
         """
         if not characters:
             return None
-        lowered = str(model_name or "").lower()
-        if any(keyword in lowered for keyword in _MULTI_CHARACTER_MODEL_KEYWORDS):
+        if supports_multi_character(model_name):
             return characters
         logger.warning(
             f"{log_prefix} (NewAPI) 模型 {model_name!r} 不在多角色支持列表内，"
-            f"已自动降级为单 prompt 路径，characters({len(characters)} 项) 已忽略"
+            f"characters({len(characters)} 项) 将被拍平回 prompt 文本"
         )
         return None
+
+    @staticmethod
+    def _merge_characters_into_prompt(
+        prompt: str,
+        characters: List[Dict[str, Any]],
+    ) -> str:
+        """把角色段拍平成 ``global,\\nchar1:...,\\nchar2:...,`` 单串。
+
+        与 ``/nai0`` 手敲多人 tag 的形态完全一致——NAI 自己会按文本解析 ``charN:`` 分段与
+        ``source#``/``target#`` 绑定，因此这是"模型不支持 characters[] 时"的无损退路。
+        """
+        lines = [f"{prompt.strip().rstrip(',')},"]
+        for index, item in enumerate(characters, start=1):
+            char_prompt = str(item.get("prompt") or "").strip().rstrip(",")
+            if char_prompt:
+                lines.append(f"char{index}:{char_prompt},")
+        return "\n".join(lines)
+
+    @classmethod
+    def _resolve_characters_for_model(
+        cls,
+        model_name: str,
+        prompt: str,
+        characters: Optional[List[Dict[str, Any]]],
+        log_prefix: str = "",
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        """决定本次请求走 ``characters[]`` 结构化通道还是拍平的单 prompt 通道。
+
+        治根：旧实现在模型不支持多角色时只是把 ``characters`` 丢成 None，而 ``prompt``
+        传的是 ``global_text``——角色段（角色名 / 服装 / ``source#``\\ ``target#`` 绑定）
+        就此静默消失，请求照常成功、图却完全不对，且前置校验也拦不住。现在改为拍平回
+        prompt 文本，任何模型下角色信息都不会丢。
+
+        Returns:
+            ``(prompt, characters)``：支持多角色时原样返回；不支持时返回
+            ``(拍平后的 prompt, None)``。
+        """
+        effective = cls._filter_characters_for_model(
+            model_name, characters, log_prefix=log_prefix
+        )
+        if effective is not None:
+            return prompt, effective
+        if not characters:
+            return prompt, None
+        return cls._merge_characters_into_prompt(prompt, characters), None
 
     @classmethod
     def _validate_inner_payload(cls, model_name: str, inner: Dict[str, Any]) -> Optional[str]:
@@ -1004,8 +1049,9 @@ class NaiWebClient:
             url = f"{base_url}{_NAI_CHAT_ENDPOINT}"
 
             model_name = self._resolve_model_name(model_config)
-            effective_characters = self._filter_characters_for_model(
-                model_name, characters, log_prefix=self.log_prefix
+            # 模型不支持 characters[] 时把角色段拍平回 prompt，绝不丢角色信息
+            prompt, effective_characters = self._resolve_characters_for_model(
+                model_name, prompt, characters, log_prefix=self.log_prefix
             )
             effective_char_refs = self._filter_character_references_for_model(
                 model_name, character_references_payload, log_prefix=self.log_prefix
