@@ -14,6 +14,16 @@ from typing import List, Tuple
 from ..model_capabilities import MODEL_SPECS
 
 
+def _models_supporting(capability_field: str) -> str:
+    """列出支持某项能力的模型档位名，供帮助文案使用。
+
+    从模型注册表派生而不是写死，否则上游放开新能力（例如 V5 补上氛围转移）时，
+    帮助文案会和实际门控行为对不上。
+    """
+    labels = [spec.label for spec in MODEL_SPECS if getattr(spec, capability_field)]
+    return " / ".join(labels) if labels else "暂无"
+
+
 @dataclass(frozen=True)
 class HelpSection:
     """一组同主题的命令项。"""
@@ -89,6 +99,7 @@ HELP_DOC: HelpDoc = HelpDoc(
             ),
             hint=(
                 "最多 4 张；全量 cache_id 命中可省 1 anlas。\n"
+                f"支持的模型：{_models_supporting('vibe_transfer')}。\n"
                 "可调参数：[vibe] info_extracted / reference_strength / overall_strength"
             ),
         ),
@@ -111,7 +122,8 @@ HELP_DOC: HelpDoc = HelpDoc(
                 ("/nai0 ref [@<名字>] <英文>", "同上但直发英文，不过 LLM"),
             ),
             hint=(
-                "仅 V4.5 系列模型支持，其它模型自动降级；固定 1 张。\n"
+                f"支持的模型：{_models_supporting('character_reference')}，"
+                "其它模型会被拦下并提示切换；固定 1 张。\n"
                 "可调参数：[character_reference] type / fidelity / strength"
             ),
         ),
@@ -123,7 +135,7 @@ HELP_DOC: HelpDoc = HelpDoc(
             items=(
                 ("/nai set [代号]", "查看 / 切换模型"),
                 ("/nai size [代号]", "查看 / 切换尺寸：竖/v、横/h、方/s"),
-                ("/nai art [编号]", "查看 / 切换画师风格预设"),
+                ("/nai art [编号]", "查看 / 切换当前模型的画师风格预设"),
                 ("/nai models", "拉取 NewAPI 网关实时可用模型"),
             ),
             hint=(

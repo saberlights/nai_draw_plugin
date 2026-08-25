@@ -1038,7 +1038,7 @@ class PluginConfigDefinition:
             ),
             "base_url": ConfigField(
                 type=str,
-                default="https://api.tuercha.com",
+                default="https://nai.rinko.ai",
                 description="NewAPI 兼容网关基础地址；可填 https://xxx 格式 URL，必填，由服务提供方给出",
                 required=True
             ),

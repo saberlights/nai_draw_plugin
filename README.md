@@ -53,7 +53,7 @@ pip install gradio_client
 enabled = true
 
 [model]
-base_url = "https://api.tuercha.com"    # 由服务方提供
+base_url = "https://nai.rinko.ai"        # 由服务方提供
 api_key = "sk-xxxxxxxx"                  # 由服务方提供
 nai_endpoint = "/v1/chat/completions"
 nai_max_tokens = 100000                  # 1 Anlas = 10000 tokens
