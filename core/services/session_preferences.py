@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -10,7 +10,11 @@ from typing import Any
 class SessionPreference:
     admin_mode: bool | None = None
     selected_model: str | None = None
-    selected_artist_index: int | None = None
+    # 画师预设索引按模型配置节隔离：{config_section: index}。
+    # 原先是一个不带模型维度的裸 int，切模型时索引会串到另一个模型的预设上
+    # （V4.5 选了 #5，切 V3 只有 2 个预设 → 越界回落，且该模型自己配的
+    # default_artist_preset 被完全忽略）。
+    selected_artist_index: dict[str, int] = field(default_factory=dict)
     selected_size: str | None = None
     recall_enabled: bool | None = None
     prompt_show_enabled: bool | None = None
@@ -43,7 +47,7 @@ class SessionPreferences:
             return {
                 "admin_mode": None,
                 "model": None,
-                "artist_index": None,
+                "artist_index": {},
                 "size": None,
                 "recall": None,
                 "prompt_show": None,
@@ -53,7 +57,7 @@ class SessionPreferences:
         return {
             "admin_mode": entry.admin_mode,
             "model": entry.selected_model,
-            "artist_index": entry.selected_artist_index,
+            "artist_index": dict(entry.selected_artist_index),
             "size": entry.selected_size,
             "recall": entry.recall_enabled,
             "prompt_show": entry.prompt_show_enabled,

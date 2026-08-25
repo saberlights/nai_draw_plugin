@@ -152,13 +152,25 @@ class SessionStateManager:
 
     # ==================== 画师串选择 ====================
 
-    def get_selected_artist_index(self, platform: str, chat_id: str) -> int:
-        """获取指定会话选定的画师串索引（从1开始）"""
+    def get_selected_artist_index(
+        self,
+        platform: str,
+        chat_id: str,
+        model_name: str,
+    ) -> Optional[int]:
+        """获取指定会话为该模型手动选定的画师串索引（从 1 开始）。
+
+        返回 None 表示该会话没有为这个模型手动切过，调用方应回落到该模型的
+        ``default_artist_preset``。
+        """
+        config_section = self._get_artist_config_section(model_name)
+        if not config_section:
+            return None
         key = self._make_key(platform, chat_id)
         preference = self._preferences.get(key)
-        if preference is None or preference.selected_artist_index is None:
-            return 1
-        return preference.selected_artist_index
+        if preference is None:
+            return None
+        return preference.selected_artist_index.get(config_section)
 
     def get_effective_artist_index(
         self,
@@ -170,7 +182,7 @@ class SessionStateManager:
         """
         获取指定会话当前实际生效的画师串索引。
 
-        若会话中未手动切换，则回退到配置中的 default_artist_preset。
+        若会话中未针对该模型手动切换，则回退到该模型配置节的 default_artist_preset。
         """
         config_section = self._get_artist_config_section(model_name)
         if not config_section:
@@ -181,19 +193,32 @@ class SessionStateManager:
         if not artist_presets:
             return 1
 
-        key = self._make_key(platform, chat_id)
-        preference = self._preferences.get(key)
-        if preference is not None and preference.selected_artist_index is not None:
-            selected_index = preference.selected_artist_index
+        selected_index = self.get_selected_artist_index(platform, chat_id, model_name)
+        if selected_index is not None:
             return selected_index if 1 <= selected_index <= len(artist_presets) else 1
 
         return self._resolve_default_artist_index(config_section, artist_presets, get_config)
 
-    def set_selected_artist_index(self, platform: str, chat_id: str, index: int):
-        """设置画师串索引"""
+    def set_selected_artist_index(
+        self,
+        platform: str,
+        chat_id: str,
+        index: int,
+        model_name: str,
+    ):
+        """为当前模型设置画师串索引；不影响其它模型已选的预设。"""
+        config_section = self._get_artist_config_section(model_name)
+        if not config_section:
+            logger.warning(
+                f"[nai_pic] 模型 {model_name} 未在模型注册表中登记，无法记录画师串选择"
+            )
+            return
         key = self._make_key(platform, chat_id)
-        self._preferences.update(key, selected_artist_index=index)
-        logger.info(f"[nai_pic] 会话 {key} 已切换画师串: #{index}")
+        preference = self._preferences.get(key)
+        current = dict(preference.selected_artist_index) if preference is not None else {}
+        current[config_section] = index
+        self._preferences.update(key, selected_artist_index=current)
+        logger.info(f"[nai_pic] 会话 {key} 已切换 {config_section} 画师串: #{index}")
 
     def get_selected_artist_preset(
         self,
@@ -241,12 +266,9 @@ class SessionStateManager:
         if not artist_presets:
             return None
 
-        # 优先使用会话中手动切换的画师串
-        key = self._make_key(platform, chat_id)
-        preference = self._preferences.get(key)
-        if preference is not None and preference.selected_artist_index is not None:
-            selected_index = preference.selected_artist_index
-        else:
+        # 优先使用会话中针对该模型手动切换的画师串
+        selected_index = self.get_selected_artist_index(platform, chat_id, model_name)
+        if selected_index is None:
             selected_index = self._resolve_default_artist_index(config_section, artist_presets, get_config)
 
         # 确保索引有效
