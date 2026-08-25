@@ -16,7 +16,6 @@ from .model_capabilities import (
     DEFAULT_MODEL_NAME,
     MAX_STEPS,
     MODEL_SPECS,
-    NOISE_SCHEDULES,
     SAMPLERS,
     ModelSpec,
     resolve_config_section,
@@ -57,8 +56,9 @@ _WEBUI_TEXTAREA_FIELDS = {
 }
 _WEBUI_PASSWORD_FIELDS = {"api_key"}
 _WEBUI_SAMPLER_CHOICES = list(SAMPLERS)
-# 留空表示不发送该字段、由网关取默认；下拉里用空串表示这一档
-_WEBUI_NOISE_SCHEDULE_CHOICES = ["", *NOISE_SCHEDULES]
+# noise_schedule 故意**不做** select：它的"留空 = 不发送该字段、让网关取默认"是一个有效
+# 且用户需要能切回去的状态，而 Dashboard 的 Select 基于 Radix，SelectItem 不接受空字符串
+# 值（会直接抛错把整个页签打崩），也没有"清除选择"的入口。所以保持文本框，说明里写清取值。
 _WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS = {
     "model_list": "候选模型列表；填系统模型配置中已定义的模型名称",
     "max_tokens": "单次响应的最大 token 数；可填正整数",
@@ -103,11 +103,6 @@ def _build_model_webui_overrides() -> dict[str, dict[str, Any]]:
             "min": 1,
             "max": MAX_STEPS,
             "step": 1,
-        }
-        overrides[f"{spec.config_section}.noise_schedule"] = {
-            "input_type": "select",
-            "ui_type": "select",
-            "choices": _WEBUI_NOISE_SCHEDULE_CHOICES,
         }
     return overrides
 
@@ -808,7 +803,7 @@ class PluginConfigDefinition:
     """以一个 Schema 驱动默认值、WebUI 和带注释 TOML 的深配置 Module。"""
 
     plugin_name = "nai_draw_plugin"
-    plugin_version = "1.12.0"
+    plugin_version = "2.0.0"
     plugin_author = "saberlight"
     # 配置文件顶部说明，渲染时挂在所有 section 之前（写 config.toml 时按行加 # 前缀）。
     config_file_header = (
@@ -1000,7 +995,7 @@ class PluginConfigDefinition:
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.8.0",
+                default="2.0.0",
                 description="插件配置版本号；由插件自行维护，请勿手动修改"
             ),
             "enabled": ConfigField(

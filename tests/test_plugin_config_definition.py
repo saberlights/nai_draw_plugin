@@ -354,16 +354,41 @@ def test_webui_uses_select_controls_for_closed_choice_fields() -> None:
         # 模型节不再重复定义
         assert sampler is None, f"{model_section} 不该再单独定义 sampler"
         assert "image_format" not in webui["sections"][model_section]["fields"]
-        # noise_schedule 仍按模型配，且要是下拉（留空 = 让网关取默认）
-        noise = webui["sections"][model_section]["fields"]["noise_schedule"]
-        assert noise["ui_type"] == "select"
-        assert noise["choices"][0] == ""
 
     defaults_fields = webui["sections"]["model_defaults"]["fields"]
     assert defaults_fields["sampler"]["ui_type"] == "select"
     assert defaults_fields["sampler"]["choices"] == sampler_choices
     assert defaults_fields["image_format"]["ui_type"] == "select"
     assert defaults_fields["image_format"]["choices"] == ["png", "webp"]
+
+
+def test_下拉候选项不含空字符串() -> None:
+    """Dashboard 的 Select 基于 Radix，SelectItem 的 value 不能是空字符串。
+
+    给下拉塞一个空选项当"未设置"会在渲染时直接抛错、把整个配置页签打崩
+    （曾因此让"生图参数"页打不开）。需要"留空 = 用默认"语义的字段必须用文本框。
+    """
+    webui = PLUGIN_CONFIG.webui_schema(plugin_id="nai_draw_plugin")
+
+    offenders = [
+        f"{section_name}.{field_name}"
+        for section_name, section in webui["sections"].items()
+        for field_name, field in section["fields"].items()
+        if not field["hidden"]
+        and any(choice == "" or choice is None for choice in (field.get("choices") or []))
+    ]
+    assert offenders == [], f"这些字段的下拉含空候选项，会让 Radix Select 崩：{offenders}"
+
+
+def test_noise_schedule_保持文本框以便清空() -> None:
+    """留空表示不发送该字段、让网关取默认，是用户需要能切回去的状态。"""
+    webui = PLUGIN_CONFIG.webui_schema(plugin_id="nai_draw_plugin")
+
+    for model_section in ALL_MODEL_SECTIONS:
+        noise = webui["sections"][model_section]["fields"]["noise_schedule"]
+        assert noise["ui_type"] == "text"
+        assert "karras" in noise["hint"]
+        assert "留空" in noise["hint"]
 
 
 def test_webui_numeric_controls_expose_steps_and_documented_ranges() -> None:
