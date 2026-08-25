@@ -99,9 +99,9 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai0 ref [@<名字>] <英文 tags>` | 角色参考直发英文 tags（不过 LLM，**仅管理员**） |
 | `/nai ref类型 [character\|style\|both]` | 不带参数查看当前类型；带参数切换 §20.4 提取目标（**仅管理员，会话级**） |
 | `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
-| `/nai set [3/f3/4c/4/4.5c/4.5]` | 查看/切换模型 |
+| `/nai set [3/f3/4c/4/4.5c/4.5/5c/5]` | 查看/切换模型（画师预设按模型独立，切换不串用） |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
-| `/nai art [编号]` | 查看/切换画师风格预设 |
+| `/nai art [编号]` | 查看/切换当前模型的画师风格预设 |
 | `/nai models` | 拉取 NewAPI 网关实时可用模型清单 |
 | `/nai nsfw [on/off]` | 查看 / 切换 NSFW 过滤（会话级，切换仅管理员） |
 | `/nai planner [on/off]` | 查看 / 切换当前会话 Planner 生图（仅管理员，默认开启；关闭后 Planner 不再看到 `nai_web_draw`） |
@@ -148,7 +148,11 @@ default_model = "nai-diffusion-4-5-full"
 [i2i] / [vibe] / [character_reference]                   # 图生图各模式可调参数（§20.1/§20.3/§20.4）
 [components] / [prompt_show] / [nsfw_filter]
 [auto_recall] / [admin] / [custom_prompt]
-[model_nai4_5] / [model_nai4] / [model_nai3]             # 各版本独立参数 + artist_presets
+[model_defaults]                                         # 全模型共享的生图默认值 + Bot 外貌
+[model_v5_full] / [model_v5_curated]                     # 每个模型一节：画师预设 + 质量词 + 参数
+[model_v45_full] / [model_v45_curated]
+[model_v4_full] / [model_v4_curated]
+[model_v3_anime] / [model_v3_furry]
 ```
 
 ### 重要参数
@@ -302,24 +306,63 @@ strength = 1.0                # 0.0~1.0，主参考强度
 
 > `[character_reference].type` 可以在会话里运行时查看或切换：`/nai ref类型` 查看当前值，`/nai ref类型 character|style|both` 切换（仅管理员）；命令切换的值优先于配置默认。
 
-### 分版本模型配置
+### 分模型配置（2.0.0 起）
 
-`[model_nai4_5]` / `[model_nai4]` / `[model_nai3]` 三段独立，结构相同。`[model_nai4]` / `[model_nai3]` 字段描述统一为"作用同 `model_nai4_5.xxx`"。每段都可独立配 `artist_presets`：
+生图参数分两层，后者按当前模型自动选用并覆盖前者：
+
+| 配置节 | 作用 |
+|---|---|
+| `[model_defaults]` | 全模型共享：采样器、种子、图片格式、质量增强、CFG rescale、兜底尺寸，以及 Bot 外貌（`selfie_*`）的唯一定义 |
+| `[model_v5_full]` / `[model_v5_curated]` / `[model_v45_full]` / `[model_v45_curated]` / `[model_v4_full]` / `[model_v4_curated]` / `[model_v3_anime]` / `[model_v3_furry]` | 该模型专属：画师预设、质量词、负面词、尺寸、步数、CFG |
+
+覆盖规则：
+
+- 一般字段：模型节的值直接覆盖 `[model_defaults]`
+- `negative_prompt_add`：模型节的值**追加**在共享值之后（不是覆盖），所以通用负面词只写一份
+- `selfie_prompt_add` / `selfie_negative_prompt_add`：模型节留空表示继承共享定义，填了才覆盖
+- `nai_extra_params`：按 key 逐项覆盖
+
+**每个模型一份独立的画师预设库**，`/nai art` 的选择也按模型分开记，切换模型不会串用。
 
 ```toml
-[model_nai4_5]
-nai_size = "竖图"
+[model_defaults]
 sampler = "k_euler_ancestral"
+seed = -1
+image_format = "png"
+negative_prompt_add = "{{bad hands}}, watermark"   # 全模型共享，用花括号语法
+selfie_prompt_add = "..."                          # Bot 外貌唯一定义
+
+[model_v45_full]
+nai_size = "竖图"
 num_inference_steps = 28
-guidance_scale = 5.0
-custom_prompt_add = ",masterpiece, best quality, absurdres"
-negative_prompt_add = "..."
-selfie_prompt_add = "..."
-artist_presets = [
-  { name = "channel风", prompt = "1.4::kazutake hazano::, 1.2::efe::" },
-  { name = "简笔朴素", prompt = "1.2::artist:shion(mirudakemann)::" },
-]
+guidance_scale = 6.0
+custom_prompt_add = "location, very aesthetic, masterpiece, no text"   # V4.5 Full 官方配方
+negative_prompt_add = "-0.8::feet::"               # 追加在共享负面之后
+
+[[model_v45_full.artist_presets]]
+name = "channel风"
+prompt = "1.4::kazutake hazano::, 1.2::efe::"
 ```
+
+为什么按模型 id 而不是按大版本分节：官方文档给出的质量词配方在同版本的 Full 与
+Curated 之间就不同（V4.5 Curated 独有 `-0.8::feet::, rating:general`，Furry V3 只用
+花括号语法），Curated 的数据集也更小、适用的画师串不一样。
+
+各模型的能力与语法差异：
+
+| 模型 | 多角色 | 角色参考 | 氛围转移 | 数值权重 `1.5::t::` | 负数值 `-1::t::` | SMEA |
+|---|---|---|---|---|---|---|
+| V5 Full / Curated | ✅ 上限 22 | ❌ | ❌ | ✅ | ✅ | ❌ |
+| V4.5 Full / Curated | ✅ 上限 6 | ✅ | ✅ | ✅ | ✅ | ❌ |
+| V4 Full / Curated | ✅ 上限 6 | ❌ | ✅ | ✅ | ❌ | ❌ |
+| V3 Anime / Furry | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ |
+
+> V5 的角色参考与氛围转移是官方尚未随发布上线的能力，不是插件缺失。
+> V5 的官方质量词配方 NovelAI 也还没公布，`custom_prompt_add` 默认留空。
+
+从 1.x 升级时插件会在启动时自动迁移 `[model_nai3]` / `[model_nai4]` / `[model_nai4_5]`
+到新结构，原文件备份为 `config.toml.pre-2.0.0`。画师预设与各段提示词原样搬运；
+若三节的共享标量取值不一致，会按当前 `default_model` 取值并在日志里报出被舍弃的值。
 
 ## NAI 提示词格式
 
@@ -390,6 +433,39 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v2.0.0 (2026-08-25)
+
+**模型配置按模型 id 分节（配置结构变更，启动时自动迁移）**
+
+- **每个模型一份独立的画师预设库**：`[model_nai3]` / `[model_nai4]` / `[model_nai4_5]` 三节拆成 8 个按模型 id 划分的节（V5 / V4.5 / V4 各含 Full 与 Curated，V3 含 Anime 与 Furry）。此前 V5 直接借用 `[model_nai4_5]`、同版本的 Full 与 Curated 也共用一节，给某个模型调画师串会污染另一个
+- **新增 `[model_defaults]` 共享层**：三节取值完全相同的 6 个标量（采样器、种子、图片格式、质量增强、CFG rescale、兜底尺寸）收敛到一处；Bot 外貌（`selfie_*`）也收为唯一定义，修掉"换个模型 Bot 就换发色"（V4.5 是棕发、V4/V3 是黑发）
+- `negative_prompt_add` 改为**追加**语义：共享层写通用负面词，模型节只写该版本特有的部分，不必每节重复一遍
+- **`/nai art` 的选择按模型隔离**：此前画师索引不带模型维度，V4.5 下选了第 2 个预设再切到 V3，会静默套用 V3 的第 2 个预设，且该模型自己配的 `default_artist_preset` 被完全忽略
+- **模型注册表成为能力、约束与官方默认值的单一事实源**（`core/model_capabilities.py`）：加模型只需加一条记录，`/nai set` 代号、可用模型清单、帮助文案、WebUI 下拉、尺寸与步数上限全部随之派生。顺带补上此前缺失的 V5 Curated
+- 各模型的 `custom_prompt_add` 默认值改为官方推荐的质量词配方（Full 与 Curated 不同，Furry V3 只用花括号语法）；V5 官方尚未公布配方，默认留空而非照抄 V4.5
+
+**WebUI**
+
+- 页签重排为 连接 / 生图参数 / 画师预设 / 提示词 / 自动化与权限 / 检索与反推；画师预设独占一个页签
+- 当前 `default_model` 对应的模型节与预设库自动排到最前并展开、标注"当前默认模型"，其余折叠；此前 group header 里硬编码"你当前默认模型是 V4.5"，改了默认模型就成谎话
+- **消灭 38 条填充式字段说明**：`[model_nai4]` / `[model_nai3]` 两节所有字段的说明原本都是"作用同 `model_nai4_5.xxx`"，而 WebUI 的标签取自说明首行——整个"其他模型"页签 36 个字段没有一个可读标签
+- `nai_extra_params` 从 TOML 子表改为 `[{key, value}]` 数组，首次可在 WebUI 里编辑（Dashboard 没有 dict 编辑器，子表形态只能藏起来）
+- `default_model` 改为下拉（候选来自注册表），`noise_schedule` 改为下拉，`plugin.name` 改为只读
+
+**修复**
+
+- `/nai size` 无参时读的是 `model.default_size`，而 `[model]` 节从来没有这个字段，于是永远显示硬编码的 `832x1216`，与实际生效尺寸脱节
+- i2i 参考图尺寸被 `nai_size` 吞掉：`nai_size` 几乎永远非空且排在调用方传入的 `size` 之前，导致 §20.1 的"i2i.image 宽高必须与外层 size 一致"校验必然失败
+- V4 及以上不再发送 `autoSmea`：SMEA 是补偿 V1 时代低训练分辨率的采样器变体，V4 起官方不再提供，此前是无效字段
+- `quality_toggle = false` 现在会显式发送，此前只在 `true` 时写入字段，用户无法关闭
+- 步数兜底从字面量 23 改为该模型注册的推荐值（与 schema 默认 28 不一致已久）
+- 角色段数量按模型上限校验（V4/V4.5 为 6，V5 为 22）；`_validate_inner_payload` 用上了此前从未被引用的 `model_name` 形参
+- 能力门控的提示语不再硬编码"请先 `/nai set 4.5`"，改为从注册表挑出真正支持该能力的模型
+
+**迁移**
+
+启动时自动把 1.x 的三个模型节搬到新结构，原文件备份为 `config.toml.pre-2.0.0`。画师预设与各段提示词逐字段原样搬运；共享标量取值不一致时按当前 `default_model` 取值，并在日志里报出被舍弃的值。触发条件只看是否存在 1.x 模型节，不看版本号，避免把结构已正确、带用户手写注释的配置重写掉。
 
 ### v1.12.0 (2026-07-31)
 - **持久化数据迁往宿主统一目录**：全部落盘数据（named_refs 图库、vibe_cache.db、visual_continuity.json、nsfw_state.json、user_blacklist.json、danbooru_tags.json 与 embedding 缓存）从插件源码目录 `plugins/nai_draw_plugin/data/` 迁移到宿主分配的 `data/plugins/saberlights.nai-draw-plugin/`；首次加载时自动整体搬迁存量数据并移除旧目录，宿主的"旧式数据目录"启动警告随之消失。若统一目录已有同名条目则不覆盖、保留原位并在日志指名，留待人工处置

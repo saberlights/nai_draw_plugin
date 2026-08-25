@@ -2,6 +2,8 @@
 config.toml
 config.toml.bak
 config.toml.before_*
+# 配置迁移留下的原文备份（含明文 api_key）
+config.toml.pre-*
 config_back/
 *.bak
 
