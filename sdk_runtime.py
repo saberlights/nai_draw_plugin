@@ -29,6 +29,9 @@ from .core.clients.nai_web_client import NaiWebClient
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.mixins.model_config_mixin import ModelConfigMixin
 from .core.model_capabilities import (
+    ALIAS_TO_MODEL_ID,
+    DEFAULT_MODEL_NAME,
+    MODEL_SPECS,
     model_label,
     resolve_config_section,
     supports_character_reference,
@@ -1678,23 +1681,34 @@ class NaiInvocation(ModelConfigMixin):
 
         ``i2i`` 是所有模型都有的能力，只有 ``ref``（§20.4 角色参考）与 ``vibe``
         （§20.3 氛围转移）需要门控——例如 V5 目前只提供文生图与图生图。
+
+        注：官方文档说明角色参考与氛围转移互不兼容，这一点由 ``mode`` 单值入参
+        天然保证（一次请求只走一条路径），不需要额外互斥校验。
         """
         checkers = {
-            "ref": (supports_character_reference, "角色参考", "ref"),
-            "vibe": (supports_vibe_transfer, "氛围转移", "vibe"),
+            "ref": ("character_reference", supports_character_reference, "角色参考", "ref"),
+            "vibe": ("vibe_transfer", supports_vibe_transfer, "氛围转移", "vibe"),
         }
         entry = checkers.get(mode)
         if entry is None:
             return True
 
-        is_supported, feature_label, command = entry
+        capability_field, is_supported, feature_label, command = entry
         model_name = self._resolve_active_model_name()
         if is_supported(model_name):
             return True
 
+        # 从注册表挑出真正支持该能力的模型，别再硬编码"请先 /nai set 4.5"
+        capable = [spec for spec in MODEL_SPECS if getattr(spec, capability_field)]
+        if capable:
+            hint = "、".join(f"/nai set {spec.alias}（{spec.label}）" for spec in capable[:3])
+            suggestion = f"支持该功能的模型：{hint}，切过去再用 /nai {command}"
+        else:
+            suggestion = f"当前没有任何已登记模型支持{feature_label}"
+
         await self.send_text(
             f"❌ 当前模型 {model_name}（{model_label(model_name)}）不支持{feature_label}\n"
-            f"请先 /nai set 4.5 切到 V4.5，再用 /nai {command}"
+            f"{suggestion}"
         )
         logger.info(
             "%s /nai %s 被能力门控拦下：模型 %s 不支持%s",
@@ -2374,15 +2388,8 @@ class NaiInvocation(ModelConfigMixin):
             )
             return True, "管理员模式已关闭", True
 
-        model_mappings = {
-            "3": "nai-diffusion-3",
-            "f3": "nai-diffusion-3-furry",
-            "4c": "nai-diffusion-4-curated",
-            "4": "nai-diffusion-4-full",
-            "4.5c": "nai-diffusion-4-5-curated",
-            "4.5": "nai-diffusion-4-5-full",
-            "5": "nai-diffusion-5-full",
-        }
+        # 模型代号映射与展示文案统一取自模型注册表，避免"加了模型忘记改帮助文案"
+        model_mappings = dict(ALIAS_TO_MODEL_ID)
         size_mappings = {
             "竖": "832x1216",
             "竖图": "832x1216",
@@ -2453,23 +2460,19 @@ class NaiInvocation(ModelConfigMixin):
             if not param:
                 current_model = session_state.get_selected_model(platform, chat_id) or self.get_config(
                     "model.default_model",
-                    "nai-diffusion-4-5-full",
+                    DEFAULT_MODEL_NAME,
                 )
-                await self.send_text(
-                    f"当前模型: {current_model}\n\n"
-                    "可用模型:\n"
-                    "3 - nai-diffusion-3\n"
-                    "f3 - nai-diffusion-3-furry\n"
-                    "4c - nai-diffusion-4-curated\n"
-                    "4 - nai-diffusion-4-full\n"
-                    "4.5c - nai-diffusion-4-5-curated\n"
-                    "4.5 - nai-diffusion-4-5-full\n"
-                    "5 - nai-diffusion-5-full"
+                model_lines = "\n".join(
+                    f"{'→ ' if spec.model_id == current_model else '  '}"
+                    f"{spec.alias} - {spec.model_id}（{spec.label}）"
+                    for spec in MODEL_SPECS
                 )
+                await self.send_text(f"当前模型: {current_model}\n\n可用模型:\n{model_lines}")
                 return True, "显示模型列表", True
 
             if param not in model_mappings:
-                await self.send_text("❌ 无效的模型代号，可用值：3 / f3 / 4c / 4 / 4.5c / 4.5 / 5")
+                available = " / ".join(spec.alias for spec in MODEL_SPECS)
+                await self.send_text(f"❌ 无效的模型代号，可用值：{available}")
                 return False, "无效的模型代号", True
 
             model_name = model_mappings[param]
@@ -2480,7 +2483,7 @@ class NaiInvocation(ModelConfigMixin):
         if action == "art":
             current_model = session_state.get_selected_model(platform, chat_id) or self.get_config(
                 "model.default_model",
-                "nai-diffusion-4-5-full",
+                DEFAULT_MODEL_NAME,
             )
             config_section = resolve_config_section(current_model)
             if config_section is None:
@@ -2512,16 +2515,25 @@ class NaiInvocation(ModelConfigMixin):
                 await self.send_text(f"❌ 无效的画师串编号，可用范围：1-{len(artist_presets)}")
                 return False, "无效的画师串编号", True
 
-            session_state.set_selected_artist_index(platform, chat_id, index)
+            session_state.set_selected_artist_index(platform, chat_id, index, current_model)
             await self.send_text(f"✅ 已切换到画师串 #{index}\n名称: {artist_presets[index - 1]['name']}")
             return True, f"已切换到画师串 #{index}", True
 
         if action == "size":
             if not param:
-                current_size = session_state.get_selected_size(platform, chat_id) or self.get_config(
-                    "model.default_size",
-                    "832x1216",
+                # 会话未指定尺寸时显示当前生效模型节的 nai_size。
+                # 原先读的是 model.default_size —— [model] 节从来没有这个字段，
+                # 于是永远显示硬编码的 832x1216，和实际生效尺寸脱节。
+                current_model = session_state.get_selected_model(platform, chat_id) or self.get_config(
+                    "model.default_model",
+                    DEFAULT_MODEL_NAME,
                 )
+                config_section = resolve_config_section(current_model)
+                current_size = session_state.get_selected_size(platform, chat_id)
+                if not current_size and config_section:
+                    current_size = self.get_config(f"{config_section}.nai_size", "")
+                if not current_size:
+                    current_size = self.get_config("model_defaults.default_size", "832x1216")
                 await self.send_text(
                     f"当前尺寸: {current_size}\n\n"
                     "可用尺寸:\n"

@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from html import escape
 from typing import List, Tuple
 
+from ..model_capabilities import MODEL_SPECS
+
 
 @dataclass(frozen=True)
 class HelpSection:
@@ -125,8 +127,9 @@ HELP_DOC: HelpDoc = HelpDoc(
                 ("/nai models", "拉取 NewAPI 网关实时可用模型"),
             ),
             hint=(
-                "模型代号：3=V3, f3=Furry V3, 4c=V4 Curated, 4=V4 Full, "
-                "4.5c=V4.5 Curated, 4.5=V4.5 Full, 5=V5 Full。会话级，重启回落默认。"
+                "模型代号："
+                + ", ".join(f"{spec.alias}={spec.label}" for spec in MODEL_SPECS)
+                + "。会话级，重启回落默认。画师预设按模型独立，切模型不串用。"
             ),
         ),
         HelpSection(
