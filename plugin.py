@@ -13,6 +13,7 @@ from src.common.logger import get_logger
 
 from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.data_paths import PLUGIN_DATA_DIR
+from .core.config_migration import migrate_to_v2
 from .core.plugin_config import PLUGIN_CONFIG
 from .core.retag import ImageCacheService, ReverseService, WD14Client
 from .core.reply_command_text import normalize_reply_command_text
@@ -198,13 +199,24 @@ class NaiPicPlugin(MaiBotPlugin):
         plugin_description: str = "",
         plugin_author: str = "",
     ) -> dict[str, Any]:
-        """返回 WebUI 可渲染的配置 Schema。"""
+        """返回 WebUI 可渲染的配置 Schema。
+
+        额外读一次盘上的 ``model.default_model``：有 8 个模型配置节，把当前生效的那个
+        排到首位并展开，用户才不用在同构的折叠卡里翻找。读盘失败时退化为注册表原序。
+        """
+        local_config = PLUGIN_CONFIG.load_local(self._config_path())
+        model_section = local_config.get("model")
+        active_model = ""
+        if isinstance(model_section, dict):
+            active_model = str(model_section.get("default_model") or "")
+
         return PLUGIN_CONFIG.webui_schema(
             plugin_id=plugin_id,
             plugin_name=plugin_name,
             plugin_version=plugin_version,
             plugin_description=plugin_description,
             plugin_author=plugin_author,
+            active_model=active_model,
         )
 
     def __init__(self) -> None:
@@ -850,8 +862,22 @@ class NaiPicPlugin(MaiBotPlugin):
         return os.path.join(os.path.dirname(plugin_file), self.config_file_name)
 
     def _regenerate_config_with_comments_if_needed(self) -> None:
-        """迁移无注释配置，使 Schema 说明进入 TOML。"""
-        PLUGIN_CONFIG.regenerate_comments_if_needed(self._config_path())
+        """先把 1.x 的模型节结构迁移到 2.0.0，再迁移无注释配置使 Schema 说明进入 TOML。
+
+        顺序不能颠倒：迁移会按 2.0.0 的 schema 重新渲染整份文件（自带注释），
+        跑在后面的注释补写只处理"完全没有注释"的旧文件。
+        """
+        config_path = self._config_path()
+        report = migrate_to_v2(config_path)
+        if report.migrated:
+            logger.info(
+                f"配置已迁移到 2.0.0（模型配置按模型 id 分节），原文件备份于 {report.backup_path}"
+            )
+            for note in report.notes:
+                logger.info(f"配置迁移: {note}")
+            for conflict in report.conflicts:
+                logger.warning(f"配置迁移需人工确认: {conflict}")
+        PLUGIN_CONFIG.regenerate_comments_if_needed(config_path)
 
     async def _load_plugin_config_data(self) -> dict[str, Any]:
         """合并本地配置与宿主运行时覆盖值。"""
