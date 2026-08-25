@@ -9,10 +9,26 @@ from typing import Dict, Any, Tuple, Optional
 
 from src.common.logger import get_logger
 
-from ..model_capabilities import DEFAULT_MODEL_NAME, resolve_capability
+from ..model_capabilities import DEFAULT_MODEL_NAME, resolve_spec
 from ..services.session_state import session_state
 
 logger = get_logger("nai_draw_plugin")
+
+# 在模型专属节里"留空表示继承 [model_defaults]"的字段。
+# bot 外貌只该有一份定义，历史上三个版本节各写一份导致换模型换发色；
+# 现在共享定义放 [model_defaults]，模型节留空即继承，非空才覆盖。
+_INHERIT_WHEN_BLANK_FIELDS = ("selfie_prompt_add", "selfie_negative_prompt_add")
+
+# 跨层深合并的字段（后一层的同名 key 覆盖前一层，其余 key 保留）
+_DEEP_MERGE_FIELDS = ("nai_extra_params",)
+
+# 跨层追加拼接而非覆盖的字段：[model_defaults] 的通用负面在前，
+# 模型节的版本特化负面在后。NAI 负面遵循"越前优先级越高"。
+_APPEND_FIELDS = ("negative_prompt_add",)
+
+# 不参与配置合并的字段：画师预设列表由 session_state 直接读原始配置节，
+# 合并进 model_config 只会让下游误用未经会话选择的原始列表。
+_SKIP_MERGE_FIELDS = ("artist_presets",)
 
 
 class ModelConfigMixin:
@@ -27,6 +43,36 @@ class ModelConfigMixin:
             return f"{base_text}, {extra_text}"
         return base_text or extra_text
 
+    @staticmethod
+    def _apply_config_layer(
+        merged_config: Dict[str, Any],
+        layer: Dict[str, Any],
+    ) -> None:
+        """把一层配置叠加到 merged_config 上（原地修改）。
+
+        普通字段直接覆盖；``nai_extra_params`` 深合并；``negative_prompt_add`` 追加拼接；
+        ``selfie_*`` 留空时保留上一层的值；``artist_presets`` 不参与合并。
+        """
+        if not layer:
+            return
+        for key, value in layer.items():
+            if key in _SKIP_MERGE_FIELDS:
+                continue
+            if key in _DEEP_MERGE_FIELDS:
+                base_extra = merged_config.get(key) or {}
+                merged_extra = dict(base_extra)
+                merged_extra.update(value or {})
+                merged_config[key] = merged_extra
+            elif key in _APPEND_FIELDS:
+                merged_config[key] = ModelConfigMixin._merge_negative_prompts(
+                    merged_config.get(key, ""),
+                    value,
+                )
+            elif key in _INHERIT_WHEN_BLANK_FIELDS and not str(value or "").strip():
+                continue
+            else:
+                merged_config[key] = value
+
     def _get_model_config(
         self,
         is_selfie: Optional[bool] = None,
@@ -37,10 +83,11 @@ class ModelConfigMixin:
         获取合并后的模型配置
 
         合并顺序：
-        1. 基础配置（model.*）
-        2. 版本特定配置（model_nai3/model_nai4/model_nai4_5）
-        3. 会话级别覆盖（模型、画师串、尺寸）
-        4. NSFW 过滤
+        1. 连接层配置（model.*）
+        2. 全模型共享默认（model_defaults.*）
+        3. 模型专属配置（model_v5_full / model_v45_full / model_v3_anime / ...）
+        4. 会话级别覆盖（模型、画师串、尺寸）
+        5. 自拍负面与 NSFW 过滤前插
         """
         base_config = self.get_config("model", {})  # type: ignore[attr-defined]
         if not base_config:
@@ -52,27 +99,17 @@ class ModelConfigMixin:
         # 获取模型名称（优先使用会话选择）
         model_name = self._resolve_active_model_name()
 
-        # 获取版本特定配置
+        # 获取全模型共享默认与版本特定配置
+        defaults_config = self.get_config("model_defaults", {})  # type: ignore[attr-defined]
         version_config = self._get_version_config(model_name)
 
-        # 合并配置
-        merged_config = base_config.copy()
+        # 合并配置：连接层 → 共享默认 → 模型专属
+        merged_config = dict(base_config)
         if model_name:
             merged_config["default_model"] = model_name
 
-        if version_config:
-            for key, value in version_config.items():
-                if key == "nai_extra_params":
-                    # 合并 extra_params
-                    base_extra = merged_config.get("nai_extra_params", {}) or {}
-                    merged_extra = dict(base_extra)
-                    merged_extra.update(value or {})
-                    merged_config["nai_extra_params"] = merged_extra
-                elif key == "artist_presets":
-                    # 跳过画师串列表，后续单独处理
-                    continue
-                else:
-                    merged_config[key] = value
+        self._apply_config_layer(merged_config, defaults_config)
+        self._apply_config_layer(merged_config, version_config)
 
         # 应用会话级别的画师串选择
         if apply_artist_preset and platform and chat_id and model_name:
@@ -146,19 +183,23 @@ class ModelConfigMixin:
         return model_name or DEFAULT_MODEL_NAME
 
     def _get_version_config(self, model_name: str) -> Dict[str, Any]:
-        """根据模型名称获取版本特定配置"""
+        """根据模型名称获取模型专属配置节"""
         if not model_name:
             return {}
 
-        capability = resolve_capability(model_name)
-        if capability.config_section is None:
+        spec = resolve_spec(model_name)
+        if spec.config_section is None:
+            logger.warning(
+                f"{self._log_prefix} 模型 {model_name} 未在模型注册表中登记，"
+                "本次生成不会应用任何模型专属配置（画师串、质量词、尺寸等）"
+            )
             return {}
 
         logger.debug(
-            f"{self._log_prefix} 检测到 NAI {capability.label} 模型，"
-            f"使用 {capability.config_section} 配置"
+            f"{self._log_prefix} 检测到 NAI {spec.label} 模型，"
+            f"使用 {spec.config_section} 配置"
         )
-        return self.get_config(capability.config_section, {})  # type: ignore[attr-defined]
+        return self.get_config(spec.config_section, {})  # type: ignore[attr-defined]
 
     @property
     def _log_prefix(self) -> str:
