@@ -10,6 +10,19 @@ import tomlkit
 
 from src.core.config_types import ConfigField
 
+from .model_capabilities import (
+    ALL_MODEL_IDS,
+    ALL_MODEL_SECTIONS,
+    DEFAULT_MODEL_NAME,
+    MAX_STEPS,
+    MODEL_SPECS,
+    NOISE_SCHEDULES,
+    SAMPLERS,
+    ModelSpec,
+    resolve_config_section,
+    spec_for_section,
+)
+
 
 def _merge_config_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """递归合并配置，优先使用运行时覆盖值。"""
@@ -43,16 +56,9 @@ _WEBUI_TEXTAREA_FIELDS = {
     "system_prompt",
 }
 _WEBUI_PASSWORD_FIELDS = {"api_key"}
-_WEBUI_SAMPLER_CHOICES = [
-    "k_euler",
-    "k_euler_ancestral",
-    "k_dpm_2",
-    "k_dpm_2_ancestral",
-    "k_dpmpp_2m",
-    "k_dpmpp_2s_ancestral",
-    "k_dpmpp_sde",
-    "ddim",
-]
+_WEBUI_SAMPLER_CHOICES = list(SAMPLERS)
+# 留空表示不发送该字段、由网关取默认；下拉里用空串表示这一档
+_WEBUI_NOISE_SCHEDULE_CHOICES = ["", *NOISE_SCHEDULES]
 _WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS = {
     "model_list": "候选模型列表；填系统模型配置中已定义的模型名称",
     "max_tokens": "单次响应的最大 token 数；可填正整数",
@@ -66,7 +72,49 @@ _WEBUI_SLIDER_0_1 = {
     "max": 1.0,
     "step": 0.01,
 }
+
+
+def _build_model_webui_overrides() -> dict[str, dict[str, Any]]:
+    """为 [model_defaults] 与每个模型节生成 WebUI 控件覆盖。
+
+    历史上这些覆盖是按配置节手写的，三个模型节就有 12 条重复条目，加一个模型要抄 6 条。
+    现在从注册表推导：采样器与噪声调度用下拉，步数滑块上限取该模型的 ``max_steps``。
+    """
+    overrides: dict[str, dict[str, Any]] = {
+        "model_defaults.sampler": {
+            "input_type": "select",
+            "ui_type": "select",
+            "choices": _WEBUI_SAMPLER_CHOICES,
+        },
+        "model_defaults.image_format": {
+            "input_type": "select",
+            "ui_type": "select",
+            "choices": ["png", "webp"],
+        },
+        "model_defaults.cfg_rescale": {
+            **_WEBUI_SLIDER_0_1,
+            "step": 0.05,
+        },
+    }
+    for spec in MODEL_SPECS:
+        overrides[f"{spec.config_section}.num_inference_steps"] = {
+            "input_type": "slider",
+            "ui_type": "slider",
+            "min": 1,
+            "max": MAX_STEPS,
+            "step": 1,
+        }
+        overrides[f"{spec.config_section}.noise_schedule"] = {
+            "input_type": "select",
+            "ui_type": "select",
+            "choices": _WEBUI_NOISE_SCHEDULE_CHOICES,
+        }
+    return overrides
+
+
 _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
+    # 插件标识与配置版本由插件自行维护，改了会让宿主认不出这份配置
+    "plugin.name": {"disabled": True},
     "plugin.config_version": {"disabled": True},
     "group_access.mode": {
         "input_type": "select",
@@ -77,6 +125,12 @@ _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
         "input_type": "select",
         "ui_type": "select",
         "choices": ["direct", "inherit", "auto"],
+    },
+    # 默认模型从注册表取候选，避免手打模型 id 打错
+    "model.default_model": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": list(ALL_MODEL_IDS),
     },
     "prompt_generator.output_format": {
         "input_type": "select",
@@ -97,36 +151,6 @@ _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
         "input_type": "select",
         "ui_type": "select",
         "choices": ["character", "style", "character&style"],
-    },
-    "model_nai4_5.sampler": {
-        "input_type": "select",
-        "ui_type": "select",
-        "choices": _WEBUI_SAMPLER_CHOICES,
-    },
-    "model_nai4.sampler": {
-        "input_type": "select",
-        "ui_type": "select",
-        "choices": _WEBUI_SAMPLER_CHOICES,
-    },
-    "model_nai3.sampler": {
-        "input_type": "select",
-        "ui_type": "select",
-        "choices": _WEBUI_SAMPLER_CHOICES,
-    },
-    "model_nai4_5.image_format": {
-        "input_type": "select",
-        "ui_type": "select",
-        "choices": ["png", "webp"],
-    },
-    "model_nai4.image_format": {
-        "input_type": "select",
-        "ui_type": "select",
-        "choices": ["png", "webp"],
-    },
-    "model_nai3.image_format": {
-        "input_type": "select",
-        "ui_type": "select",
-        "choices": ["png", "webp"],
     },
     "tag_retriever.popularity_weight": _WEBUI_SLIDER_0_1,
     "tag_retriever.min_score": _WEBUI_SLIDER_0_1,
@@ -152,39 +176,7 @@ _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
     "vibe.overall_strength": _WEBUI_SLIDER_0_1,
     "character_reference.fidelity": _WEBUI_SLIDER_0_1,
     "character_reference.strength": _WEBUI_SLIDER_0_1,
-    "model_nai4_5.num_inference_steps": {
-        "input_type": "slider",
-        "ui_type": "slider",
-        "min": 1,
-        "max": 28,
-        "step": 1,
-    },
-    "model_nai4.num_inference_steps": {
-        "input_type": "slider",
-        "ui_type": "slider",
-        "min": 1,
-        "max": 28,
-        "step": 1,
-    },
-    "model_nai3.num_inference_steps": {
-        "input_type": "slider",
-        "ui_type": "slider",
-        "min": 1,
-        "max": 28,
-        "step": 1,
-    },
-    "model_nai4_5.cfg_rescale": {
-        **_WEBUI_SLIDER_0_1,
-        "step": 0.05,
-    },
-    "model_nai4.cfg_rescale": {
-        **_WEBUI_SLIDER_0_1,
-        "step": 0.05,
-    },
-    "model_nai3.cfg_rescale": {
-        **_WEBUI_SLIDER_0_1,
-        "step": 0.05,
-    },
+    **_build_model_webui_overrides(),
 }
 
 
@@ -265,10 +257,32 @@ def _webui_item_schema_from_value(value: Any) -> dict[str, Any]:
 def _webui_list_item_fields(field_name: str, default: Any) -> dict[str, Any] | None:
     """推断列表对象字段；显式补上常用可选字段，避免 WebUI 只能编辑默认样例。"""
     if field_name == "artist_presets":
+        # Dashboard 的 ObjectItemEditor 对字符串字段只渲染单行 Input（没有 textarea
+        # 分支），而画师串动辄上千字符。这是渲染器的限制，插件侧无法绕开：所以这里
+        # 只能给单行控件，并在 section 说明里引导长内容走"源代码"模式编辑。
         return {
-            "name": {"type": "string", "label": "名称", "default": ""},
-            "prompt": {"type": "string", "label": "正向提示词", "default": ""},
-            "negative_prompt_add": {"type": "string", "label": "负向提示词", "default": ""},
+            "name": {
+                "type": "string",
+                "label": "名称",
+                "default": "",
+                "placeholder": "用于 /nai art <名称> 调用，建议用可输入的中英文短名",
+            },
+            "prompt": {
+                "type": "string",
+                "label": "正向提示词（画师串）",
+                "default": "",
+                "placeholder": "长画师串建议切换到源代码模式编辑",
+            },
+            "negative_prompt_add": {
+                "type": "string",
+                "label": "负向提示词（留空则用该模型的 negative_prompt_add）",
+                "default": "",
+            },
+        }
+    if field_name == "nai_extra_params":
+        return {
+            "key": {"type": "string", "label": "字段名", "default": ""},
+            "value": {"type": "string", "label": "值", "default": ""},
         }
     if field_name == "wd14_spaces":
         return {
@@ -509,6 +523,287 @@ def _format_comment_block(text: str) -> str:
     return "\n".join(rendered)
 
 
+def _model_defaults_fields() -> dict[str, ConfigField]:
+    """[model_defaults]：全模型共享的生图默认值。
+
+    这些字段历史上在三个版本配置节里各写一份、值还完全相同（sampler / seed /
+    image_format / quality_toggle / cfg_rescale / default_size），是纯冗余。
+    ``selfie_*`` 也收在这里：bot 外貌只该有一份定义，原先三份各写导致换模型换发色。
+    """
+    return {
+        "sampler": ConfigField(
+            type=str,
+            default="k_euler_ancestral",
+            description=(
+                "采样器；官方提供 DPM++ 2M / Euler Ancestral / Euler / DPM2 / "
+                "DPM++ 2S Ancestral / DPM++ SDE / DPM Fast / DDIM，常用 k_euler_ancestral"
+            ),
+        ),
+        "seed": ConfigField(
+            type=int,
+            default=-1,
+            description="随机种子；可填整数固定结果，填 -1 表示由网关随机",
+        ),
+        "quality_toggle": ConfigField(
+            type=bool,
+            default=True,
+            description="质量增强；可填 true / false；开启后追加 NovelAI 的 quality 通路",
+        ),
+        "cfg_rescale": ConfigField(
+            type=float,
+            default=0.0,
+            description=(
+                "Prompt Guidance Rescale（NewAPI §5 cfg_rescale）；可填 0~1 的数；"
+                "0 表示不发送让网关用默认；典型值 0.5"
+            ),
+        ),
+        "image_format": ConfigField(
+            type=str,
+            default="png",
+            description="返回图片格式；可填 png / webp",
+        ),
+        "default_size": ConfigField(
+            type=str,
+            default="832x1216",
+            description=(
+                "兜底尺寸；当模型节的 nai_size 为空或无法解析时使用；"
+                "可填 832x1216 / 1216x832 / 1024x1024"
+            ),
+        ),
+        "negative_prompt_add": ConfigField(
+            type=str,
+            default="",
+            description=(
+                "全模型共享的负面提示词；建议只用 {tag} / [tag] 花括号语法，"
+                "因为数值权重 1.5::tag:: 仅 V4 及以上支持、负数值仅 V4.5 及以上支持。"
+                "各模型节的 negative_prompt_add 会追加在这段之后"
+            ),
+        ),
+        "selfie_prompt_add": ConfigField(
+            type=str,
+            default="",
+            description=(
+                "Bot 出镜时固定追加的外貌与身材正向词（全模型共享的唯一定义）；"
+                "建议用花括号语法以便所有模型通用；配置名为历史兼容，不会强制自拍构图。"
+                "个别模型要用不同写法时，在该模型节的同名字段里填即可覆盖"
+            ),
+        ),
+        "selfie_negative_prompt_add": ConfigField(
+            type=str,
+            default="",
+            description=(
+                "Bot 出镜时固定追加的外貌负向词（全模型共享的唯一定义）；"
+                "拼在 negative_prompt_add 之前，优先级更高"
+            ),
+        ),
+        "nai_extra_params": ConfigField(
+            type=list,
+            default=[],
+            description=(
+                "额外透传到 NewAPI 内层 draw_params 的字段；填 [{key, value}] 数组；"
+                "文档 §5 之外的字段不保证被识别，按服务方说明使用。"
+                "各模型节的同名字段会按 key 覆盖这里的值"
+            ),
+        ),
+    }
+
+
+def _model_section_fields(spec: ModelSpec) -> dict[str, ConfigField]:
+    """生成单个模型专属配置节的字段。
+
+    这里的 description 由 spec 拼出来，所以每个模型都是自己的真实说明。历史上
+    ``model_nai4`` / ``model_nai3`` 两节 38 个字段的说明全写成"作用同 model_nai4_5.xxx"，
+    而 WebUI 的 label 取的正是 description 首行——于是"其他模型"整个页签没有一个可读标签。
+    """
+    label = spec.label
+    weight_hint = (
+        "支持 1.5::tag:: 数值权重"
+        if spec.numeric_emphasis
+        else "只支持 {tag} / [tag] 花括号权重（数值权重需 V4 及以上）"
+    )
+    if spec.negative_numeric_emphasis:
+        weight_hint += "，也支持 -1::tag:: 负数值权重"
+    quality_position = "末尾" if spec.quality_tags_at_end else "开头"
+
+    if spec.default_quality_tags:
+        quality_desc = (
+            f"{label} 固定追加到正向提示词的质量词；"
+            f"官方推荐配方是 {spec.default_quality_tags}；"
+            f"{label} 的质量词应放在 prompt {quality_position}"
+        )
+    else:
+        quality_desc = (
+            f"{label} 固定追加到正向提示词的质量词；"
+            f"NovelAI 尚未公布 {label} 的官方推荐配方，请按实际效果自行调整"
+        )
+
+    fields: dict[str, ConfigField] = {
+        "artist_presets": ConfigField(
+            type=list,
+            default=[],
+            description=(
+                f"{label} 专属画师预设列表；每项含 name / prompt，可选 negative_prompt_add；"
+                f"通过 /nai art <名称或序号> 切换。{weight_hint}。"
+                "每个模型的预设互相独立，切换模型不会串用"
+            ),
+        ),
+        "default_artist_preset": ConfigField(
+            type=str,
+            default="",
+            description=(
+                f"{label} 的默认画师预设；可填预设名称或序号（从 1 开始），"
+                "留空时使用第一个预设"
+            ),
+        ),
+        "nai_artist_prompt": ConfigField(
+            type=str,
+            default="",
+            description=(
+                f"{label} 直接写死的画师串；可填英文 prompt 片段，"
+                "仅在不用 artist_presets 时设置"
+            ),
+        ),
+        "custom_prompt_add": ConfigField(
+            type=str,
+            default=spec.default_quality_tags,
+            description=quality_desc,
+        ),
+        "negative_prompt_add": ConfigField(
+            type=str,
+            default="",
+            description=(
+                f"{label} 专属负面提示词；会追加在 [model_defaults].negative_prompt_add "
+                f"之后。{weight_hint}"
+            ),
+        ),
+        "nai_size": ConfigField(
+            type=str,
+            default=spec.default_size,
+            description=(
+                f"{label} 图片尺寸；可填 竖图 / 横图 / 方图（或别名 v/h/s、"
+                "portrait/landscape/square），也可直接写 832x1216 / 1216x832 / 1024x1024；"
+                "请求时自动转成 [宽,高] 整数数组"
+            ),
+        ),
+        "num_inference_steps": ConfigField(
+            type=int,
+            default=spec.default_steps,
+            description=(
+                f"{label} 去噪步数；可填 1~{MAX_STEPS} 的整数；"
+                f"超过 {MAX_STEPS} 步会消耗 Anlas，越高细节越多但也更慢"
+            ),
+        ),
+        "guidance_scale": ConfigField(
+            type=float,
+            default=spec.default_guidance,
+            description=(
+                f"{label} 提示词跟随强度；官方建议 5~6；"
+                "越高越听 prompt，也越容易僵硬"
+            ),
+        ),
+        "variety_boost": ConfigField(
+            type=bool,
+            default=False,
+            description=(
+                f"{label} 多样性增强（NewAPI §5 variety_boost）；可填 true / false；"
+                "开启后画面构图/姿势更随机"
+            ),
+        ),
+        "noise_schedule": ConfigField(
+            type=str,
+            default="",
+            description=(
+                f"{label} 噪声调度算法（NewAPI §5/§9 noise_schedule）；"
+                "可填 karras / exponential / polyexponential；留空表示不发送让网关用默认"
+            ),
+        ),
+        "selfie_prompt_add": ConfigField(
+            type=str,
+            default="",
+            description=(
+                f"{label} 专属的 Bot 外貌正向词；"
+                "留空表示继承 [model_defaults].selfie_prompt_add，填了才覆盖"
+            ),
+        ),
+        "selfie_negative_prompt_add": ConfigField(
+            type=str,
+            default="",
+            description=(
+                f"{label} 专属的 Bot 外貌负向词；"
+                "留空表示继承 [model_defaults].selfie_negative_prompt_add，填了才覆盖"
+            ),
+        ),
+        "nai_extra_params": ConfigField(
+            type=list,
+            default=[],
+            description=(
+                f"{label} 专属的额外透传字段；填 [{{key, value}}] 数组；"
+                "按 key 覆盖 [model_defaults].nai_extra_params 的同名项"
+            ),
+        ),
+    }
+
+    # SMEA 是为 V1 时代补偿高分辨率一致性设计的，V2 起提高训练分辨率后已不需要，
+    # V4 起官方不再提供。只给还认这个字段的模型生成，避免对 V4+ 发无效参数。
+    if spec.smea:
+        fields["auto_smea"] = ConfigField(
+            type=bool,
+            default=False,
+            description=(
+                f"{label} 的 SMEA 类增强；可填 true / false；"
+                "用于改善高分辨率下的一致性，仅 V3 及更早模型有效"
+            ),
+        )
+
+    return fields
+
+
+def _build_model_sections() -> dict[str, dict[str, ConfigField]]:
+    """按注册表生成全部模型专属配置节。加模型只需在注册表加一条记录。"""
+    return {spec.config_section: _model_section_fields(spec) for spec in MODEL_SPECS}
+
+
+def _build_model_group_headers() -> dict[str, str]:
+    """生成模型相关配置节在 config.toml 里的分组标题。
+
+    ``[model_defaults]`` 处开一个大组并解释三层覆盖关系，之后每个模型节一个小标题。
+    历史上这里硬编码了"你当前默认模型是 V4.5"，改了 default_model 之后那句话就在骗人；
+    现在不再声明哪个是当前模型（WebUI 侧会按实际 default_model 动态排序）。
+    """
+    headers: dict[str, str] = {
+        "model_defaults": (
+            "========== 生图模型配置 ==========\n"
+            "分两层：[model_defaults] 是全模型共享的默认值，下面每个 [model_<模型>] 是\n"
+            "该模型专属的覆盖。生成时按当前模型自动选用对应的那一节。\n"
+            "\n"
+            "覆盖规则：\n"
+            "  - 一般字段：模型节的值直接覆盖 [model_defaults]\n"
+            "  - negative_prompt_add：模型节的值追加在共享值之后（不是覆盖）\n"
+            "  - selfie_prompt_add / selfie_negative_prompt_add：模型节留空表示继承\n"
+            "  - nai_extra_params：按 key 逐项覆盖\n"
+            "\n"
+            "----- 全模型共享默认 -----"
+        )
+    }
+    for spec in MODEL_SPECS:
+        notes: list[str] = [f"模型 id：{spec.model_id}，/nai set {spec.alias}"]
+        if not spec.multi_character:
+            notes.append("不支持多角色 characters[]")
+        else:
+            notes.append(f"多角色上限 {spec.max_characters} 个")
+        unsupported = []
+        if not spec.character_reference:
+            unsupported.append("角色参考")
+        if not spec.vibe_transfer:
+            unsupported.append("氛围转移")
+        if unsupported:
+            notes.append("不支持：" + " / ".join(unsupported))
+        headers[spec.config_section] = (
+            f"----- {spec.label} -----\n" + "\n".join(notes)
+        )
+    return headers
+
+
 class PluginConfigDefinition:
     """以一个 Schema 驱动默认值、WebUI 和带注释 TOML 的深配置 Module。"""
 
@@ -520,18 +815,26 @@ class PluginConfigDefinition:
         "nai_draw_plugin - 配置文件\n"
         "与 nai_pic_plugin 共享同一套业务逻辑，底层请求改为 NewAPI 兼容 OpenAI 协议\n"
         "（POST /v1/chat/completions，绘图参数以 JSON 字符串塞入 messages[0].content）。\n"
-        "支持 NAI 格式提示词（大括号权重），仅支持文生图。\n"
+        "支持 NAI 格式提示词（大括号权重）。\n"
+        "\n"
+        "生图参数分三层，后面的覆盖前面的：\n"
+        "  [model]           网关连接与默认模型（全局）\n"
+        "  [model_defaults]  全模型共享的生图默认值与 Bot 外貌\n"
+        "  [model_<模型>]    该模型专属的画师预设、质量词、步数等\n"
+        "其中 negative_prompt_add 是追加拼接而非覆盖，selfie_* 在模型节留空表示继承。\n"
         "\n"
         "建议按这个顺序改：\n"
         "1. [plugin] 是否启用插件\n"
         "2. [model] NewAPI 地址 / 密钥 / 默认生图模型\n"
         "3. [prompt_generator] 提示词生成模型\n"
-        "4. [model_nai4_5] 当前默认模型（V4.5）的专属参数\n"
-        "5. 其他功能按需开启"
+        "4. [model_defaults] 全模型共享的生图默认值\n"
+        "5. 你实际在用的那个 [model_<模型>] 节：画师预设与质量词\n"
+        "6. 其他功能按需开启"
     )
 
     # section 渲染顺序；schema 字典本身的顺序与历史代码相关，渲染另走这套清单，
     # 保证配置文件读起来从'要先改的'到'通常不动的'。未列出的 section 走 schema 字典原顺序。
+    # 模型节按注册表顺序排在最后（体积最大、改动频率低于功能开关）。
     config_section_order = [
         "plugin",
         "group_access",
@@ -550,9 +853,8 @@ class PluginConfigDefinition:
         "vibe",
         "character_reference",
         "custom_prompt",
-        "model_nai4_5",
-        "model_nai4",
-        "model_nai3",
+        "model_defaults",
+        *ALL_MODEL_SECTIONS,
     ]
 
     # 大段分隔符；key 是 section 名，value 是渲染在该 section 之前的多行注释块
@@ -583,19 +885,11 @@ class PluginConfigDefinition:
             "========== 自定义系统提示词 ==========\n"
             "这段通常不需要频繁修改；保留在文件末尾，避免影响日常配置体验。"
         ),
-        "model_nai4_5": (
-            "========== 生图模型专属配置 ==========\n"
-            "下面三段会按当前模型自动选用。\n"
-            "你当前默认模型是 V4.5，所以优先看 [model_nai4_5]。\n"
-            "\n"
-            "----- NAI V4.5（当前默认模型） -----"
-        ),
-        "model_nai4": "----- NAI V4 -----",
-        "model_nai3": "----- NAI V3 / V3 Furry -----",
+        **_build_model_group_headers(),
     }
 
     # TOML 分组标题面向源码阅读；WebUI 使用独立标题与标签页，避免把装饰性标题
-    # 直接当成导航文案，并保证当前默认的 V4.5 配置进入首屏。
+    # 直接当成导航文案。
     config_webui_section_titles = {
         "group_access": "群聊访问控制",
         "prompt_show": "提示词显示",
@@ -603,20 +897,33 @@ class PluginConfigDefinition:
         "auto_recall": "自动撤回",
         "admin": "管理员权限",
         "tag_retriever": "Danbooru Tag 检索",
-        "model_nai4_5": "NAI V4.5 生图参数",
+        "model_defaults": "全模型共享默认",
+        **{spec.config_section: f"{spec.label} 生图参数" for spec in MODEL_SPECS},
     }
+
+    # tab 里的模型节顺序在 webui_schema() 里会按"当前默认模型优先"重排，
+    # 这里给的是注册表原始顺序（新到旧）作为兜底。
     config_webui_tabs = [
         {
+            "id": "connection",
+            "title": "连接",
+            "sections": ["model"],
+        },
+        {
             "id": "generation",
-            "title": "生图配置",
+            "title": "生图参数",
             "sections": [
-                "model",
-                "model_nai4_5",
-                "model_nai4_5.artist_presets",
+                "model_defaults",
+                *ALL_MODEL_SECTIONS,
                 "i2i",
                 "vibe",
                 "character_reference",
             ],
+        },
+        {
+            "id": "presets",
+            "title": "画师预设",
+            "sections": [f"{section}.artist_presets" for section in ALL_MODEL_SECTIONS],
         },
         {
             "id": "prompting",
@@ -627,16 +934,6 @@ class PluginConfigDefinition:
                 "random_scene",
                 "random_scene.custom_model",
                 "custom_prompt",
-            ],
-        },
-        {
-            "id": "models",
-            "title": "其他模型",
-            "sections": [
-                "model_nai4",
-                "model_nai4.artist_presets",
-                "model_nai3",
-                "model_nai3.artist_presets",
             ],
         },
         {
@@ -676,21 +973,12 @@ class PluginConfigDefinition:
         },
     }
     config_webui_detached_field_sections = {
-        "model_nai4_5.artist_presets": {
-            "source_section": "model_nai4_5",
+        f"{spec.config_section}.artist_presets": {
+            "source_section": spec.config_section,
             "source_field": "artist_presets",
-            "title": "NAI V4.5 画师预设",
-        },
-        "model_nai4.artist_presets": {
-            "source_section": "model_nai4",
-            "source_field": "artist_presets",
-            "title": "NAI V4 画师预设",
-        },
-        "model_nai3.artist_presets": {
-            "source_section": "model_nai3",
-            "source_field": "artist_presets",
-            "title": "NAI V3 / Furry 画师预设",
-        },
+            "title": f"{spec.label} 画师预设",
+        }
+        for spec in MODEL_SPECS
     }
 
     # 不渲染到 config.toml 的字段（schema 仍保留以便高级用户手动覆盖；默认值在代码层走兜底）。
@@ -767,20 +1055,12 @@ class PluginConfigDefinition:
             ),
             "available_models": ConfigField(
                 type=list,
-                default=[
-                    "nai-diffusion-3",
-                    "nai-diffusion-3-furry",
-                    "nai-diffusion-4-curated",
-                    "nai-diffusion-4-full",
-                    "nai-diffusion-4-5-curated",
-                    "nai-diffusion-4-5-full",
-                    "nai-diffusion-5-full",
-                ],
+                default=list(ALL_MODEL_IDS),
                 description="可用模型列表；填字符串数组，每项需与服务方 /v1/models 返回的 id 一致，供 /nai set 切换"
             ),
             "default_model": ConfigField(
                 type=str,
-                default="nai-diffusion-4-5-full",
+                default=DEFAULT_MODEL_NAME,
                 description="默认生图模型；可填 available_models 中任意一项，作为新会话的初始模型"
             ),
             "nai_request_timeout": ConfigField(
@@ -799,321 +1079,8 @@ class PluginConfigDefinition:
                 description="单次绘图 token 预算；可填正整数，1 Anlas = 10000 tokens；常用 100000(=10 Anlas)，超出网关返回 400"
             ),
         },
-        "model_nai3": {
-            "artist_presets": ConfigField(
-                type=list,
-                default=[
-                    {"name": "示例风格1", "prompt": "artist:example1, artist:example2, year 2023"},
-                    {"name": "示例风格2", "prompt": "artist:example3, artist:example4, year 2024"}
-                ],
-                description="画师预设；结构同 model_nai4_5.artist_presets"
-            ),
-            "default_artist_preset": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.default_artist_preset"
-            ),
-            "nai_artist_prompt": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.nai_artist_prompt"
-            ),
-            "nai_size": ConfigField(
-                type=str,
-                default="832x1216",
-                description="作用同 model_nai4_5.nai_size（V3 默认尺寸）"
-            ),
-            "sampler": ConfigField(
-                type=str,
-                default="k_euler_ancestral",
-                description="作用同 model_nai4_5.sampler"
-            ),
-            "num_inference_steps": ConfigField(
-                type=int,
-                default=25,
-                description="作用同 model_nai4_5.num_inference_steps"
-            ),
-            "guidance_scale": ConfigField(
-                type=float,
-                default=3.5,
-                description="作用同 model_nai4_5.guidance_scale"
-            ),
-            "seed": ConfigField(
-                type=int,
-                default=-1,
-                description="作用同 model_nai4_5.seed"
-            ),
-            "quality_toggle": ConfigField(
-                type=bool,
-                default=True,
-                description="作用同 model_nai4_5.quality_toggle"
-            ),
-            "auto_smea": ConfigField(
-                type=bool,
-                default=False,
-                description="作用同 model_nai4_5.auto_smea"
-            ),
-            "variety_boost": ConfigField(
-                type=bool,
-                default=False,
-                description="作用同 model_nai4_5.variety_boost"
-            ),
-            "cfg_rescale": ConfigField(
-                type=float,
-                default=0.0,
-                description="作用同 model_nai4_5.cfg_rescale"
-            ),
-            "noise_schedule": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.noise_schedule"
-            ),
-            "image_format": ConfigField(
-                type=str,
-                default="png",
-                description="作用同 model_nai4_5.image_format"
-            ),
-            "default_size": ConfigField(
-                type=str,
-                default="832x1216",
-                description="作用同 model_nai4_5.default_size"
-            ),
-            "custom_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.custom_prompt_add"
-            ),
-            "negative_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.negative_prompt_add"
-            ),
-            "selfie_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.selfie_prompt_add"
-            ),
-            "selfie_negative_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.selfie_negative_prompt_add"
-            ),
-            "nai_extra_params": ConfigField(
-                type=dict,
-                default={},
-                description="作用同 model_nai4_5.nai_extra_params"
-            )
-        },
-        "model_nai4": {
-            "artist_presets": ConfigField(
-                type=list,
-                default=[
-                    {"name": "风格组合1", "prompt": "1.2::artist1::, 1.0::artist2::, 0.9::artist3::"},
-                    {"name": "风格组合2", "prompt": "1.5::artist4::, 1.0::artist5::, 0.8::artist6::"}
-                ],
-                description="画师预设；结构同 model_nai4_5.artist_presets"
-            ),
-            "default_artist_preset": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.default_artist_preset"
-            ),
-            "nai_artist_prompt": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.nai_artist_prompt"
-            ),
-            "nai_size": ConfigField(
-                type=str,
-                default="竖图",
-                description="作用同 model_nai4_5.nai_size"
-            ),
-            "sampler": ConfigField(
-                type=str,
-                default="k_euler_ancestral",
-                description="作用同 model_nai4_5.sampler"
-            ),
-            "num_inference_steps": ConfigField(
-                type=int,
-                default=28,
-                description="作用同 model_nai4_5.num_inference_steps"
-            ),
-            "guidance_scale": ConfigField(
-                type=float,
-                default=5.0,
-                description="作用同 model_nai4_5.guidance_scale"
-            ),
-            "seed": ConfigField(
-                type=int,
-                default=-1,
-                description="作用同 model_nai4_5.seed"
-            ),
-            "quality_toggle": ConfigField(
-                type=bool,
-                default=True,
-                description="作用同 model_nai4_5.quality_toggle"
-            ),
-            "auto_smea": ConfigField(
-                type=bool,
-                default=False,
-                description="作用同 model_nai4_5.auto_smea"
-            ),
-            "variety_boost": ConfigField(
-                type=bool,
-                default=False,
-                description="作用同 model_nai4_5.variety_boost"
-            ),
-            "cfg_rescale": ConfigField(
-                type=float,
-                default=0.0,
-                description="作用同 model_nai4_5.cfg_rescale"
-            ),
-            "noise_schedule": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.noise_schedule"
-            ),
-            "image_format": ConfigField(
-                type=str,
-                default="png",
-                description="作用同 model_nai4_5.image_format"
-            ),
-            "default_size": ConfigField(
-                type=str,
-                default="832x1216",
-                description="作用同 model_nai4_5.default_size"
-            ),
-            "custom_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.custom_prompt_add"
-            ),
-            "negative_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.negative_prompt_add"
-            ),
-            "selfie_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.selfie_prompt_add"
-            ),
-            "selfie_negative_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="作用同 model_nai4_5.selfie_negative_prompt_add"
-            ),
-            "nai_extra_params": ConfigField(
-                type=dict,
-                default={},
-                description="作用同 model_nai4_5.nai_extra_params"
-            )
-        },
-        "model_nai4_5": {
-            "artist_presets": ConfigField(
-                type=list,
-                default=[
-                    {"name": "风格示例1", "prompt": "1.2::artist:example1::, 1.0::artist:example2::, 0.8::artist:example3::"},
-                    {"name": "风格示例2", "prompt": "1.5::artist:example4::, 1.3::artist:example5::"}
-                ],
-                description="画师预设列表；每项含 name / prompt，可选 negative_prompt_add；通过 /nai art <名称或序号> 切换"
-            ),
-            "default_artist_preset": ConfigField(
-                type=str,
-                default="",
-                description="默认画师预设；可填预设名称或序号（从 1 开始），留空时使用第一个预设"
-            ),
-            "nai_artist_prompt": ConfigField(
-                type=str,
-                default="",
-                description="直接写死的画师串；可填英文 prompt 片段，仅在不用 artist_presets 时设置"
-            ),
-            "nai_size": ConfigField(
-                type=str,
-                default="竖图",
-                description="图片尺寸；可填 竖图 / 横图 / 方图（或别名 v/h/s、portrait/landscape/square），也可直接写 832x1216 / 1216x832 / 1024x1024；请求时自动转成 [宽,高] 整数数组"
-            ),
-            "sampler": ConfigField(
-                type=str,
-                default="k_euler_ancestral",
-                description="采样器；可填 k_euler / k_euler_ancestral / k_dpm_2 / k_dpm_2_ancestral / k_dpmpp_2m / k_dpmpp_2s_ancestral / k_dpmpp_sde / ddim；常用 k_euler_ancestral"
-            ),
-            "num_inference_steps": ConfigField(
-                type=int,
-                default=28,
-                description="去噪步数；可填 1~28 的整数（NewAPI §5 上限）；越高细节越多但也更慢、更耗 anlas"
-            ),
-            "guidance_scale": ConfigField(
-                type=float,
-                default=5.0,
-                description="提示词跟随强度；可填正浮点数，常用 5.0；越高越听 prompt，也越容易僵硬"
-            ),
-            "seed": ConfigField(
-                type=int,
-                default=-1,
-                description="随机种子；可填整数固定结果，填 -1 表示由 NewAPI 随机"
-            ),
-            "quality_toggle": ConfigField(
-                type=bool,
-                default=True,
-                description="质量增强；可填 true / false；开启后追加 NovelAI 的 quality 通路"
-            ),
-            "auto_smea": ConfigField(
-                type=bool,
-                default=False,
-                description="底层 SMEA 类增强；可填 true / false"
-            ),
-            "variety_boost": ConfigField(
-                type=bool,
-                default=False,
-                description="多样性增强（NewAPI §5 variety_boost）；可填 true / false；开启后画面构图/姿势更随机"
-            ),
-            "cfg_rescale": ConfigField(
-                type=float,
-                default=0.0,
-                description="Prompt Guidance Rescale（NewAPI §5 cfg_rescale）；可填 0~1 的数；0 或留空表示不发送让网关用默认；典型值 0.5"
-            ),
-            "noise_schedule": ConfigField(
-                type=str,
-                default="",
-                description="噪声调度算法（NewAPI §5/§9 noise_schedule）；可填 karras / exponential / polyexponential；留空表示不发送让网关用默认"
-            ),
-            "image_format": ConfigField(
-                type=str,
-                default="png",
-                description="返回图片格式；可填 png / webp"
-            ),
-            "default_size": ConfigField(
-                type=str,
-                default="832x1216",
-                description="兜底尺寸；当 nai_size 为空或无法解析时使用；可填 832x1216 / 1216x832 / 1024x1024"
-            ),
-            "custom_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="固定追加到正向提示词；可填英文 prompt 片段；通常放质量词、风格词、通用修饰词"
-            ),
-            "negative_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="固定追加到负面提示词；可填英文 prompt 片段；用于压低坏手、多人乱入、水印等问题"
-            ),
-            "selfie_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="Bot 出镜时固定追加的外貌与身材正向词；可填英文 prompt 片段；配置名为历史兼容，不会强制自拍构图"
-            ),
-            "selfie_negative_prompt_add": ConfigField(
-                type=str,
-                default="",
-                description="Bot 出镜时固定追加的外貌负向词；可填英文 prompt 片段；拼在 negative_prompt_add 之前，优先级更高"
-            ),
-            "nai_extra_params": ConfigField(
-                type=dict,
-                default={},
-                description="额外透传到 NewAPI 内层 draw_params 的字段；可填 {key=value} 表；文档 §5 之外的字段不保证被识别，按服务方说明使用"
-            )
-        },
+        "model_defaults": _model_defaults_fields(),
+        **_build_model_sections(),
         "components": {
             "enable_debug_info": ConfigField(
                 type=bool,
@@ -1524,8 +1491,15 @@ class PluginConfigDefinition:
         plugin_version: str = "",
         plugin_description: str = "",
         plugin_author: str = "",
+        active_model: str = "",
     ) -> dict[str, Any]:
-        """把同一 Schema 映射为 WebUI 可渲染的配置描述。"""
+        """把同一 Schema 映射为 WebUI 可渲染的配置描述。
+
+        ``active_model`` 传当前生效的 ``model.default_model``，用来把该模型的配置节与
+        画师预设排到首位并默认展开，其余模型节折叠。有 8 个模型节，不排序的话用户每次
+        都要在一堆折叠卡里找自己在用的那个。
+        """
+        active_section = resolve_config_section(active_model) if active_model else None
         sections: dict[str, Any] = {}
         detached_fields = {
             (meta["source_section"], meta["source_field"])
@@ -1555,21 +1529,29 @@ class PluginConfigDefinition:
                     ),
                     order=field_index,
                 )
+            spec = spec_for_section(section_name)
+            title = self.config_webui_section_titles.get(
+                section_name,
+                _webui_section_title(
+                    section_name,
+                    self.config_section_group_headers,
+                ),
+            )
+            # 模型节：非当前模型的默认折叠；当前模型在标题里点明，省得用户对着
+            # 8 张同构的卡片猜哪个在生效
+            is_model_section = spec is not None
+            is_active_model = is_model_section and section_name == active_section
+            if is_active_model:
+                title = f"{title}（当前默认模型）"
             sections[section_name] = {
                 "name": section_name,
-                "title": self.config_webui_section_titles.get(
-                    section_name,
-                    _webui_section_title(
-                        section_name,
-                        self.config_section_group_headers,
-                    ),
-                ),
+                "title": title,
                 "description": _webui_section_description(
                     section_name,
                     self.config_section_group_headers,
                 ),
                 "icon": None,
-                "collapsed": False,
+                "collapsed": is_model_section and not is_active_model,
                 "order": section_index,
                 "fields": section_fields,
             }
@@ -1614,8 +1596,9 @@ class PluginConfigDefinition:
             }
 
         detached_description = (
-            "画师预设列表较长，默认折叠以保持页面整洁；需要换行阅读或编辑长画师串时，"
-            "请切换右上角“源代码”，编辑器会自动换行。"
+            "每个模型一份独立的画师预设库，切换模型不会串用。"
+            "可在这里增删、拖动排序、改名；由于 Dashboard 的列表项只提供单行输入框，"
+            "编辑上千字符的长画师串请切换右上角“源代码”，编辑器会自动换行。"
         )
         for detached_index, (detached_name, detached_meta) in enumerate(
             self.config_webui_detached_field_sections.items(),
@@ -1630,13 +1613,19 @@ class PluginConfigDefinition:
             if not isinstance(source_field, ConfigField):
                 continue
 
+            is_active_model = source_section_name == active_section
+            title = detached_meta["title"]
+            if is_active_model:
+                title = f"{title}（当前默认模型）"
+
             sections[detached_name] = {
                 # Dashboard 依赖 section.name 决定取值和保存路径；这里必须仍指向原配置节。
                 "name": source_section_name,
-                "title": detached_meta["title"],
+                "title": title,
                 "description": detached_description,
                 "icon": None,
-                "collapsed": True,
+                # 当前模型的预设库默认展开，其余折叠
+                "collapsed": not is_active_model,
                 "order": detached_index,
                 "fields": {
                     source_field_name: _webui_field_schema(
@@ -1658,8 +1647,32 @@ class PluginConfigDefinition:
                 "author": plugin_author or self.plugin_author,
             },
             "sections": sections,
-            "layout": {"type": "tabs", "tabs": self.config_webui_tabs},
+            "layout": {
+                "type": "tabs",
+                "tabs": self._webui_tabs_for_active_model(active_section),
+            },
         }
+
+    def _webui_tabs_for_active_model(self, active_section: str | None) -> list[dict[str, Any]]:
+        """把当前默认模型的配置节与画师预设提到各自 tab 的最前面。
+
+        Dashboard 按 ``tab.sections`` 数组顺序渲染（``section.order`` 只在 auto 布局生效），
+        所以排序必须在这里做完。
+        """
+        if not active_section:
+            return self.config_webui_tabs
+
+        def reorder(section_names: list[str]) -> list[str]:
+            preferred = [active_section, f"{active_section}.artist_presets"]
+            head = [name for name in section_names if name in preferred]
+            tail = [name for name in section_names if name not in preferred]
+            # [model_defaults] 是共享基准层，必须留在模型节之前，否则"先看共享默认、
+            # 再看模型覆盖"的阅读顺序就反了
+            if tail and tail[0] == "model_defaults":
+                return [tail[0], *head, *tail[1:]]
+            return head + tail
+
+        return [{**tab, "sections": reorder(list(tab["sections"]))} for tab in self.config_webui_tabs]
 
     @staticmethod
     def load_local(config_path: str | Path) -> dict[str, Any]:
