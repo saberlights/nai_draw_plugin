@@ -13,8 +13,13 @@ from src.common.logger import get_logger
 from ..utils.image_meta import normalize_image_base64, read_image_dimensions
 from ..model_capabilities import (
     DEFAULT_MODEL_NAME,
+    MAX_STEPS,
+    NORMAL_SIZES,
+    NOISE_SCHEDULES,
+    resolve_spec,
     supports_character_reference,
     supports_multi_character,
+    supports_smea,
 )
 from ..services.vibe_cache import (
     compute_image_hash,
@@ -25,19 +30,19 @@ from ..services.vibe_cache import (
 logger = get_logger("nai_draw_plugin")
 
 
-# 文档要求图片尺寸的硬上限（参考 §6）
-_MAX_SIZE_PORTRAIT: Tuple[int, int] = (832, 1216)
-_MAX_SIZE_LANDSCAPE: Tuple[int, int] = (1216, 832)
-_MAX_SIZE_SQUARE: Tuple[int, int] = (1024, 1024)
+# 图片尺寸的硬上限（参考 §6）。取自模型注册表，与上层能力门控用同一份定义。
+_MAX_SIZE_PORTRAIT: Tuple[int, int] = NORMAL_SIZES["portrait"]
+_MAX_SIZE_LANDSCAPE: Tuple[int, int] = NORMAL_SIZES["landscape"]
+_MAX_SIZE_SQUARE: Tuple[int, int] = NORMAL_SIZES["square"]
 
 # 文档 §5 steps 硬上限：超出会被网关直接 400
-_MAX_STEPS: int = 28
+_MAX_STEPS: int = MAX_STEPS
 
 # 文档 §11 image_format 白名单：其他值会被网关直接 400
 _ALLOWED_IMAGE_FORMATS: frozenset = frozenset({"png", "webp"})
 
 # 文档 §9 noise_schedule 枚举
-_ALLOWED_NOISE_SCHEDULES: frozenset = frozenset({"karras", "exponential", "polyexponential"})
+_ALLOWED_NOISE_SCHEDULES: frozenset = frozenset(NOISE_SCHEDULES)
 
 # NewAPI 绘图请求只能走 OpenAI 兼容的 chat/completions 端点（文档 §3）
 _NAI_CHAT_ENDPOINT: str = "/v1/chat/completions"
@@ -273,7 +278,19 @@ class NaiWebClient:
 
         full_prompt = cls._merge_artist_into_prompt(prompt, artist_prompt, custom_prompt_add)
 
-        size_value = model_config.get("nai_size") or size or model_config.get("default_size") or "竖图"
+        model_name = cls._resolve_model_name(model_config)
+        spec = resolve_spec(model_name)
+
+        # 尺寸优先级：调用方显式传入的 size > 模型节 nai_size > 共享兜底 default_size。
+        # size 入参必须排在 nai_size 之前 —— i2i 会把参考图的真实宽高作为 size 传进来，
+        # 而 nai_size 几乎永远非空，原先的顺序会把它吞掉，导致 §20.1 的
+        # "i2i.image 宽高必须与外层 size 一致" 校验必然失败。
+        size_value = (
+            size
+            or model_config.get("nai_size")
+            or model_config.get("default_size")
+            or spec.default_size
+        )
         width, height = cls._resolve_size(size_value)
         size_payload: List[int] = [width, height]
 
@@ -286,8 +303,9 @@ class NaiWebClient:
             "prompt": full_prompt,
             "negative_prompt": negative_prompt,
             "size": size_payload,
-            "steps": int(model_config.get("num_inference_steps", 23)),
-            "scale": float(model_config.get("guidance_scale", 5.0)),
+            # 兜底步数取该模型注册的推荐值，不再用与 schema 默认不一致的字面量 23
+            "steps": int(model_config.get("num_inference_steps", spec.default_steps)),
+            "scale": float(model_config.get("guidance_scale", spec.default_guidance)),
             "sampler": str(model_config.get("sampler") or "k_euler_ancestral"),
             "n_samples": 1,
             "image_format": cls._resolve_image_format(model_config.get("image_format")),
@@ -303,11 +321,21 @@ class NaiWebClient:
             inner["use_order"] = True
 
         # 质量增强参数（NovelAI 原生开关，透传给上游解释；NewAPI 网关在 §5 表外，
-        # 但已知会向下游 NovelAI 透传，保留以保持画质行为一致）
-        if bool(model_config.get("quality_toggle", True)):
-            inner["qualityToggle"] = True
+        # 但已知会向下游 NovelAI 透传，保留以保持画质行为一致）。
+        # 显式发送 true/false，而不是"只在 true 时发送"——否则用户没法关掉它。
+        inner["qualityToggle"] = bool(model_config.get("quality_toggle", True))
+
+        # SMEA 只对 V3 及更早模型有效（V2 起提高训练分辨率后官方不再提供）。
+        # 对 V4+ 发 autoSmea 是无效字段，这里按注册表门控掉。
         if bool(model_config.get("auto_smea", False)):
-            inner["autoSmea"] = True
+            if supports_smea(model_name):
+                inner["autoSmea"] = True
+            else:
+                logger.debug(
+                    "(NewAPI) 模型 %s（%s）不支持 SMEA，已忽略 auto_smea 配置",
+                    model_name,
+                    spec.label,
+                )
 
         # 多样性增强（文档 §5）
         if bool(model_config.get("variety_boost", False)):
@@ -324,11 +352,8 @@ class NaiWebClient:
             inner["noise_schedule"] = noise_schedule
 
         # nai_extra_params 透传（用户在 config.toml 显式声明的扩展字段，含 §5 表外字段时由 NewAPI 自行决定）
-        extra_params = model_config.get("nai_extra_params") or {}
-        if isinstance(extra_params, dict):
-            for key, value in extra_params.items():
-                if value not in (None, ""):
-                    inner[key] = value
+        for key, value in cls._resolve_extra_params(model_config.get("nai_extra_params")).items():
+            inner[key] = value
 
         # §20 图生图族字段：i2i / controlnet / character_references
         normalized_i2i = cls._normalize_i2i_payload(i2i_payload)
@@ -372,6 +397,35 @@ class NaiWebClient:
             logger.warning(f"(NewAPI) cfg_rescale={value} 超过 1，已 clamp 到 1.0")
             return 1.0
         return value
+
+    @staticmethod
+    def _resolve_extra_params(raw: Any) -> Dict[str, Any]:
+        """把 nai_extra_params 归一成 ``{key: value}``。
+
+        配置里现在是 ``[{key, value}]`` 数组形态（Dashboard 没有 dict/json 编辑器，
+        用数组才能在 WebUI 里编）；同时兼容历史的 TOML 子表 dict 形态。
+        空 key 或空 value 直接跳过，避免往请求里塞垃圾字段。
+        """
+        resolved: Dict[str, Any] = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                name = str(key).strip()
+                if name and value not in (None, ""):
+                    resolved[name] = value
+            return resolved
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    logger.warning(f"(NewAPI) nai_extra_params 元素不是表结构，已跳过：{item!r}")
+                    continue
+                name = str(item.get("key") or "").strip()
+                value = item.get("value")
+                if not name:
+                    continue
+                if value in (None, ""):
+                    continue
+                resolved[name] = value
+        return resolved
 
     @staticmethod
     def _resolve_noise_schedule(raw: Any) -> Optional[str]:
@@ -614,7 +668,14 @@ class NaiWebClient:
 
         返回非空字符串表示拒绝原因；返回 None 表示通过。
         故意不做语种校验：让 NewAPI 自己回 400 反而给出更精确的错误。
+        采样器同样不做白名单校验 —— 公开文档没有给出各模型的权威 API 代号清单，
+        用一份没核实的白名单拦请求只会误伤，交给网关回 400 更准确。
+
+        ``model_name`` 用于按模型取尺寸档与步数上限：这些约束登记在模型注册表里，
+        新模型放开更大分辨率时只改注册表，不必动这里。
         """
+        spec = resolve_spec(model_name)
+
         prompt = str(inner.get("prompt") or "").strip()
         if not prompt:
             return "prompt 为空，无法发起绘图请求"
@@ -632,18 +693,21 @@ class NaiWebClient:
         if width % 64 != 0 or height % 64 != 0:
             return f"size 宽高必须是 64 的倍数，当前收到 {size_value!r}"
         if width == height:
-            if width > _MAX_SIZE_SQUARE[0]:
-                return f"方图最大尺寸为 {_MAX_SIZE_SQUARE}，当前收到 {size_value!r}"
+            max_square = NORMAL_SIZES["square"]
+            if width > max_square[0]:
+                return f"{spec.label} 方图最大尺寸为 {max_square}，当前收到 {size_value!r}"
         elif height > width:
-            if width > _MAX_SIZE_PORTRAIT[0] or height > _MAX_SIZE_PORTRAIT[1]:
-                return f"竖图最大尺寸为 {_MAX_SIZE_PORTRAIT}，当前收到 {size_value!r}"
+            max_portrait = NORMAL_SIZES["portrait"]
+            if width > max_portrait[0] or height > max_portrait[1]:
+                return f"{spec.label} 竖图最大尺寸为 {max_portrait}，当前收到 {size_value!r}"
         else:
-            if width > _MAX_SIZE_LANDSCAPE[0] or height > _MAX_SIZE_LANDSCAPE[1]:
-                return f"横图最大尺寸为 {_MAX_SIZE_LANDSCAPE}，当前收到 {size_value!r}"
+            max_landscape = NORMAL_SIZES["landscape"]
+            if width > max_landscape[0] or height > max_landscape[1]:
+                return f"{spec.label} 横图最大尺寸为 {max_landscape}，当前收到 {size_value!r}"
 
         steps_value = inner.get("steps")
-        if not isinstance(steps_value, int) or steps_value < 1 or steps_value > _MAX_STEPS:
-            return f"steps 必须是 1~{_MAX_STEPS} 的整数，当前收到 {steps_value!r}"
+        if not isinstance(steps_value, int) or steps_value < 1 or steps_value > MAX_STEPS:
+            return f"steps 必须是 1~{MAX_STEPS} 的整数，当前收到 {steps_value!r}"
 
         image_format = inner.get("image_format")
         if image_format not in _ALLOWED_IMAGE_FORMATS:
@@ -671,6 +735,11 @@ class NaiWebClient:
         if characters_value is not None:
             if not isinstance(characters_value, list) or not characters_value:
                 return f"characters 必须是非空数组，当前收到 {characters_value!r}"
+            if len(characters_value) > spec.max_characters:
+                return (
+                    f"{spec.label} 单张图最多 {spec.max_characters} 个角色段，"
+                    f"当前收到 {len(characters_value)} 个"
+                )
             for index, item in enumerate(characters_value):
                 if not isinstance(item, dict):
                     return f"characters[{index}] 必须是对象，当前收到 {item!r}"
