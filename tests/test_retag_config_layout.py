@@ -173,7 +173,9 @@ def test_rendered_config_has_per_field_comments() -> None:
         ("# 入站图片缓存保留时间", "cache_ttl_seconds"),
         ("# 单个 Space 请求超时", "wd14_request_timeout"),
         ("# 访问 Hugging Face Space", "wd14_proxy"),
-        ("# 图片尺寸；可填 竖图 / 横图 / 方图", "nai_size"),
+        # 模型专属字段的注释现在带上各自的档位名（1.x 里 V4/V3 两节全是"作用同 xxx"）
+        ("# V4.5 Full 图片尺寸；可填 竖图 / 横图 / 方图", "nai_size"),
+        ("# V3 Anime 图片尺寸；可填 竖图 / 横图 / 方图", "nai_size"),
         ("# 随机种子；可填整数固定结果", "seed"),
     ]
     for comment_prefix, field_name in must_have:
@@ -186,9 +188,12 @@ def test_repository_config_toml_is_valid_and_uses_supported_draw_defaults() -> N
     config_path = Path(__file__).resolve().parents[1] / "config.toml"
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
 
-    assert data["model_nai4_5"]["seed"] == -1
-    assert data["model_nai4_5"]["default_size"] == "832x1216"
-    assert data["model_nai4"]["default_size"] == "832x1216"
+    # 共享标量收敛到 [model_defaults]，不再在每个模型节里重复
+    assert data["model_defaults"]["seed"] == -1
+    assert data["model_defaults"]["default_size"] == "832x1216"
+    # 1.x 的模型节必须已被迁移掉
+    for legacy in ("model_nai3", "model_nai4", "model_nai4_5"):
+        assert legacy not in data, f"{legacy} 应已迁移到按模型 id 划分的新配置节"
 
 
 def test_rendered_config_does_not_contain_wd14_spaces_block() -> None:

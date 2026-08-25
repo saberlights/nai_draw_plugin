@@ -104,7 +104,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-4-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "negative_prompt_add": "model-default-negative",
                 "artist_presets": [
                     {"name": "风格A", "prompt": "artist:a"},
@@ -129,7 +129,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-4-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "negative_prompt_add": "model-default-negative",
                 "artist_presets": [
                     {
@@ -147,17 +147,30 @@ class ArtistPresetConfigTest(unittest.TestCase):
         self.assertEqual(model_config["nai_artist_prompt"], "artist:a")
         self.assertEqual(model_config["negative_prompt_add"], "model-default-negative")
 
-    def test_v5_model_reuses_v45_config_and_artist_preset(self):
+    def test_v5_has_its_own_config_and_artist_presets(self):
+        """V5 必须读自己的配置节，不能再串用 V4.5 的画师预设。
+
+        1.x 把 V5 映射到 model_nai4_5，两者共用一份画师串与同一个会话索引 —— 给 V5
+        调画师串会污染 V4.5，反之亦然。这条断言就是防止再退回那个行为。
+        """
         host = _DummyModelConfigHost({
             "model": {
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "nai_size": "1216x832",
                 "negative_prompt_add": "v45-negative",
                 "artist_presets": [
                     {"name": "风格A", "prompt": "artist:v45"},
+                ],
+                "default_artist_preset": 1,
+            },
+            "model_v5_full": {
+                "nai_size": "832x1216",
+                "negative_prompt_add": "v5-negative",
+                "artist_presets": [
+                    {"name": "风格V5", "prompt": "artist:v5"},
                 ],
                 "default_artist_preset": 1,
             },
@@ -166,9 +179,110 @@ class ArtistPresetConfigTest(unittest.TestCase):
         model_config = host._get_model_config()
 
         self.assertEqual(model_config["default_model"], "nai-diffusion-5-full")
-        self.assertEqual(model_config["nai_size"], "1216x832")
-        self.assertEqual(model_config["nai_artist_prompt"], "artist:v45")
-        self.assertEqual(model_config["negative_prompt_add"], "v45-negative")
+        # 全部取自 model_v5_full，V4.5 那节的值一个都不该漏进来
+        self.assertEqual(model_config["nai_size"], "832x1216")
+        self.assertEqual(model_config["nai_artist_prompt"], "artist:v5")
+        self.assertEqual(model_config["negative_prompt_add"], "v5-negative")
+
+    def test_模型专属值覆盖共享默认(self):
+        """三层链：[model] → [model_defaults] → [model_<id>]，后者逐 key 覆盖前者。"""
+        host = _DummyModelConfigHost({
+            "model": {
+                "base_url": "https://example.com",
+                "default_model": "nai-diffusion-4-5-full",
+            },
+            "model_defaults": {
+                "sampler": "k_euler_ancestral",
+                "seed": -1,
+                "image_format": "png",
+            },
+            "model_v45_full": {
+                "guidance_scale": 6.0,
+                "image_format": "webp",
+            },
+        })
+
+        model_config = host._get_model_config()
+
+        # 共享层提供的值透下来
+        self.assertEqual(model_config["sampler"], "k_euler_ancestral")
+        self.assertEqual(model_config["seed"], -1)
+        # 模型节覆盖共享层
+        self.assertEqual(model_config["image_format"], "webp")
+        self.assertEqual(model_config["guidance_scale"], 6.0)
+
+    def test_负面提示词是追加而不是覆盖(self):
+        """[model_defaults] 的通用负面在前，模型节的版本特化负面追加在后。
+
+        这样通用负面（坏手、水印）只写一份，又不牺牲各版本的权重语法差异。
+        """
+        host = _DummyModelConfigHost({
+            "model": {
+                "base_url": "https://example.com",
+                "default_model": "nai-diffusion-4-5-full",
+            },
+            "model_defaults": {
+                "negative_prompt_add": "{{bad hands}}, watermark",
+            },
+            "model_v45_full": {
+                "negative_prompt_add": "-0.8::feet::",
+            },
+        })
+
+        model_config = host._get_model_config()
+
+        self.assertEqual(
+            model_config["negative_prompt_add"],
+            "{{bad hands}}, watermark, -0.8::feet::",
+        )
+
+    def test_自拍词留空继承共享定义_非空才覆盖(self):
+        """bot 外貌只该有一份定义；模型节留空即继承，避免"换模型换发色"。"""
+        shared = {
+            "model": {
+                "base_url": "https://example.com",
+                "default_model": "nai-diffusion-4-5-full",
+            },
+            "model_defaults": {
+                "selfie_prompt_add": "{{brown hair}}",
+                "selfie_negative_prompt_add": "{{loli}}",
+            },
+        }
+
+        inherited = _DummyModelConfigHost({**shared, "model_v45_full": {"selfie_prompt_add": ""}})
+        self.assertEqual(
+            inherited._get_model_config()["selfie_prompt_add"],
+            "{{brown hair}}",
+        )
+
+        overridden = _DummyModelConfigHost(
+            {**shared, "model_v45_full": {"selfie_prompt_add": "{{black hair}}"}}
+        )
+        self.assertEqual(
+            overridden._get_model_config()["selfie_prompt_add"],
+            "{{black hair}}",
+        )
+
+    def test_额外透传参数跨层按_key_深合并(self):
+        host = _DummyModelConfigHost({
+            "model": {
+                "base_url": "https://example.com",
+                "default_model": "nai-diffusion-4-5-full",
+            },
+            "model_defaults": {
+                "nai_extra_params": {"shared": 1, "both": "defaults"},
+            },
+            "model_v45_full": {
+                "nai_extra_params": {"only_v45": 2, "both": "v45"},
+            },
+        })
+
+        model_config = host._get_model_config()
+
+        self.assertEqual(
+            model_config["nai_extra_params"],
+            {"shared": 1, "both": "v45", "only_v45": 2},
+        )
 
     def test_model_config_can_apply_artist_preset_for_direct_tag_command(self):
         host = _DummyModelConfigHost({
@@ -176,7 +290,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-4-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "negative_prompt_add": "model-default-negative",
                 "artist_presets": [
                     {
@@ -196,7 +310,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
 
     def test_effective_artist_index_uses_config_default_when_session_not_overridden(self):
         config = {
-            "model_nai4_5": {
+            "model_v45_full": {
                 "artist_presets": [
                     {"name": "风格A", "prompt": "artist:a"},
                     {"name": "风格B", "prompt": "artist:b"},
@@ -229,7 +343,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-4-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "negative_prompt_add": "model-default-negative",
                 "selfie_negative_prompt_add": "selfie-negative",
             },
@@ -248,7 +362,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-4-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "negative_prompt_add": "model-default-negative",
                 "selfie_negative_prompt_add": "selfie-negative",
             },
@@ -265,7 +379,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "default_model": "nai-diffusion-4-5-full",
                 "negative_prompt_add": "model-default-negative",
             },
-            "model_nai4_5": {},
+            "model_v45_full": {},
             "nsfw_filter": {
                 "filter_tags": "{{{{{nsfw}}}}}",
             },
@@ -282,7 +396,7 @@ class ArtistPresetConfigTest(unittest.TestCase):
                 "base_url": "https://example.com",
                 "default_model": "nai-diffusion-4-5-full",
             },
-            "model_nai4_5": {
+            "model_v45_full": {
                 "negative_prompt_add": "",
                 "selfie_negative_prompt_add": "selfie-negative",
             },

@@ -3,21 +3,12 @@
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-from pathlib import Path
-
-
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "core" / "utils" / "help_renderer.py"
-_SPEC = importlib.util.spec_from_file_location("nai_help_renderer", _MODULE_PATH)
-if _SPEC is None or _SPEC.loader is None:
-    raise RuntimeError(f"无法加载帮助渲染模块：{_MODULE_PATH}")
-_MODULE = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = _MODULE
-_SPEC.loader.exec_module(_MODULE)
-
-HELP_DOC = _MODULE.HELP_DOC
-HELP_FALLBACK_TEXT = _MODULE.HELP_FALLBACK_TEXT
+# help_renderer 现在从模型注册表取模型代号清单（避免帮助文案与注册表漂移），
+# 因此必须按包导入，不能再用 spec_from_file_location 单文件加载。
+from plugins.nai_draw_plugin.core.utils.help_renderer import (
+    HELP_DOC,
+    HELP_FALLBACK_TEXT,
+)
 
 
 def _documented_commands() -> tuple[str, ...]:

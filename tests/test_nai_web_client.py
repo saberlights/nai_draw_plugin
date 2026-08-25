@@ -127,13 +127,124 @@ def test_build_inner_draw_params_uses_integer_array_size_and_omits_random_seed()
     assert inner["size"] == [832, 1216]
     assert "seed" not in inner
     assert inner["qualityToggle"] is True
-    assert inner["autoSmea"] is True
+    # SMEA 是补偿 V1 时代低训练分辨率的手段，V4 起官方不再提供；
+    # 即使配置里写了 auto_smea=true，也不该给 V4.5 发这个无效字段
+    assert "autoSmea" not in inner
     # 文档 §5 表外的 sm/sm_dyn 字段已不再透传，避免触发网关 400
     assert "sm" not in inner
     assert "sm_dyn" not in inner
     assert inner["variety_boost"] is True
     assert inner["image_format"] == "webp"
     assert "model" not in inner
+
+
+def test_auto_smea_只发给_v3_及更早模型() -> None:
+    """V3 仍认 SMEA，配置开了就要发；V4+ 一律不发。"""
+    v3_inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-3", "auto_smea": True},
+        None,
+    )
+    assert v3_inner["autoSmea"] is True
+
+    for model in ("nai-diffusion-4-full", "nai-diffusion-4-5-full", "nai-diffusion-5-full"):
+        inner = NaiWebClient._build_inner_draw_params(
+            "1girl",
+            {"default_model": model, "auto_smea": True},
+            None,
+        )
+        assert "autoSmea" not in inner, f"{model} 不该收到 autoSmea"
+
+
+def test_quality_toggle_可以显式关闭() -> None:
+    """原先只在 True 时写入字段，用户没法显式关掉质量增强。"""
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-4-5-full", "quality_toggle": False},
+        None,
+    )
+    assert inner["qualityToggle"] is False
+
+
+def test_显式传入的_size_优先于_nai_size() -> None:
+    """i2i 会把参考图真实宽高作为 size 传进来，而 nai_size 几乎永远非空。
+
+    原先 nai_size 排在 size 之前，会把参考图尺寸吞掉，导致 §20.1 的
+    "i2i.image 宽高必须与外层 size 一致" 校验必然失败。
+    """
+    inner = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-4-5-full", "nai_size": "竖图"},
+        "1216x832",
+    )
+    assert inner["size"] == [1216, 832]
+
+    # 调用方没传 size 时仍走模型节的 nai_size
+    fallback = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {"default_model": "nai-diffusion-4-5-full", "nai_size": "竖图"},
+        None,
+    )
+    assert fallback["size"] == [832, 1216]
+
+
+def test_steps_兜底取该模型的推荐值() -> None:
+    """原先硬编码兜底 23，与 schema 默认 28 不一致。"""
+    v45 = NaiWebClient._build_inner_draw_params(
+        "1girl", {"default_model": "nai-diffusion-4-5-full"}, None
+    )
+    assert v45["steps"] == 28
+
+    v3 = NaiWebClient._build_inner_draw_params(
+        "1girl", {"default_model": "nai-diffusion-3"}, None
+    )
+    assert v3["steps"] == 25
+
+
+def test_额外透传参数支持键值数组与历史子表两种写法() -> None:
+    """配置改成 [{key, value}] 数组（Dashboard 没有 dict 编辑器），但要兼容旧子表。"""
+    from_list = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {
+            "default_model": "nai-diffusion-4-5-full",
+            "nai_extra_params": [
+                {"key": "custom_field", "value": "abc"},
+                {"key": "", "value": "无 key 应被跳过"},
+                {"key": "empty_value", "value": ""},
+            ],
+        },
+        None,
+    )
+    assert from_list["custom_field"] == "abc"
+    assert "empty_value" not in from_list
+
+    from_dict = NaiWebClient._build_inner_draw_params(
+        "1girl",
+        {
+            "default_model": "nai-diffusion-4-5-full",
+            "nai_extra_params": {"legacy_field": 42},
+        },
+        None,
+    )
+    assert from_dict["legacy_field"] == 42
+
+
+def test_角色数量上限按模型校验() -> None:
+    """V4/V4.5 上限 6 个，V5 上限 22 个。"""
+    def make_characters(count: int) -> list[dict]:
+        return [{"prompt": f"girl {index}"} for index in range(count)]
+
+    over_v45 = NaiWebClient._build_inner_draw_params(
+        "2girls", {"default_model": "nai-diffusion-4-5-full"}, None, make_characters(7)
+    )
+    error = NaiWebClient._validate_inner_payload("nai-diffusion-4-5-full", over_v45)
+    assert error is not None and "最多 6 个角色段" in error
+
+    # 同样 7 个角色，V5 允许
+    over_v5 = NaiWebClient._build_inner_draw_params(
+        "2girls", {"default_model": "nai-diffusion-5-full"}, None, make_characters(7)
+    )
+    assert NaiWebClient._validate_inner_payload("nai-diffusion-5-full", over_v5) is None
 
 
 def test_build_inner_draw_params_normalizes_image_format_whitelist() -> None:
