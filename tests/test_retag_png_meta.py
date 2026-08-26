@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import struct
 import sys
@@ -14,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from plugins.nai_draw_plugin.core.retag.png_meta import (
     describe_png_metadata,
     extract_prompt_from_png,
+    extract_stealth_metadata,
 )
 
 
@@ -467,3 +470,138 @@ def test_negative_container_is_never_promoted_to_positive() -> None:
         result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
 
         assert result is None, f"{negative_key} 被当成正向读了"
+
+
+# ==================== 像素隐写（stealth pnginfo）====================
+# NAI 出图同时写 tEXt 和 alpha 通道最低位。QQ 等平台会剥掉 ancillary chunk
+# 但像素是无损转发的，隐写因此存活——tEXt 丢失后这是唯一还能拿到真实 prompt
+# 的路径（比 WD14 反标签精确得多）。
+
+def _embed_stealth(payload: str, width: int = 64, height: int = 64, compress: bool = True) -> bytes:
+    """把载荷写进 alpha 最低位，复现 NAI 的 stealth pnginfo 布局。"""
+
+    from PIL import Image
+
+    raw = payload.encode("utf-8")
+    if compress:
+        raw = gzip.compress(raw)
+    signature = ("stealth_pngcomp" if compress else "stealth_pnginfo").encode("latin-1")
+
+    bits: list[int] = []
+    for byte in signature:
+        bits.extend((byte >> shift) & 1 for shift in range(7, -1, -1))
+    bit_count = len(raw) * 8
+    for shift in range(31, -1, -1):
+        bits.append((bit_count >> shift) & 1)
+    for byte in raw:
+        bits.extend((byte >> shift) & 1 for shift in range(7, -1, -1))
+
+    assert len(bits) <= width * height, "测试画布太小，装不下载荷"
+    image = Image.new("RGBA", (width, height), (120, 130, 140, 255))
+    pixels = image.load()
+    index = 0
+    # 写入顺序必须与读取一致：x 外层、y 内层（列优先）
+    for x in range(width):
+        for y in range(height):
+            r, g, b, a = pixels[x, y]
+            bit = bits[index] if index < len(bits) else 0
+            pixels[x, y] = (r, g, b, (a & ~1) | bit)
+            index += 1
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_stealth_payload_is_read_from_alpha_lsb() -> None:
+    """gzip 变体（NAI 实际使用的 stealth_pngcomp）必须能原样读回。"""
+
+    payload = json.dumps({"Description": "1girl, solo, red hair", "Software": "NovelAI"})
+    recovered = extract_stealth_metadata(_embed_stealth(payload))
+
+    assert recovered == payload
+
+
+def test_stealth_uncompressed_variant_is_supported() -> None:
+    payload = json.dumps({"Description": "1boy, beach"})
+    recovered = extract_stealth_metadata(_embed_stealth(payload, compress=False))
+
+    assert recovered == payload
+
+
+def test_reverse_falls_back_to_stealth_when_text_chunks_are_stripped() -> None:
+    """平台剥掉 tEXt 后，仍要能从像素里拿到真实 prompt 而不是退化到 WD14。"""
+
+    comment = json.dumps(
+        {
+            "prompt": "",
+            "v4_prompt": {
+                "caption": {
+                    "base_caption": "rating:general, 2girls, indoor",
+                    "char_captions": [
+                        {"char_caption": "girl, source#hug"},
+                        {"char_caption": "girl, target#hug"},
+                    ],
+                }
+            },
+            "uc": "lowres, bad anatomy",
+        }
+    )
+    # 隐写载荷的键名与 tEXt chunk 同构，Comment 值本身是一层嵌套 JSON
+    payload = json.dumps({"Comment": comment, "Software": "NovelAI"})
+    png_bytes = _embed_stealth(payload, width=96, height=96)
+
+    # 前置条件：这张图确实没有任何文本块
+    from plugins.nai_draw_plugin.core.retag.png_meta import _parse_png_text_chunks
+
+    assert not _parse_png_text_chunks(png_bytes)
+
+    result = extract_prompt_from_png(png_bytes)
+
+    assert result is not None, "tEXt 被剥掉后应当由像素隐写兜住"
+    assert "char1:girl, source#hug," in result.prompt
+    assert "char2:girl, target#hug," in result.prompt
+    # 负面同样不许经隐写路径混进正向
+    assert "lowres" not in result.prompt
+
+
+def test_text_chunks_take_priority_over_stealth() -> None:
+    """两者都在时以 tEXt 为准，隐写只是兜底，避免同一张图产出两种结果。"""
+
+    stealth_png = _embed_stealth(json.dumps({"Description": "stealth version"}))
+    # 往这张图里再塞一个 tEXt Comment
+    from plugins.nai_draw_plugin.core.retag.png_meta import _parse_png_text_chunks
+
+    insert_at = stealth_png.index(b"IDAT") - 4
+    comment_chunk = _png_chunk(
+        b"tEXt", b"Comment\x00" + json.dumps({"prompt": "text chunk version"}).encode()
+    )
+    combined = stealth_png[:insert_at] + comment_chunk + stealth_png[insert_at:]
+    assert "Comment" in _parse_png_text_chunks(combined)
+
+    result = extract_prompt_from_png(combined)
+
+    assert result is not None
+    assert result.prompt == "text chunk version"
+
+
+def test_describe_reports_which_source_supplied_the_metadata() -> None:
+    """诊断要说清 prompt 是 tEXt 来的还是隐写来的，否则排查时分不清链路。"""
+
+    stealth_only = _embed_stealth(json.dumps({"Description": "1girl, solo"}))
+    reason = describe_png_metadata(stealth_only)
+
+    assert "元数据其实可解析" in reason
+    assert "像素隐写" in reason
+
+
+def test_image_without_alpha_or_stealth_still_returns_none() -> None:
+    """无 alpha、无隐写的普通图必须干净地返回 None，交由上层兜底。"""
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(buffer, format="PNG")
+
+    assert extract_stealth_metadata(buffer.getvalue()) is None
+    assert extract_prompt_from_png(buffer.getvalue()) is None

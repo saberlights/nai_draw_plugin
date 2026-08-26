@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """PNG 元数据反推 —— 仅输出正向 prompt。
 
-支持三种主流写入方式：
+支持四种写入方式：
   * NAI 出图：tEXt/iTXt["Comment"] 是 JSON，含 prompt / uc
+  * NAI 隐写：alpha（或 RGB）通道最低位藏 stealth pnginfo，tEXt 被剥掉后仍在
   * SD WebUI：tEXt["parameters"] 是纯文本，"prompt\\nNegative prompt: ...\\nSteps: ..."
   * 通用：tEXt["prompt"] / ["Description"] / ["UserComment"]
 
@@ -11,11 +12,13 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import struct
 import zlib
 from dataclasses import dataclass, field
+from itertools import islice
 from typing import Dict, List, Optional
 
 
@@ -28,6 +31,19 @@ _CAPTION_CONTAINER_KEYS = frozenset({"prompt", "description", "caption"})
 
 # 负面来源，任何情况下都不得当正向读取
 _NEGATIVE_KEYS = frozenset({"uc", "negative_prompt", "negativeprompt"})
+
+# stealth pnginfo 的四种签名。前缀决定载体通道，后缀决定是否 gzip 压缩。
+# 实测 NAI 出图用的是 alpha 通道 + gzip（stealth_pngcomp）。
+_STEALTH_SIGNATURES = {
+    "stealth_pnginfo": ("alpha", False),
+    "stealth_pngcomp": ("alpha", True),
+    "stealth_rgbinfo": ("rgb", False),
+    "stealth_rgbcomp": ("rgb", True),
+}
+_STEALTH_SIGNATURE_BITS = 15 * 8  # 四个签名都是 15 个 ASCII 字符
+_STEALTH_LENGTH_BITS = 32  # 紧跟签名的 32 位大端整数，单位是"位"而不是字节
+# 载荷位数上限，防止被构造的长度字段拖着读满整张图
+_STEALTH_MAX_PAYLOAD_BITS = 8 * 1024 * 1024
 
 # 常见图片容器的魔数，用于把"不是 PNG"和"是 PNG 但没元数据"区分开
 _IMAGE_MAGICS = (
@@ -286,13 +302,12 @@ def _extract_from_sd_parameters(raw: str) -> Optional[PngMetaResult]:
     )
 
 
-def extract_prompt_from_png(image_bytes: bytes) -> Optional[PngMetaResult]:
-    """从 PNG bytes 中尝试解析 prompt。无元数据时返回 None。"""
-    try:
-        chunks = _parse_png_text_chunks(image_bytes)
-    except Exception:
-        # 任何解析异常都视为无元数据，由上层走兜底链路
-        return None
+def _resolve_from_chunks(chunks: Dict[str, str]) -> Optional[PngMetaResult]:
+    """按 NAI → SD WebUI → 通用键的顺序解析一组文本字段。
+
+    tEXt chunk 与像素隐写载荷的键名是同一套（Comment / Description / …），
+    所以两条来源共用这个解析器，避免规则各写一份后漂移。
+    """
 
     if not chunks:
         return None
@@ -321,6 +336,43 @@ def extract_prompt_from_png(image_bytes: bytes) -> Optional[PngMetaResult]:
     return None
 
 
+def _stealth_chunks(image_bytes: bytes) -> Dict[str, str]:
+    """把隐写载荷解成与 tEXt chunk 同构的字段表。"""
+
+    payload = extract_stealth_metadata(image_bytes)
+    if not payload:
+        return {}
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, ValueError):
+        # 载荷不是 JSON 时按纯 prompt 文本处理
+        return {"Description": payload}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in parsed.items()
+        if isinstance(value, str)
+    }
+
+
+def extract_prompt_from_png(image_bytes: bytes) -> Optional[PngMetaResult]:
+    """从 PNG bytes 中尝试解析 prompt。无元数据时返回 None。"""
+    try:
+        chunks = _parse_png_text_chunks(image_bytes)
+    except Exception:
+        # 任何解析异常都视为无元数据，由上层走兜底链路
+        chunks = {}
+
+    result = _resolve_from_chunks(chunks)
+    if result is not None:
+        return result
+
+    # tEXt 没拿到就读像素隐写：QQ 等平台会剥掉 ancillary chunk，但像素是无损
+    # 转发的，NAI 同时写进 alpha 最低位的那份因此存活
+    return _resolve_from_chunks(_stealth_chunks(image_bytes))
+
+
 def _detect_container(image_bytes: bytes) -> str:
     """识别图片容器类型，未知时返回前 4 字节的十六进制。"""
     for magic, label in _IMAGE_MAGICS:
@@ -329,6 +381,107 @@ def _detect_container(image_bytes: bytes) -> str:
     if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
         return "WebP"
     return f"未知容器(前4字节 {image_bytes[:4].hex()})"
+
+
+def _iter_lsb_bits(image, carrier: str):
+    """按列优先顺序产出载体通道的最低位。
+
+    stealth pnginfo 的写入顺序是 x 外层、y 内层（列优先），读的时候必须一致，
+    否则位流会整体错位、签名对不上。
+    """
+
+    pixels = image.load()
+    width, height = image.size
+    for x in range(width):
+        for y in range(height):
+            pixel = pixels[x, y]
+            if carrier == "alpha":
+                yield pixel[3] & 1
+            else:
+                for channel in pixel[:3]:
+                    yield channel & 1
+
+
+def _bits_to_bytes(bits: List[int]) -> bytes:
+    out = bytearray()
+    for index in range(0, len(bits) - 7, 8):
+        byte = 0
+        for bit in bits[index : index + 8]:
+            byte = (byte << 1) | bit
+        out.append(byte)
+    return bytes(out)
+
+
+def _read_stealth_payload(image, carrier: str, compressed: bool) -> Optional[str]:
+    """按指定载体读出 stealth 载荷文本；签名或长度不合法时返回 None。"""
+
+    stream = _iter_lsb_bits(image, carrier)
+    header_length = _STEALTH_SIGNATURE_BITS + _STEALTH_LENGTH_BITS
+    header_bits = list(islice(stream, header_length))
+    if len(header_bits) < header_length:
+        return None
+
+    signature = _bits_to_bytes(header_bits[:_STEALTH_SIGNATURE_BITS]).decode("latin-1")
+    expected = next(
+        (name for name, spec in _STEALTH_SIGNATURES.items() if spec == (carrier, compressed)),
+        None,
+    )
+    if signature != expected:
+        return None
+
+    length_bits = header_bits[_STEALTH_SIGNATURE_BITS :]
+    payload_bit_count = int.from_bytes(_bits_to_bytes(length_bits), "big")
+    if payload_bit_count <= 0 or payload_bit_count > _STEALTH_MAX_PAYLOAD_BITS:
+        return None
+
+    payload_bits = list(islice(stream, payload_bit_count))
+    if len(payload_bits) < payload_bit_count:
+        # 声明长度超过图里实际可读的位数，说明签名是巧合或数据被截断
+        return None
+
+    raw = _bits_to_bytes(payload_bits)
+    if compressed:
+        try:
+            raw = gzip.decompress(raw)
+        except (OSError, zlib.error):
+            return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def extract_stealth_metadata(image_bytes: bytes) -> Optional[str]:
+    """读取藏在像素最低位里的 stealth pnginfo 原文。
+
+    NAI 出图同时写 tEXt 和像素隐写。QQ 之类的平台会剥掉 tEXt ancillary chunk
+    但像素是无损转发的，隐写因此存活——这是 tEXt 丢失后唯一还能拿到真实
+    prompt 的路径，比 WD14 反标签精确得多。
+
+    需要 Pillow 读像素；缺依赖时返回 None 交由上层继续兜底。
+    """
+
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+
+    import io
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            # 载体是 alpha 还是 RGB 由签名决定，先按图像本身有没有 alpha 排序尝试
+            carriers = ["alpha", "rgb"] if image.mode in ("RGBA", "LA", "PA") else ["rgb"]
+            for carrier in carriers:
+                converted = image.convert("RGBA" if carrier == "alpha" else "RGB")
+                for compressed in (True, False):
+                    payload = _read_stealth_payload(converted, carrier, compressed)
+                    if payload:
+                        return payload
+    except Exception:
+        # 隐写是兜底路径，任何解码异常都不该冒泡打断反推
+        return None
+    return None
 
 
 def _png_dimensions(image_bytes: bytes) -> str:
@@ -366,13 +519,39 @@ def describe_png_metadata(image_bytes: bytes) -> str:
     except Exception as exc:  # noqa: BLE001 - 诊断路径，任何解析异常都要如实报告
         return f"PNG 文本块解析异常: {exc!r}"
 
-    if not chunks:
-        # 体积与像素尺寸是判断"图被谁动过"的唯一线索：NAI 原图约 1MB 且尺寸是
-        # 832x1216 这类出图档位，明显偏小就说明中途被重新编码过，
-        # 那种情况下任何解析器都救不回元数据
+    # 能不能解析必须在最前面判定：tEXt 为空但像素隐写命中是常态（平台剥 chunk
+    # 但无损转发像素），先看 chunks 就会把这种成功情形误报成失败
+    existing = extract_prompt_from_png(image_bytes)
+    stealth_chunks = _stealth_chunks(image_bytes)
+    if existing is not None and existing.tags:
+        via = "tEXt 文本块" if _resolve_from_chunks(chunks) is not None else "像素隐写"
+        source = str(
+            chunks.get("Source")
+            or chunks.get("Software")
+            or stealth_chunks.get("Source")
+            or stealth_chunks.get("Software")
+            or ""
+        ).strip()
+        origin = f"来源={source!r}；" if source else ""
+        keys = "、".join(sorted(chunks)) or "无"
         return (
-            "PNG 没有任何 tEXt/iTXt/zTXt 文本块（元数据已被剥离或平台重新编码过）；"
+            f"元数据其实可解析（{len(existing.tags)} 个 tag，来自{via}）；"
+            f"{origin}文本块键：{keys}"
+        )
+
+    if not chunks and not stealth_chunks:
+        # tEXt 和像素隐写都没拿到。体积与像素尺寸是判断"图被谁动过"的唯一线索：
+        # NAI 原图约 1MB 且尺寸是 832x1216 这类出图档位，明显偏小就是中途被重新
+        # 编码过——那会连隐写一起毁掉，任何解析器都救不回来
+        return (
+            "PNG 没有任何 tEXt/iTXt/zTXt 文本块，像素隐写里也没有 stealth pnginfo；"
             f"收到 {len(image_bytes) / 1024:.0f}KB，{_png_dimensions(image_bytes)}"
+        )
+
+    if not chunks:
+        return (
+            "tEXt 文本块为空，像素隐写有载荷但解析不出正向 prompt；"
+            f"隐写字段：{'、'.join(sorted(stealth_chunks))}"
         )
 
     # NAI 把模型版本写在 Source chunk（如 "NovelAI Diffusion V4.5 4BDE2A90"），
@@ -380,13 +559,6 @@ def describe_png_metadata(image_bytes: bytes) -> str:
     source = str(chunks.get("Source") or chunks.get("Software") or "").strip()
     origin = f"来源={source!r}；" if source else ""
     keys = "、".join(sorted(chunks))
-
-    existing = extract_prompt_from_png(image_bytes)
-    if existing is not None and existing.tags:
-        return (
-            f"元数据其实可解析（{len(existing.tags)} 个 tag）；{origin}"
-            f"文本块键：{keys}"
-        )
 
     comment = chunks.get("Comment")
     if comment is None:
