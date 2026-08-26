@@ -294,3 +294,69 @@ def test_describe_reports_missing_comment_chunk() -> None:
     reason = describe_png_metadata(_make_png_with_text([("Software", "NovelAI")]))
     assert "没有 NAI 的 Comment 字段" in reason
     assert "Software" in reason
+
+
+def test_v4_single_character_stays_flat_not_charn() -> None:
+    """V4 单人图也会填一个 char_caption，但绝不能因此切成 charN 多行格式。
+
+    回归来源：下游认定多人的阈值是"1 全局段 + ≥2 角色段"
+    （extract_multi_character_payload_from_text 要求 ≥3 段）。只输出一条 char1:
+    时谁都反解不回来，回灌 /nai0 会把字面量 `char1:` 当 tag 画进图里。
+    """
+
+    comment = _nai_structured_comment(
+        top_level_prompt="rating:general, 1girl, solo, garden",
+        structured_key="v4_prompt",
+        base_caption="rating:general, 1girl, solo, garden",
+        char_captions=["girl, blue hair, smile, standing"],
+    )
+    result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+    assert result is not None
+    assert "\n" not in result.prompt, "单人图不能输出多行 charN 格式"
+    assert "char1:" not in result.prompt
+    # 角色段的 tag 仍要并进扁平串，不能因为不切多行就丢内容
+    assert "blue hair" in result.prompt
+    assert "standing" in result.prompt
+    assert "rating:general" in result.prompt
+    assert "lowres" not in result.prompt
+
+
+def test_v4_two_characters_still_use_charn_format() -> None:
+    """≥2 角色段才切多行，阈值必须与下游反解一致。"""
+
+    comment = _nai_structured_comment(
+        top_level_prompt="",
+        structured_key="v4_prompt",
+        base_caption="rating:general, 2girls, indoor",
+        char_captions=["girl, source#hug", "girl, target#hug"],
+    )
+    result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+    assert result is not None
+    assert result.prompt.count("\n") == 2
+    assert "char1:girl, source#hug," in result.prompt
+    assert "char2:girl, target#hug," in result.prompt
+
+
+def test_describe_does_not_claim_failure_when_metadata_is_parseable() -> None:
+    """诊断函数也会被当独立探针调用，元数据能解析时不许硬报失败。"""
+
+    comment = json.dumps({"prompt": "1girl, solo, smile", "uc": "lowres"})
+    reason = describe_png_metadata(_make_png_with_text([("Comment", comment)]))
+
+    assert "元数据其实可解析" in reason
+    assert "没有可用的正向 prompt" not in reason
+
+
+def test_describe_reports_nai_model_version_from_source_chunk() -> None:
+    """NAI 把模型版本写在 Source chunk，判断"哪个版本推不出来"必须报出它。"""
+
+    comment = json.dumps({"prompt": "", "steps": 28})
+    reason = describe_png_metadata(
+        _make_png_with_text(
+            [("Comment", comment), ("Source", "NovelAI Diffusion V5 1A2B3C4D")]
+        )
+    )
+
+    assert "NovelAI Diffusion V5 1A2B3C4D" in reason

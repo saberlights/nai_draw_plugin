@@ -194,9 +194,11 @@ def _extract_from_nai_comment(comment_value: str) -> Optional[PngMetaResult]:
     if not base_tags and not char_tag_groups:
         return None
 
-    if char_tag_groups:
-        # 与 _render_from_v2 / extract_multi_character_payload_from_text 同一套
-        # charN: 拍平格式，反推结果可以直接回灌 /nai0 重画
+    # charN: 拍平格式只在真多人时使用。下游认定多人的阈值是"1 个全局段 + ≥2 个角色段"
+    # （extract_multi_character_payload_from_text 要求 ≥3 段，_select_send_payload 要求
+    # characters ≥ 2）。V4 单人图也会填一个 char_caption，若在这里就切多行，产出的
+    # 单条 char1: 谁都反解不回来，回灌 /nai0 会把字面量 char1: 当 tag 画进图里。
+    if len(char_tag_groups) >= 2:
         lines = [", ".join(base_tags) + ","] if base_tags else []
         lines.extend(
             f"char{index}:{', '.join(group)},"
@@ -204,7 +206,11 @@ def _extract_from_nai_comment(comment_value: str) -> Optional[PngMetaResult]:
         )
         prompt = "\n".join(lines)
     else:
-        prompt = ", ".join(base_tags)
+        # 单人：合并成扁平串，与 V3 行为一致；角色段的 tag 仍然并进来，不丢内容
+        merged = list(base_tags)
+        for group in char_tag_groups:
+            merged.extend(tag for tag in group if tag not in merged)
+        prompt = ", ".join(merged)
 
     tags = list(base_tags)
     for group in char_tag_groups:
@@ -298,12 +304,14 @@ def _detect_container(image_bytes: bytes) -> str:
 
 
 def describe_png_metadata(image_bytes: bytes) -> str:
-    """反推未命中时给出精确原因。
+    """报告 PNG 元数据的真实状况，供反推未命中时定位原因。
 
     原先四种完全不同的故障都只表现为 ``extract_prompt_from_png`` 返回 None：
     根本不是 PNG、是 PNG 但没有文本块、有 Comment 但不是 JSON、有 JSON 但正向
     字段为空。它们的处理方式完全不同（换出图格式 / 平台重编码剥元数据 / NAI 改了
     结构），混成一句"无元数据"就没法定位，所以这里逐层报告。
+
+    也可以当独立探针直接调用：元数据其实可解析时会如实说明，不会硬报失败。
     """
 
     if not image_bytes:
@@ -324,18 +332,30 @@ def describe_png_metadata(image_bytes: bytes) -> str:
     if not chunks:
         return "PNG 没有任何 tEXt/iTXt/zTXt 文本块（元数据已被剥离或平台重新编码过）"
 
+    # NAI 把模型版本写在 Source chunk（如 "NovelAI Diffusion V4.5 4BDE2A90"），
+    # 判断"哪个版本的图反推不出来"必须报出它，否则只能靠猜
+    source = str(chunks.get("Source") or chunks.get("Software") or "").strip()
+    origin = f"来源={source!r}；" if source else ""
     keys = "、".join(sorted(chunks))
+
+    existing = extract_prompt_from_png(image_bytes)
+    if existing is not None and existing.tags:
+        return (
+            f"元数据其实可解析（{len(existing.tags)} 个 tag）；{origin}"
+            f"文本块键：{keys}"
+        )
+
     comment = chunks.get("Comment")
     if comment is None:
-        return f"PNG 有文本块但没有 NAI 的 Comment 字段；现有键：{keys}"
+        return f"PNG 有文本块但没有 NAI 的 Comment 字段；{origin}现有键：{keys}"
 
     try:
         meta = json.loads(comment.strip())
     except (json.JSONDecodeError, ValueError) as exc:
-        return f"Comment 不是合法 JSON（{exc}）；现有键：{keys}"
+        return f"Comment 不是合法 JSON（{exc}）；{origin}现有键：{keys}"
 
     if not isinstance(meta, dict):
-        return f"Comment JSON 顶层不是对象而是 {type(meta).__name__}；现有键：{keys}"
+        return f"Comment JSON 顶层不是对象而是 {type(meta).__name__}；{origin}现有键：{keys}"
 
     base_caption, char_captions = _extract_structured_captions(meta)
     structured_keys = [
@@ -344,7 +364,7 @@ def describe_png_metadata(image_bytes: bytes) -> str:
     ]
     return (
         "Comment JSON 里没有可用的正向 prompt："
-        f"顶层 prompt={meta.get('prompt')!r}，"
+        f"{origin}顶层 prompt={meta.get('prompt')!r}，"
         f"结构化键={structured_keys or '无'}，"
         f"base_caption={base_caption!r}，角色段 {len(char_captions)} 个；"
         f"Comment 顶层字段：{'、'.join(sorted(meta))}"
