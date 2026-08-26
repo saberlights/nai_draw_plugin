@@ -88,6 +88,7 @@ from .core.utils.prompt_postprocessor import (
     strip_cjk_and_fullwidth_from_characters,
     user_mentions_appearance,
 )
+from .core.utils.prompt_output_parser import extract_multi_character_payload_from_text
 from .core.utils.random_scene_description import parse_random_scene_request
 
 logger = get_logger("nai_draw_plugin")
@@ -2032,10 +2033,18 @@ class NaiInvocation(ModelConfigMixin):
             if enable_debug:
                 await self.send_text("正在生成图片，请稍候...")
 
+            # 直发路径不过 LLM，但用户手输或从反推结果粘回的多人串同样是
+            # `global,\nchar1:...,\nchar2:...` 格式；不反解就会把 `char1:` 当成
+            # 字面 tag 画进图里。generate_image 内部按模型嗅探 characters，
+            # 不支持多角色的模型会自动降级回单串。
+            structured = extract_multi_character_payload_from_text(tags)
+            send_prompt, request_characters = self._select_send_payload(tags, structured)
+
             success, result = await self.api_client.generate_image(
-                prompt=tags,
+                prompt=send_prompt,
                 model_config=model_config,
                 size=image_size,
+                characters=request_characters,
             )
 
             if not success:
