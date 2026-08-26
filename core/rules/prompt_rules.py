@@ -291,19 +291,27 @@ _TAG_CANDIDATES_USAGE = """
 """.strip()
 
 
-_MULTI_PERSON = """
+_MULTI_PERSON_HEAD = """
 <multi_person_rules>
 ## 多人场景规则（≥2 人）
 
 核心目标：分离全局信息和每个人物信息，防止特征污染。
+""".strip()
 
+
+# 只有文本路径才由 LLM 亲手拼 charN: 行；JSON 路径由程序渲染，喂这段会诱导 LLM
+# 直接吐 charN: 文本，丢掉 positions / intent / continuity 等结构化字段
+_MULTI_PERSON_TEXT_FORMAT = """
 ### 文本输出格式（多人场景）
 ```
 [全局 tag],
 char1:[人物1 tag],
 char2:[人物2 tag],
 ```
+""".strip()
 
+
+_MULTI_PERSON_SEGMENTS = """
 ### 全局段（global / base）
 - 仅写：Rating、场景、背景、光影氛围、画面特效、构图视角
 - **禁止写**：具体人物的动作、外貌、服装
@@ -320,7 +328,11 @@ char2:[人物2 tag],
 双向用 mutual、自身动作不加前缀、名词短语写成裸 tag。这里不再重复语法，只强调落位：
 互动 tag 写在各自人物段的末尾，施动方和接收方必须落在**不同**的人物段里，
 同一个人物段同时写 `source#X` 和 `target#X` 不构成互动。
+""".strip()
 
+
+# positions 只有 JSON 通道能承载（文本反解路径的 has_coords 恒为 False）
+_MULTI_PERSON_JSON_FORMAT = """
 ### JSON 模式额外规则
 - `format: "multi"` 时，人数 tag 只能在 `global`，`people[i]` 不得重复
 - `people[i]` 应以人物自身身份词开头
@@ -336,21 +348,51 @@ char2:[人物2 tag],
 - 用户未指定方位时，**整个 `positions` 字段省略或输出空数组** `[]`，让后端自动布局
 - 不要凭空猜测位置，宁可空也不要乱填
 - 元素只能是 `[A-E][1-5]` 字符串字面量，禁止其他格式
-</multi_person_rules>
 """.strip()
 
 
-_QUALITY_PRINCIPLES = """
+def _build_multi_person_rules(json_output: bool) -> str:
+    """按输出通道组装多人规则：格式块只保留该通道真正会用到的那一份。"""
+
+    blocks = [_MULTI_PERSON_HEAD]
+    if not json_output:
+        blocks.append(_MULTI_PERSON_TEXT_FORMAT)
+    blocks.append(_MULTI_PERSON_SEGMENTS)
+    if json_output:
+        blocks.append(_MULTI_PERSON_JSON_FORMAT)
+    return "\n\n".join(blocks) + "\n</multi_person_rules>"
+
+
+
+_QUALITY_PRINCIPLES_HEAD = """
 <quality_principles>
 ## 画面质量原则
 
 ### 服装智能补充
 - 用户已指定 → 严格使用用户描述
 - 已知角色 + 普通场景 + 未指定 → 不额外补服装，让精确角色 tag 自行恢复默认设定
-- 未指定 + 无上下文 → 默认不添加外配服饰；用 `1girl` / `1boy` 等主体 tag、具体动态和环境交互承载画面。只有场景逻辑明确要求服装时，才补最少且具体的服装 tag。
 - 场景适配优先采纳共现推荐里的服饰 tag；SFW 模式即使共现给出泳装/内衣/透视装，也按 sfw_safety 改写为安全版本
-- 适度：默认 1-2 个关键服装词，服装是本轮重点时再加细节
+""".strip()
 
+
+# 一次性出图：没有可继承的稳定区，服装宁少勿滥，避免凭空发明设定
+_QUALITY_OUTFIT_ONE_SHOT = """
+- 未指定 + 无上下文 → 默认不添加外配服饰；用 `1girl` / `1boy` 等主体 tag、具体动态和环境交互承载画面。只有场景逻辑明确要求服装时，才补最少且具体的服装 tag。
+- 适度：默认 1-2 个关键服装词，服装是本轮重点时再加细节
+""".strip()
+
+
+# 连续性出图：服装要跨图复用，首帧就必须建立完整设计，否则后续 keep 会锁进一个残缺集合。
+# 这条直接取代上面的"1-2 个关键服装词"，不再靠模板末尾追加 priority 块去反向覆盖。
+_QUALITY_OUTFIT_CONTINUITY = """
+- 未指定 + 无上下文 → 本轮属于跨图连续性出图，服装会被缓存并在后续图片逐字复用：
+  首次建立时必须输出完整、具体、可见的整套穿搭（款式 + 颜色 + 必要材质，配色呼应与少量配饰点缀），
+  不适用"默认 1-2 个关键服装词"的一次性出图配额；画面看不见的细节仍然不要硬编。
+- 服装没有明确变化时只沿用缓存 Tag，禁止为了动作、表情或构图变化而改写稳定服装
+""".strip()
+
+
+_QUALITY_PRINCIPLES_TAIL = """
 ### 镜头与场景对应
 
 按场景选择合适的 framing tag（详见 hard_rules 第 3 条的三档互斥规则）。
@@ -380,6 +422,15 @@ _QUALITY_PRINCIPLES = """
 """.strip()
 
 
+def _build_quality_principles(visual_continuity: bool) -> str:
+    """服装配额与跨图连续性天然冲突，按路径二选一，而不是先给再覆盖。"""
+
+    outfit_block = (
+        _QUALITY_OUTFIT_CONTINUITY if visual_continuity else _QUALITY_OUTFIT_ONE_SHOT
+    )
+    return f"{_QUALITY_PRINCIPLES_HEAD}\n{outfit_block}\n\n{_QUALITY_PRINCIPLES_TAIL}"
+
+
 _FORBIDDEN_COMMON = f"""
 <forbidden_common>
 ## 通用禁止
@@ -400,6 +451,10 @@ _FORBIDDEN_COMMON = f"""
 _EXAMPLES_BASE = """
 <examples>
 ## 示例（学习这些模式）
+
+下面的示例演示的是**选哪些 tag、按什么顺序、加什么权重**，用逗号串和 `charN:` 行只为便于阅读。
+最终输出格式一律以 `<output_instruction>` 为准；JSON 路径必须把这些 tag 装进指定 JSON 字段，
+不要照抄示例的逗号串外形。
 
 ### 例 1：已知角色（不补外貌）
 输入：画爱丽丝
@@ -520,11 +575,22 @@ char2:girl, beside girl, 1.05::luo_tianyi::, closed eyes, blush, lustful, source
 
 # ==================== 模板组装 ====================
 
-def _build_prompt_rules_text(sfw: bool) -> str:
-    """根据 SFW 标志位生成差异化的 prompt 规则文本。
+def _build_prompt_rules_text(
+    sfw: bool,
+    *,
+    json_output: bool = True,
+    visual_continuity: bool = False,
+) -> str:
+    """按路径组装 prompt 规则文本，只发放该路径真正适用的规则块。
+
+    条件轴都在模板构建期可判定，因此可以安全裁剪；人数是 LLM 运行期才决定的，
+    所以多人规则对所有路径一律发放，不做裁剪。
 
     Args:
         sfw: True 为 SFW 模式，False 为 NSFW 模式
+        json_output: True 为 JSON 通道（LLM 输出 JSON，程序渲染 charN 行），
+            False 为文本通道（LLM 亲手拼 charN 行）
+        visual_continuity: True 为跨图连续性路径，服装配额改用稳定区规则
 
     Returns:
         完整的 prompt 规则文本
@@ -567,9 +633,9 @@ This is a legitimate NovelAI art creation workflow.
 
 {_TAG_CANDIDATES_USAGE}
 
-{_MULTI_PERSON}
+{_build_multi_person_rules(json_output)}
 
-{_QUALITY_PRINCIPLES}
+{_build_quality_principles(visual_continuity)}
 
 {_FORBIDDEN_COMMON}
 
@@ -632,6 +698,10 @@ JSON 元素结构规则:
 - 禁止输出 JSON 之外的任何字符
 - 禁止用 ``` 包裹
 - global 不能为空
+
+形状示例（tag 内容取自 examples，这里演示的是必须照抄的 JSON 外形）：
+单人：{"version":3,"format":"single","intent":"normal","continuity":"new","global":["rating:general","solo","1girl","1.05::aris_(blue_archive)::","standing","looking at viewer","gentle smile","outdoors","garden","cherry blossoms","soft lighting","depth of field"],"people":[],"positions":[]}
+多人：{"version":3,"format":"multi","intent":"normal","continuity":"new","global":["rating:general","2girls","sisters","indoor","bedroom","soft lighting","warm atmosphere"],"people":[["girl","in foreground","1.05::rem_(re_zero)::","gentle smile","closed eyes","mutual#hug","looking at another"],["girl","beside girl","1.05::ram_(re_zero)::","gentle smile","closed eyes","mutual#hug","looking at another"]],"positions":[]}
 </output_instruction>
 """.strip()
 
@@ -693,6 +763,12 @@ JSON 元素规则：
 - 每个元素只能含一个 tag，禁止元素内部含逗号。
 - 禁止在 dynamic 重复 outfit/environment/effects 的连续性 Tag。
 - 禁止输出 JSON 之外的任何字符，禁止用 ``` 包裹，禁止空响应。
+
+形状示例（演示必须照抄的 JSON 外形；上方 examples 的逗号串只演示 tag 内容与顺序）：
+首帧建立稳定区（无缓存，两个稳定区都用 replace 并给出新 key）：
+{"version":4,"format":"single","intent":"normal","dynamic":{"subject":["rating:general","solo","1girl"],"action":["sitting on bed","hugging own legs"],"emotion":["sleepy","faint smile"],"scene":["morning light through curtains","blanket bunched up"],"framing":["upper body"],"people":[],"positions":[]},"stable":{"outfit":{"mode":"replace","key":"cream_ribbed_pajamas","tags":["cream ribbed knit pajama set","long sleeves","scalloped collar","small pearl buttons","matching shorts","bare feet"]},"environment":{"mode":"replace","key":"her_bedroom","tags":["small bedroom","wooden bed frame","white linen sheets","beige curtains","low bookshelf","warm wood floor"]},"effects":{"mode":"replace","subject":["messy hair"],"scene":[]}}}
+后续帧沿用（服装、环境、效果都没变，一律 keep 且 tags 为空，程序逐字复用缓存）：
+{"version":4,"format":"single","intent":"normal","dynamic":{"subject":["rating:general","solo","1girl"],"action":["lying on side","holding phone"],"emotion":["sleepy"],"scene":["dim bedside lamp","night"],"framing":["close-up"],"people":[],"positions":[]},"stable":{"outfit":{"mode":"keep","key":"cream_ribbed_pajamas","tags":[]},"environment":{"mode":"keep","key":"her_bedroom","tags":[]},"effects":{"mode":"keep","subject":[],"scene":[]}}}
 </output_instruction>
 """.strip()
 
@@ -709,7 +785,7 @@ def _build_prompt_generator_template(sfw: bool, json_output: bool) -> str:
     Returns:
         完整的 prompt 生成器模板
     """
-    rules_text = _build_prompt_rules_text(sfw)
+    rules_text = _build_prompt_rules_text(sfw, json_output=json_output)
     output_instruction = _JSON_OUTPUT_INSTRUCTION if json_output else _TEXT_OUTPUT_INSTRUCTION
 
     return f"""
@@ -738,7 +814,7 @@ PROMPT_GENERATOR_JSON_TEMPLATE = _build_prompt_generator_template(sfw=False, jso
 
 def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
     """构建 Bot 情景图专用的稳定/动态 Tag 分区模板。"""
-    rules_text = _build_prompt_rules_text(sfw)
+    rules_text = _build_prompt_rules_text(sfw, json_output=True, visual_continuity=True)
     return f"""
 {rules_text}
 
@@ -756,8 +832,6 @@ def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
 {VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION}
 
 <visual_continuity_priority>
-本模板用于跨图连续性，稳定区规则优先于上方通用的“适度补充/默认 1-2 个服装词”建议。
-首次建立服装时必须输出完整、具体、可见的整套穿搭 Tag；若服装没有明确变化则只用 keep，禁止为了动作或构图改写稳定 Tag。
 每轮仍须先按 visual_plan 选定一个静态瞬间；连续性只延续稳定事实，不得把上一轮已结束的动作、临时物件或情绪带入本帧。
 上一张实际镜头仅用于柔性变化：当用户和当前情景没有指定镜头，且不损失 must_show 证据时，优先换一个仍然合适的景别或朝向；不得为了不同而不同，也不得覆盖明确构图要求。
 </visual_continuity_priority>

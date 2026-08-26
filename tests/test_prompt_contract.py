@@ -6,6 +6,7 @@
 而且没有任何测试发现。
 """
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -24,6 +25,11 @@ from plugins.nai_draw_plugin.core.rules.prompt_rules import (
 )
 from plugins.nai_draw_plugin.core.services.visual_continuity import (
     _interaction_binding_failure,
+    resolve_visual_continuity,
+)
+from plugins.nai_draw_plugin.core.utils.prompt_output_parser import (
+    extract_multi_character_payload,
+    parse_prompt_from_structured_output,
 )
 
 
@@ -145,3 +151,123 @@ def test_multi_person_block_defers_binding_to_the_shared_contract() -> None:
 
     for name, template in ALL_TEMPLATES.items():
         assert "施动方和接收方必须落在**不同**的人物段里" in template, f"{name} 丢失落位约束"
+
+
+# ==================== 形状示例必须能被程序真实解析 ====================
+
+
+def _extract_json_objects(template: str) -> list[tuple[str, dict]]:
+    """抽出模板里可解析的 JSON 形状示例（跳过带 `[...]` 占位符的 schema 行）。"""
+
+    found: list[tuple[str, dict]] = []
+    for match in re.finditer(r'\{"version".*\}', template):
+        raw = match.group(0)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        found.append((raw, parsed))
+    return found
+
+
+def test_v3_shape_examples_round_trip_through_the_real_parser() -> None:
+    """JSON 路径的形状示例必须能被 parse_prompt_from_structured_output 渲染出提示词。"""
+
+    checked = 0
+    for name in ("json_sfw", "json_nsfw"):
+        for raw, parsed in _extract_json_objects(ALL_TEMPLATES[name]):
+            if parsed.get("version") != 3:
+                continue
+            rendered = parse_prompt_from_structured_output(raw)
+            assert rendered, f"{name} 的 v3 示例无法渲染：{raw[:80]}"
+            assert rendered.startswith("rating:"), f"{name} 的 v3 示例首 tag 不是 rating：{rendered[:60]}"
+            if parsed.get("format") == "multi":
+                payload = extract_multi_character_payload(raw)
+                assert payload, f"{name} 的多人示例进不了 characters[] 通道"
+                assert len(payload["characters"]) == 2
+            checked += 1
+    assert checked >= 4, f"只校验到 {checked} 个 v3 形状示例，抽取逻辑可能已失效"
+
+
+def test_v4_shape_examples_pass_the_real_continuity_resolver() -> None:
+    """连续性路径的形状示例必须能过 resolve，且 keep 示例要真的复用上一帧缓存。"""
+
+    checked = 0
+    for name in ("continuity_sfw", "continuity_nsfw"):
+        previous = None
+        examples = [
+            (raw, parsed)
+            for raw, parsed in _extract_json_objects(ALL_TEMPLATES[name])
+            if parsed.get("version") == 4
+        ]
+        assert len(examples) >= 2, f"{name} 需要同时演示 replace 首帧与 keep 后续帧"
+        for raw, _parsed in examples:
+            result = resolve_visual_continuity(
+                raw,
+                previous=previous,
+                include_outfit=True,
+                directives=None,
+                stable_change_text="",
+            )
+            assert not result.failure, f"{name} 的 v4 示例被 resolve 打回：{result.failure}"
+            assert result.prompt, f"{name} 的 v4 示例没有产出提示词"
+            previous = result.stable
+            checked += 1
+        # keep 示例必须沿用首帧建立的服装，而不是把稳定区清空
+        assert "cream ribbed knit pajama set" in result.prompt, (
+            f"{name} 的 keep 示例没有复用首帧服装缓存"
+        )
+    assert checked >= 4, f"只校验到 {checked} 个 v4 形状示例"
+
+
+# ==================== 按路径裁剪：该发的发到，不该发的不发 ====================
+
+
+def test_text_format_block_only_reaches_the_text_channel() -> None:
+    """JSON 路径由程序渲染 charN 行，喂文本格式块会诱导 LLM 直接吐 charN 文本。"""
+
+    text_fence = "char1:[人物1 tag],"
+    for name in ("text_sfw", "text_nsfw"):
+        assert text_fence in ALL_TEMPLATES[name], f"{name} 丢失文本输出格式块"
+    for name in ("json_sfw", "json_nsfw", "continuity_sfw", "continuity_nsfw"):
+        assert text_fence not in ALL_TEMPLATES[name], f"{name} 仍在教 LLM 直接输出 charN 文本"
+
+
+def test_positions_rules_only_reach_json_channels() -> None:
+    """positions 只有 JSON 通道能承载（文本反解路径 has_coords 恒为 False）。"""
+
+    for name in ("json_sfw", "json_nsfw", "continuity_sfw", "continuity_nsfw"):
+        assert "多人坐标（positions，可选）" in ALL_TEMPLATES[name], f"{name} 丢失坐标规则"
+        assert "元素只能是 `[A-E][1-5]` 字符串字面量" in ALL_TEMPLATES[name]
+    for name in ("text_sfw", "text_nsfw"):
+        assert "多人坐标（positions，可选）" not in ALL_TEMPLATES[name], (
+            f"{name} 是文本通道，positions 永远不会被解析"
+        )
+
+
+def test_outfit_quota_and_continuity_rule_never_coexist() -> None:
+    """一次性配额与跨图完整穿搭互斥，必须二选一，而不是先给再覆盖。"""
+
+    one_shot = "适度：默认 1-2 个关键服装词"
+    continuity = "首次建立时必须输出完整、具体、可见的整套穿搭"
+    for name in ("text_sfw", "text_nsfw", "json_sfw", "json_nsfw"):
+        template = ALL_TEMPLATES[name]
+        assert one_shot in template, f"{name} 丢失一次性出图的服装配额"
+        assert continuity not in template
+    for name in ("continuity_sfw", "continuity_nsfw"):
+        template = ALL_TEMPLATES[name]
+        assert continuity in template, f"{name} 丢失稳定区完整穿搭要求"
+        assert one_shot not in template, f"{name} 仍带互相矛盾的一次性配额"
+        # 旧实现靠模板末尾追加 priority 块反向覆盖，规则冲突时 LLM 的取舍不可控
+        assert "稳定区规则优先于上方通用的" not in template, (
+            f"{name} 仍在用自我覆盖块打补丁"
+        )
+
+
+def test_examples_declare_themselves_as_tag_content_not_wire_format() -> None:
+    """示例的逗号串外形曾与 JSON 输出契约直接冲突，必须显式声明只演示 tag 内容。"""
+
+    for name, template in ALL_TEMPLATES.items():
+        assert "最终输出格式一律以 `<output_instruction>` 为准" in template, (
+            f"{name} 的示例没有声明格式归属"
+        )
