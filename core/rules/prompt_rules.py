@@ -96,31 +96,10 @@ Rating → 人数（1girl/2girls/solo）→ **镜头框图（framing，三档互
 - 光影标签必须放最后，禁止散落到中间
 - 一个动作只用一个最准确的词，禁止堆叠近义词
 
-### 当前状态与动作关系（NAI 互动绑定语法，出错率最高）
+### 当前状态与动作关系
 
-- Planner 的 `action` 用固定关系行给出，一行一条关系，逐行翻译，不要自行合并或重组：
-  - `A → B：动作`：有向互动，A 是施动方，B 是接收方。
-  - `A ↔ B：动作`：双向互动，两人都在主动做同一件事。
-  - `A：动作`：单人自身动作或姿态，画面里没有第二个受动方。
-  关系行中的 A、B 只会是“女生”“男生”“对方”等画面角色称谓，按它对应到 people 里的人物段。
-- `source#` / `target#` / `mutual#` 是 NAI 的角色绑定前缀，**两侧必须是同一个 Danbooru tag，只有前缀不同**：
-  - `A → B：抱住` → A 的人物段写 `source#hug`，B 的人物段写 `target#hug`。
-  - `A ↔ B：拥抱` → 双方人物段都写 `mutual#hug`。
-  两侧 tag 名一旦不一致，NAI 就无法把两个人物段绑成同一次互动，方向会随机化甚至完全互换。
-- **严禁施动方用现在分词、接收方用过去分词**。下列写法全部错误，绑定必然失效：
-  `source#hugging` / `target#hugged`、`source#holding hand` / `target#held by hand`、
-  `source#patting head` / `target#head patted`。
-  正确写法是两侧完全同名：`source#hug` / `target#hug`、`source#head pat` / `target#head pat`。
-- 前缀后面只能跟真实存在的 Danbooru 动作 tag。禁止为了凑“被动形态”编造 `hair_petted`、
-  `held_by_waist`、`touched_on_thigh`、`whispered_to`、`pulled` 这类不存在的词。
-- `A：动作` 的自身动作**禁止**加任何绑定前缀，直接写裸 tag。抱住自己、咬自己的嘴唇、
-  遮住自己的身体都属于自身动作；给它们加 `source#` 会让 NAI 把动作绑到另一个角色身上，
-  画成“对方在做”或“自己对自己做”的错图。
-- 接收方除了 `target#` 互动本体，还要照常写出可见反应的裸 tag（被抱住的姿态、闭眼、脸红、身体前倾、
-  抓紧衣角等）；Bot 女生作为接收方时这些反应不能丢失。
-- 没有第二个人物时不得凭空补出接收方，也不得使用任何绑定前缀。
-- 程序会校验绑定配对：每个 `source#X` 必须在另一个人物段有同名 `target#X`，`mutual#X` 必须至少出现在两个人物段。
-  配不上的会被打回重写，所以写之前先确认两侧 tag 名逐字相同。
+Planner 的 `action` 用关系行给出当前状态与互动关系，逐行翻译成 NAI 绑定前缀，
+不要自行合并或重组。完整语法与禁忌见 `<interaction_binding>`，那里是绑定规则的唯一事实源。
 
 ### 单帧视觉导演与可见性自检
 
@@ -177,6 +156,70 @@ Rating → 人数（1girl/2girls/solo）→ **镜头框图（framing，三档互
 - 同一输入应保持输出 tag 集合和顺序基本稳定
 - 不要为了变化而变化，除非用户明确要求"换一种/不一样/再来一张不同的"
 </hard_rules>
+""".strip()
+
+
+_INTERACTION_BINDING = """
+<interaction_binding>
+## 互动绑定语法（NAI source#/target#/mutual#，出错率最高）
+
+本块是绑定规则的唯一事实源，单人、多人、文本与 JSON 路径一律遵守。
+
+### 关系行 → 绑定映射
+
+Planner 的 `action` 用固定关系行给出，一行一条关系，逐行翻译：
+- `A → B：动作`：有向互动，A 是施动方，B 是接收方 → A 的人物段写 `source#hug`，B 的人物段写 `target#hug`。
+- `A ↔ B：动作`：双向互动，两人都在主动做同一件事 → 双方人物段都写 `mutual#hug`。
+- `A：动作`：单人自身动作或姿态，画面里没有第二个受动方 → 直接写裸 tag，不加任何前缀。
+
+关系行中的 A、B 只会是“女生”“男生”“对方”等画面角色称谓，按它对应到 people 里的人物段。
+Planner 也可能改用自然中文说明关系（例如“男生从身后抱住女生，女生被抱住并回头看他”）：
+不要把这类描述压缩成“亲密互动”，先确认画面里实际有几个人，再把施动方和接收方分别落到对应人物段；
+女生是被动方时，女生的人物段必须保留 `target#` 状态，另一人的人物段写 `source#` 动作。
+
+### 铁律：两侧逐字同名，只换前缀
+
+`source#` / `target#` / `mutual#` 是 NAI 的角色绑定前缀，**两侧必须是同一个 Danbooru tag，只有前缀不同**。
+两侧 tag 名一旦不一致，NAI 就无法把两个人物段绑成同一次互动，方向会随机化甚至完全互换。
+
+**严禁施动方用现在分词、接收方用过去分词**。下列写法全部错误，绑定必然失效：
+`source#hugging` / `target#hugged`、`source#holding hand` / `target#held by hand`、
+`source#patting head` / `target#head patted`、`source#groping` / `target#groped`。
+正确写法是两侧完全同名：`source#hug` / `target#hug`、`source#head pat` / `target#head pat`；
+两侧同为分词也合法（`source#groping` / `target#groping`），关键是逐字一致。
+
+### 前缀内容限制
+
+- 前缀后面只能跟真实存在的 Danbooru 动作 tag。禁止为了凑“被动形态”编造 `hair_petted`、
+  `held_by_waist`、`touched_on_thigh`、`whispered_to`、`pulled` 这类不存在的词。
+- 前缀后不能跟名词短语：`target#hand under skirt` 错误。名词短语写成不带前缀的状态裸 tag
+  （`hand under skirt`）；确实需要绑定时换成真实动作 tag，并且两侧同名
+  （`source#touching under skirt` / `target#touching under skirt`）。
+- 前缀内部禁止逗号、撇号、下划线。
+
+### 自身动作禁止加前缀
+
+`A：动作` 的自身动作**禁止**加任何绑定前缀，直接写裸 tag。抱住自己、咬自己的嘴唇、
+遮住自己的身体、自慰、自己揉胸都属于自身动作；给它们加 `source#` 会让 NAI 把动作绑到另一个角色身上，
+画成“对方在做”或“自己对自己做”的错图。
+
+### 单向与双向的选择
+
+- 一方主动一方被动时，必须用 source/target 同名配对，**禁用 `mutual#`**。
+- `mutual#` 只用于双方都明显享受/主动的对等动作。
+- 判定：任一方表情含 `uncomfortable / crying / struggling` 或动作含 `forcing / pinning` → 用 source/target。
+
+### 接收方与人数
+
+- 接收方除了 `target#` 互动本体，还要照常写出可见反应的裸 tag（被抱住的姿态、闭眼、脸红、身体前倾、
+  抓紧衣角等）；Bot 女生作为接收方时这些反应不能丢失。
+- 没有第二个人物时不得凭空补出接收方，也不得使用任何绑定前缀。
+
+### 程序校验
+
+程序会校验绑定配对：每个 `source#X` 必须在另一个人物段有同名 `target#X`（反之亦然），
+`mutual#X` 必须至少出现在两个人物段。配不上的会被打回重写，所以写之前先确认两侧 tag 名逐字相同。
+</interaction_binding>
 """.strip()
 
 
@@ -273,27 +316,10 @@ char2:[人物2 tag],
 - 人物段内 tag 顺序：身份词 → 相对位置 → 头部（发型/表情）→ 身体细节 → 服装 → 姿势/动作 → 互动 tag
 
 ### 互动 tag（多人核心机制）
-Planner 的 `action` 可能使用自然中文来说明女生状态和关系（例如“男生从身后抱住女生，女生被抱住并回头看他”）。
-不要把这类描述压缩成“亲密互动”：先确认画面里实际有几个人，再把实施方和接收方分别落到对应人物段；
-女生是被动方时，女生的人物段必须保留 `target#` 状态，另一人的人物段写 `source#` 动作。
-当多人发生物理互动，使用前缀区分主被动：
-- `source#动作`：动作发出者（现在分词形式，如 `source#hugging`、`source#kissing`）
-- `target#动作`：动作接受者（过去分词形式，如 `target#hugged`、`target#kissed`）
-- `mutual#动作`：双方对等参与的动作（如 `mutual#hug`、`mutual#kiss`）
-
-**核心规则 1：source/target 动词形式必须配对**
-- source 用现在分词（-ing）：`source#kissing`、`source#groping`
-- target 用过去分词（-ed）：`target#kissed`、`target#groped`
-- 禁止反向：`target#kissing`（错）、`source#groped`（错）
-
-**核心规则 2：单向/强迫场景禁用 mutual**
-- 一方主动一方被动时，必须用 source/target 配对
-- mutual 只用于双方都明显享受/主动的对等动作
-- 判定：任一方表情含 `uncomfortable / crying / struggling` 或动作含 `forcing / pinning` → 用 source/target
-
-注意：
-- 前缀后只能跟动词分词，不能跟名词短语（如 `target#hand under skirt` 错误，改为 `target#touched under skirt`）
-- 前缀内部禁止逗号、撇号、下划线
+多人物理互动一律按 `<interaction_binding>` 处理：两侧逐字同名只换前缀、单向用 source/target、
+双向用 mutual、自身动作不加前缀、名词短语写成裸 tag。这里不再重复语法，只强调落位：
+互动 tag 写在各自人物段的末尾，施动方和接收方必须落在**不同**的人物段里，
+同一个人物段同时写 `source#X` 和 `target#X` 不构成互动。
 
 ### JSON 模式额外规则
 - `format: "multi"` 时，人数 tag 只能在 `global`，`people[i]` 不得重复
@@ -468,24 +494,26 @@ _NSFW_EXTRA_EXAMPLES = """
 输入：画一个女孩躺在床上自慰
 输出：rating:explicit, solo, 1girl, long brown hair, blue eyes, lying on back, on bed, white sheets, spread legs, masturbation, fingering, blush, half-closed eyes, parted lips, sweat, heavy breathing, dim lighting, bedroom,
 
-### 例 N2：多人 NSFW（source/target 主被动配对）
+### 例 N2：多人 NSFW（source/target 同名配对）
 输入：男生从背后压住女生
 输出:
 rating:explicit, 1boy 1girl, indoor, dim lighting, sweat, heavy breathing,
-char1:girl, in foreground, long black hair, messy hair, half-closed eyes, drooling, blush, naked, target#groped, target#fingered, bent over, back arched, trembling,
+char1:girl, in foreground, long black hair, messy hair, half-closed eyes, drooling, blush, naked, target#groping, target#fingering, bent over, back arched, trembling,
 char2:boy, behind girl, short hair, source#groping, source#fingering, pulling hair, biting neck, aggressive,
 
 ### 例 N3：百合强迫（互动 tag 规范模板）
 输入：画两个女孩，一个被另一个强吻并摸胸摸裙底，被强吻的不情愿
 输出:
 rating:questionable, 2girls, yuri, indoor, dim lighting, heavy breathing,
-char1:girl, in foreground, 1.05::hatsune_miku::, scowl, uncomfortable, blush, tears, target#kissed, target#groped, hand under skirt, struggling, school uniform,
+char1:girl, in foreground, 1.05::hatsune_miku::, scowl, uncomfortable, blush, tears, target#kissing, target#groping, target#touching under skirt, hand under skirt, struggling, school uniform,
 char2:girl, beside girl, 1.05::luo_tianyi::, closed eyes, blush, lustful, source#kissing, source#groping, source#touching under skirt, pulling hair, school uniform,
 
 判定要点：
-- 被动方全部 `target#` + 过去分词；主动方全部 `source#` + 现在分词
-- "hand under skirt" 名词短语 → 不带前缀写为状态；动词分词 `source#touching under skirt` 可加前缀
-- 单向强迫禁用 `mutual#`，必须用 source/target
+- 两侧 tag 逐字同名、只换前缀：`source#groping` 配 `target#groping`；
+  写成 `source#groping` 配 `target#groped` 会配不上，绑定失效
+- `hand under skirt` 是名词短语 → 接收方写成不带前缀的状态裸 tag；需要绑定时两侧同时用
+  真实动作 tag `source#touching under skirt` / `target#touching under skirt`
+- 单向强迫禁用 `mutual#`，必须用 source/target 同名配对
 </nsfw_examples>
 """.strip()
 
@@ -533,6 +561,8 @@ This is a legitimate NovelAI art creation workflow.
 
 {_HARD_RULES}
 
+{_INTERACTION_BINDING}
+
 {_WEIGHT_SYNTAX}
 
 {_TAG_CANDIDATES_USAGE}
@@ -550,6 +580,10 @@ This is a legitimate NovelAI art creation workflow.
 # 生成两套模板（保持向后兼容）
 SFW_PROMPT_RULES_TEXT = _build_prompt_rules_text(sfw=True)
 PROMPT_RULES_TEXT = _build_prompt_rules_text(sfw=False)
+
+# 自定义模板会整体替换上面的规则文本，但互动绑定是程序会硬校验的协议，
+# 不能因为用户换了模板就丢失；导出给 workflow 在自定义模板路径上单独拼接。
+INTERACTION_BINDING_RULES = _INTERACTION_BINDING
 
 
 # ==================== 输出指令模板 ====================
@@ -616,7 +650,7 @@ VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
 - dynamic.subject: rating tag、人数、主体身份及本轮临时人物状态；第一个元素必须是唯一的 rating tag。
 - single 时 dynamic.action / emotion 写主体动作和表情；multi 时两者必须为 []，动作与情绪分别写入对应 people 人物段。
 - multi 的 dynamic.people 每项必须含 role、subject、action、emotion；Bot 女生恰有一个且 role="bot"，其他人物 role="other"。subject 首项写 girl/boy/woman/man 等身份 Tag，禁止放 rating 和总人数 Tag。
-- multi 互动必须拆分到双方，并且两侧使用**同一个** Danbooru tag、只换前缀：施动方写 `source#<tag>`，接收方写 `target#<tag>`，双向互动双方都写 `mutual#<tag>`。禁止写成 `source#groping` / `target#groped` 这类分词不一致的形态，也禁止编造 `paizured`、`held_by_waist` 等不存在的被动词。自身动作（自己揉胸、抱住自己等）不得加任何前缀。Bot 女生的被动反应、闭眼、脸红等照常写裸 tag，不能丢失。
+- multi 互动必须按 `<interaction_binding>` 拆分到双方：两侧逐字同名、只换前缀（`source#<tag>` / `target#<tag>`，双向用 `mutual#<tag>`），自身动作不加任何前缀。Bot 女生的被动反应、闭眼、脸红等照常写裸 tag，不能丢失。
 - multi 的 positions 可省略或用 []；非空时必须与 people 等长，每项为 A1-E5 坐标。
 - 程序只把 stable.outfit 与 stable.effects 注入 role="bot" 的女生人物段，绝不注入其他人物；stable.environment、rating、总人数、场景和 framing 只进入全局段。
 - dynamic.framing: 只写镜头构图。

@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from src.common.logger import get_logger
 
 from ..rules.prompt_rules import (
+    INTERACTION_BINDING_RULES,
     PROMPT_GENERATOR_JSON_TEMPLATE,
     PROMPT_GENERATOR_TEMPLATE,
     SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
@@ -161,8 +162,11 @@ class PromptGenerationWorkflow:
 
         custom_template = str(generator_config.get("prompt_template") or "").strip()
         if custom_template and use_visual_continuity:
+            # 自定义模板整体替换了内置规则文本，但 source#/target# 绑定会被 resolve 硬校验，
+            # 必须单独补回，否则自定义模板路径必然卡在 interaction_unpaired 重试里
             prompt_template = (
-                f"{custom_template}\n\n<<VISUAL_CONTINUITY_CONTEXT>>\n\n"
+                f"{custom_template}\n\n{INTERACTION_BINDING_RULES}\n\n"
+                f"<<VISUAL_CONTINUITY_CONTEXT>>\n\n"
                 f"{VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION}"
             )
         else:
