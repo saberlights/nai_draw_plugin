@@ -377,3 +377,48 @@ def test_planner_visual_state_only_carries_runtime_values() -> None:
     planner_text = _planner_facing_text()
     assert "只延续剧情尚未解除的跨图临时效果" in planner_text
     assert "优先换一个合适景别或朝向" in planner_text
+
+
+# ==================== 体积闸门：防止提示词再次无声膨胀 ====================
+
+# 字符数上限 = 当前实测值向上留 6% 余量。用字符数而不是 token 数，是为了不引入
+# tokenizer 依赖，也避免估算公式本身成为测试的隐藏变量。
+# 触发失败时不要直接抬高上限：先确认新增内容是不是某条已有规则的第 N 次复述。
+TEMPLATE_SIZE_CEILINGS = {
+    "text_sfw": 15_180,
+    "text_nsfw": 18_170,
+    "json_sfw": 17_240,
+    "json_nsfw": 20_230,
+    "continuity_sfw": 20_600,
+    "continuity_nsfw": 23_590,
+}
+
+PLANNER_TEXT_CEILING = 9_385
+
+
+def test_templates_stay_within_size_budget() -> None:
+    oversized = {
+        name: (len(ALL_TEMPLATES[name]), ceiling)
+        for name, ceiling in TEMPLATE_SIZE_CEILINGS.items()
+        if len(ALL_TEMPLATES[name]) > ceiling
+    }
+    assert not oversized, (
+        f"提示词模板超出体积预算（实际, 上限）：{oversized}；"
+        "先检查新增内容是否与既有规则块重复，再考虑抬高上限"
+    )
+
+
+def test_planner_resident_text_stays_within_budget() -> None:
+    """Planner 侧每条消息都要付这笔钱，膨胀成本远高于出图路径。"""
+
+    actual = len(_planner_facing_text())
+    assert actual <= PLANNER_TEXT_CEILING, (
+        f"Planner 常驻文本 {actual} 字符已超预算 {PLANNER_TEXT_CEILING}；"
+        "它进入主 bot 的每一次决策，新增前先确认没有和 action_parameters 重复"
+    )
+
+
+def test_size_ceilings_cover_every_template() -> None:
+    """新增路径必须同时进入体积闸门，否则闸门会被绕过。"""
+
+    assert set(TEMPLATE_SIZE_CEILINGS) == set(ALL_TEMPLATES)
