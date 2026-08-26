@@ -331,6 +331,15 @@ def _detect_container(image_bytes: bytes) -> str:
     return f"未知容器(前4字节 {image_bytes[:4].hex()})"
 
 
+def _png_dimensions(image_bytes: bytes) -> str:
+    """从 IHDR 读宽高。判断图是否被重新编码时，像素尺寸比字节数更有指示性。"""
+
+    if len(image_bytes) < 24 or image_bytes[12:16] != b"IHDR":
+        return "尺寸未知"
+    width, height = struct.unpack(">II", image_bytes[16:24])
+    return f"{width}x{height}"
+
+
 def describe_png_metadata(image_bytes: bytes) -> str:
     """报告 PNG 元数据的真实状况，供反推未命中时定位原因。
 
@@ -358,7 +367,13 @@ def describe_png_metadata(image_bytes: bytes) -> str:
         return f"PNG 文本块解析异常: {exc!r}"
 
     if not chunks:
-        return "PNG 没有任何 tEXt/iTXt/zTXt 文本块（元数据已被剥离或平台重新编码过）"
+        # 体积与像素尺寸是判断"图被谁动过"的唯一线索：NAI 原图约 1MB 且尺寸是
+        # 832x1216 这类出图档位，明显偏小就说明中途被重新编码过，
+        # 那种情况下任何解析器都救不回元数据
+        return (
+            "PNG 没有任何 tEXt/iTXt/zTXt 文本块（元数据已被剥离或平台重新编码过）；"
+            f"收到 {len(image_bytes) / 1024:.0f}KB，{_png_dimensions(image_bytes)}"
+        )
 
     # NAI 把模型版本写在 Source chunk（如 "NovelAI Diffusion V4.5 4BDE2A90"），
     # 判断"哪个版本的图反推不出来"必须报出它，否则只能靠猜
