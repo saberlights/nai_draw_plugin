@@ -12,10 +12,25 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 import zlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+
+# NAI 的结构化正向 prompt 容器键：v4_prompt / v4_5_prompt / v5_prompt …
+# 按家族匹配而非硬编码版本号，新版本沿用同一结构时不需要改代码
+_STRUCTURED_PROMPT_KEY_RE = re.compile(r"v\d+(?:_\d+)*_prompt")
+
+# 常见图片容器的魔数，用于把"不是 PNG"和"是 PNG 但没元数据"区分开
+_IMAGE_MAGICS = (
+    (b"\x89PNG\r\n\x1a\n", "PNG"),
+    (b"\xff\xd8\xff", "JPEG"),
+    (b"GIF87a", "GIF"),
+    (b"GIF89a", "GIF"),
+    (b"BM", "BMP"),
+)
 
 
 @dataclass
@@ -102,6 +117,51 @@ def _normalize_prompt(prompt: str) -> str:
     return ", ".join(tags)
 
 
+def _iter_positive_structured_prompts(meta: Dict[str, object]):
+    """产出 NAI V4+ 的结构化正向 prompt 容器。
+
+    V4 起 NAI 不再把完整正向写进顶层 ``prompt``，而是放进 ``v4_prompt.caption``：
+    ``base_caption`` 是全局段，``char_captions[].char_caption`` 是各角色段。
+    多角色图的顶层 ``prompt`` 可能整体为空，只读顶层就会反推不出任何东西。
+
+    键名按 ``v<数字>_prompt`` 家族匹配而不是硬编码 ``v4_prompt``，这样 V5 沿用
+    同一套结构时无需改代码；带 ``negative`` 的键一律跳过，避免把负面串进正向。
+    """
+
+    for key, value in meta.items():
+        lowered = str(key).lower()
+        if "negative" in lowered or "uc" == lowered:
+            continue
+        if not _STRUCTURED_PROMPT_KEY_RE.fullmatch(lowered):
+            continue
+        if isinstance(value, dict):
+            yield value
+
+
+def _extract_structured_captions(meta: Dict[str, object]) -> tuple[str, List[str]]:
+    """从 V4+ 结构里取 (base_caption, [char_caption...])，缺失处返回空。"""
+
+    base_caption = ""
+    char_captions: List[str] = []
+    for container in _iter_positive_structured_prompts(meta):
+        caption = container.get("caption")
+        if not isinstance(caption, dict):
+            continue
+        raw_base = caption.get("base_caption")
+        if isinstance(raw_base, str) and raw_base.strip() and not base_caption:
+            base_caption = raw_base
+        raw_chars = caption.get("char_captions")
+        if not isinstance(raw_chars, list):
+            continue
+        for entry in raw_chars:
+            if not isinstance(entry, dict):
+                continue
+            raw_caption = entry.get("char_caption")
+            if isinstance(raw_caption, str) and raw_caption.strip():
+                char_captions.append(raw_caption)
+    return base_caption, char_captions
+
+
 def _extract_from_nai_comment(comment_value: str) -> Optional[PngMetaResult]:
     """解析 NAI 写入的 Comment 字段。可能是 JSON 也可能是纯文本。"""
     text = (comment_value or "").strip()
@@ -121,14 +181,36 @@ def _extract_from_nai_comment(comment_value: str) -> Optional[PngMetaResult]:
     if not isinstance(meta, dict):
         return None
 
-    raw_prompt = meta.get("prompt") or meta.get("Description") or ""
-    if not isinstance(raw_prompt, str) or not raw_prompt.strip():
+    # V4+ 结构优先：它才带角色段；顶层 prompt 只在结构里没有全局段时兜底
+    base_caption, char_captions = _extract_structured_captions(meta)
+    if not base_caption:
+        legacy = meta.get("prompt") or meta.get("Description") or ""
+        if isinstance(legacy, str):
+            base_caption = legacy
+
+    base_tags = _split_tags(base_caption)
+    char_tag_groups = [_split_tags(caption) for caption in char_captions]
+    char_tag_groups = [group for group in char_tag_groups if group]
+    if not base_tags and not char_tag_groups:
         return None
-    tags = _split_tags(raw_prompt)
-    if not tags:
-        return None
+
+    if char_tag_groups:
+        # 与 _render_from_v2 / extract_multi_character_payload_from_text 同一套
+        # charN: 拍平格式，反推结果可以直接回灌 /nai0 重画
+        lines = [", ".join(base_tags) + ","] if base_tags else []
+        lines.extend(
+            f"char{index}:{', '.join(group)},"
+            for index, group in enumerate(char_tag_groups, start=1)
+        )
+        prompt = "\n".join(lines)
+    else:
+        prompt = ", ".join(base_tags)
+
+    tags = list(base_tags)
+    for group in char_tag_groups:
+        tags.extend(group)
     return PngMetaResult(
-        prompt=", ".join(tags),
+        prompt=prompt,
         tags=tags,
         raw_metadata=meta,
     )
@@ -205,4 +287,68 @@ def extract_prompt_from_png(image_bytes: bytes) -> Optional[PngMetaResult]:
     return None
 
 
-__all__ = ["PngMetaResult", "extract_prompt_from_png"]
+def _detect_container(image_bytes: bytes) -> str:
+    """识别图片容器类型，未知时返回前 4 字节的十六进制。"""
+    for magic, label in _IMAGE_MAGICS:
+        if image_bytes.startswith(magic):
+            return label
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "WebP"
+    return f"未知容器(前4字节 {image_bytes[:4].hex()})"
+
+
+def describe_png_metadata(image_bytes: bytes) -> str:
+    """反推未命中时给出精确原因。
+
+    原先四种完全不同的故障都只表现为 ``extract_prompt_from_png`` 返回 None：
+    根本不是 PNG、是 PNG 但没有文本块、有 Comment 但不是 JSON、有 JSON 但正向
+    字段为空。它们的处理方式完全不同（换出图格式 / 平台重编码剥元数据 / NAI 改了
+    结构），混成一句"无元数据"就没法定位，所以这里逐层报告。
+    """
+
+    if not image_bytes:
+        return "图片数据为空"
+
+    container = _detect_container(image_bytes)
+    if container != "PNG":
+        return (
+            f"不是 PNG 而是 {container}，只有 PNG 带 tEXt 元数据；"
+            "检查 image_format 配置，或图片是否被平台转码"
+        )
+
+    try:
+        chunks = _parse_png_text_chunks(image_bytes)
+    except Exception as exc:  # noqa: BLE001 - 诊断路径，任何解析异常都要如实报告
+        return f"PNG 文本块解析异常: {exc!r}"
+
+    if not chunks:
+        return "PNG 没有任何 tEXt/iTXt/zTXt 文本块（元数据已被剥离或平台重新编码过）"
+
+    keys = "、".join(sorted(chunks))
+    comment = chunks.get("Comment")
+    if comment is None:
+        return f"PNG 有文本块但没有 NAI 的 Comment 字段；现有键：{keys}"
+
+    try:
+        meta = json.loads(comment.strip())
+    except (json.JSONDecodeError, ValueError) as exc:
+        return f"Comment 不是合法 JSON（{exc}）；现有键：{keys}"
+
+    if not isinstance(meta, dict):
+        return f"Comment JSON 顶层不是对象而是 {type(meta).__name__}；现有键：{keys}"
+
+    base_caption, char_captions = _extract_structured_captions(meta)
+    structured_keys = [
+        key for key in meta
+        if _STRUCTURED_PROMPT_KEY_RE.fullmatch(str(key).lower())
+    ]
+    return (
+        "Comment JSON 里没有可用的正向 prompt："
+        f"顶层 prompt={meta.get('prompt')!r}，"
+        f"结构化键={structured_keys or '无'}，"
+        f"base_caption={base_caption!r}，角色段 {len(char_captions)} 个；"
+        f"Comment 顶层字段：{'、'.join(sorted(meta))}"
+    )
+
+
+__all__ = ["PngMetaResult", "describe_png_metadata", "extract_prompt_from_png"]

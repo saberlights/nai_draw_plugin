@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .png_meta import extract_prompt_from_png
+from .png_meta import describe_png_metadata, extract_prompt_from_png
 from .wd14_client import WD14Client, WD14ClientError
 
 
@@ -78,11 +78,24 @@ class ReverseService:
                 tags=list(meta_result.tags),
             )
 
+        # 元数据未命中的具体原因必须留痕：WD14 兜底成功时结果看起来是对的，
+        # 但"NAI 改了元数据结构"和"平台把图重编码了"的处理方式完全不同
+        meta_miss_reason = describe_png_metadata(image_bytes)
+        self._logger.info(f"[nai/反推] PNG 元数据未命中：{meta_miss_reason}")
+
         # ── Level 2: WD14 兜底 ──
         if not self._wd14_enabled:
-            return ReverseResult(source="failed", prompt="", detail="未启用 WD14 兜底")
+            return ReverseResult(
+                source="failed",
+                prompt="",
+                detail=f"未启用 WD14 兜底；PNG 元数据未命中原因：{meta_miss_reason}",
+            )
         if self._wd14_client is None:
-            return ReverseResult(source="failed", prompt="", detail="WD14 客户端未初始化")
+            return ReverseResult(
+                source="failed",
+                prompt="",
+                detail=f"WD14 客户端未初始化；PNG 元数据未命中原因：{meta_miss_reason}",
+            )
 
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
         try:
