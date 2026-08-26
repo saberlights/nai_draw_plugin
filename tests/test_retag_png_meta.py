@@ -360,3 +360,110 @@ def test_describe_reports_nai_model_version_from_source_chunk() -> None:
     )
 
     assert "NovelAI Diffusion V5 1A2B3C4D" in reason
+
+
+# ==================== 容器形状容差 ====================
+# NAI 在版本迭代里换过 prompt 字段的形状。只按"顶层 prompt 是字符串 +
+# v4_prompt.caption 两层嵌套"去解析，换一种形状就整张图反推不出来。
+
+
+def test_prompt_field_itself_may_be_a_caption_container() -> None:
+    """顶层 prompt 可能不是字符串而是 caption 容器对象。"""
+
+    comment = json.dumps(
+        {
+            "prompt": {
+                "caption": {
+                    "base_caption": "rating:general, 1girl, night",
+                    "char_captions": [],
+                }
+            },
+            "uc": "lowres, bad anatomy",
+        }
+    )
+    result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+    assert result is not None
+    assert result.tags == ["rating:general", "1girl", "night"]
+    assert "lowres" not in result.prompt
+
+
+def test_prompt_container_keeps_character_segments() -> None:
+    """prompt 作容器时，角色段同样不能丢。"""
+
+    comment = json.dumps(
+        {
+            "prompt": {
+                "caption": {
+                    "base_caption": "rating:general, 2girls, cafe",
+                    "char_captions": [
+                        {"char_caption": "girl, left, source#hug"},
+                        {"char_caption": "girl, right, target#hug"},
+                    ],
+                }
+            },
+            "uc": "lowres",
+        }
+    )
+    result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+    assert result is not None
+    assert "char1:girl, left, source#hug," in result.prompt
+    assert "char2:girl, right, target#hug," in result.prompt
+
+
+def test_container_without_caption_nesting_is_accepted() -> None:
+    """少一层 caption 嵌套时也要能读到（base_caption 直接挂在容器上）。"""
+
+    comment = json.dumps(
+        {
+            "prompt": "",
+            "v5_prompt": {
+                "base_caption": "rating:general, 1boy, beach",
+                "char_captions": ["boy, standing"],
+            },
+            "uc": "lowres",
+        }
+    )
+    result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+    assert result is not None
+    assert "beach" in result.tags
+    assert "standing" in result.tags
+
+
+def test_char_captions_may_be_plain_strings() -> None:
+    """char_captions 可能是字符串数组而不是对象数组。"""
+
+    comment = json.dumps(
+        {
+            "prompt": "",
+            "v5_prompt": {
+                "caption": {
+                    "base_caption": "rating:general, 2girls",
+                    "char_captions": ["girl, a", "girl, b"],
+                }
+            },
+            "uc": "lowres",
+        }
+    )
+    result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+    assert result is not None
+    assert "char1:girl, a," in result.prompt
+    assert "char2:girl, b," in result.prompt
+
+
+def test_negative_container_is_never_promoted_to_positive() -> None:
+    """放宽容器形状容差后，负面键仍然一条都不许被当正向读。"""
+
+    for negative_key in ("v5_negative_prompt", "negative_prompt", "negativePrompt", "uc"):
+        comment = json.dumps(
+            {
+                "prompt": "",
+                negative_key: {"caption": {"base_caption": "lowres, bad anatomy"}},
+            }
+        )
+        result = extract_prompt_from_png(_make_png_with_text([("Comment", comment)]))
+
+        assert result is None, f"{negative_key} 被当成正向读了"

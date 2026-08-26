@@ -23,6 +23,12 @@ from typing import Dict, List, Optional
 # 按家族匹配而非硬编码版本号，新版本沿用同一结构时不需要改代码
 _STRUCTURED_PROMPT_KEY_RE = re.compile(r"v\d+(?:_\d+)*_prompt")
 
+# 顶层 prompt / Description 也可能直接是 caption 容器而不是字符串
+_CAPTION_CONTAINER_KEYS = frozenset({"prompt", "description", "caption"})
+
+# 负面来源，任何情况下都不得当正向读取
+_NEGATIVE_KEYS = frozenset({"uc", "negative_prompt", "negativeprompt"})
+
 # 常见图片容器的魔数，用于把"不是 PNG"和"是 PNG 但没元数据"区分开
 _IMAGE_MAGICS = (
     (b"\x89PNG\r\n\x1a\n", "PNG"),
@@ -130,35 +136,57 @@ def _iter_positive_structured_prompts(meta: Dict[str, object]):
 
     for key, value in meta.items():
         lowered = str(key).lower()
-        if "negative" in lowered or "uc" == lowered:
+        if "negative" in lowered or lowered in _NEGATIVE_KEYS:
             continue
-        if not _STRUCTURED_PROMPT_KEY_RE.fullmatch(lowered):
+        # 结构化容器既可能挂在 v4_prompt / v5_prompt 这类版本键下，也可能就是
+        # 顶层 prompt / Description 本身——NAI 把 prompt 从字符串换成对象时，
+        # 只按版本键去找就会整张图反推不出来
+        if lowered not in _CAPTION_CONTAINER_KEYS and not _STRUCTURED_PROMPT_KEY_RE.fullmatch(lowered):
             continue
         if isinstance(value, dict):
             yield value
 
 
+def _caption_of(container: Dict[str, object]) -> Dict[str, object]:
+    """取容器里的 caption 子对象；没有嵌套层时容器自身就是 caption。"""
+
+    caption = container.get("caption")
+    if isinstance(caption, dict):
+        return caption
+    return container
+
+
 def _extract_structured_captions(meta: Dict[str, object]) -> tuple[str, List[str]]:
-    """从 V4+ 结构里取 (base_caption, [char_caption...])，缺失处返回空。"""
+    """从 V4+ 结构里取 (base_caption, [char_caption...])，缺失处返回空。
+
+    容器允许两种嵌套深度：``{"caption": {"base_caption": ..., "char_captions": [...]}}``
+    与直接 ``{"base_caption": ..., "char_captions": [...]}``。
+    """
 
     base_caption = ""
     char_captions: List[str] = []
     for container in _iter_positive_structured_prompts(meta):
-        caption = container.get("caption")
-        if not isinstance(caption, dict):
-            continue
-        raw_base = caption.get("base_caption")
-        if isinstance(raw_base, str) and raw_base.strip() and not base_caption:
-            base_caption = raw_base
+        caption = _caption_of(container)
+        if not base_caption:
+            for candidate_key in ("base_caption", "prompt"):
+                raw_base = caption.get(candidate_key)
+                if isinstance(raw_base, str) and raw_base.strip():
+                    base_caption = raw_base
+                    break
         raw_chars = caption.get("char_captions")
         if not isinstance(raw_chars, list):
             continue
         for entry in raw_chars:
+            if isinstance(entry, str) and entry.strip():
+                char_captions.append(entry)
+                continue
             if not isinstance(entry, dict):
                 continue
-            raw_caption = entry.get("char_caption")
-            if isinstance(raw_caption, str) and raw_caption.strip():
-                char_captions.append(raw_caption)
+            for candidate_key in ("char_caption", "caption", "prompt"):
+                raw_caption = entry.get(candidate_key)
+                if isinstance(raw_caption, str) and raw_caption.strip():
+                    char_captions.append(raw_caption)
+                    break
     return base_caption, char_captions
 
 
