@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from plugins.nai_draw_plugin import plugin as plugin_module
 from plugins.nai_draw_plugin.core.rules.prompt_rules import (
     INTERACTION_BINDING_RULES,
     PROMPT_GENERATOR_JSON_TEMPLATE,
@@ -271,3 +272,108 @@ def test_examples_declare_themselves_as_tag_content_not_wire_format() -> None:
         assert "最终输出格式一律以 `<output_instruction>` 为准" in template, (
             f"{name} 的示例没有声明格式归属"
         )
+
+
+# ==================== Planner 侧：合并后规则一条都不能少 ====================
+
+
+def _planner_facing_text() -> str:
+    """还原 Planner 实际看到的工具文本。
+
+    SDK 的 _build_action_detailed_description 把 description、action_parameters
+    和 action_require 折进同一份工具描述，所以「规则写在哪个入参里」不影响
+    Planner 能不能读到；这里按同样的方式拼接三个常量，断言才不会被搬家动作骗过。
+    """
+
+    return "\n\n".join(
+        (
+            plugin_module._NAI_DRAW_DESCRIPTION,
+            "\n".join(plugin_module._NAI_DRAW_ACTION_PARAMETERS.values()),
+            "\n".join(plugin_module._NAI_DRAW_ACTION_REQUIRE),
+        )
+    )
+
+
+# 被删除的 _VISUAL_DIRECTOR_POLICY 里每一条约束，与它现在的落点关键词
+DELETED_VISUAL_DIRECTOR_CLAUSES = {
+    "静态瞬间选择": "定格的静态瞬间",
+    "不压缩整段剧情": "不要把整段剧情压成关键词",
+    "must_show 数量": "2~4 个画面证据",
+    "exclude 不改剧情": "不能用来偷偷改变剧情",
+    "不凭空增加要素": "不要凭空增加人物、动作或道具",
+    "导演笔记不外流": "不得复制到 action、scene_delta 或最终提示词",
+    "moment 禁前因后果": "醒来→看到消息→拍照→发送",
+    "提交前物理自检": "肢体动作是否物理可行",
+    "互斥动作自检": "一只手不能同时完成互斥动作",
+    "关系行三句型": "`A → B：动作`",
+    "禁被字句与代词": "禁止'被'字句，禁止'他/她'代词",
+    "自身动作不写箭头": "自身动作绝不能写成箭头句",
+    "箭头句的绑定后果": "source#/target# 角色绑定",
+    "字段路由-服装": "scene_delta=仅稳定服装和固定环境",
+    "字段路由-动态场景": "dynamic_scene=临时物件/倒影/天气/时间/光线",
+    "同地点光线不换环境": "同一物理地点的昼夜、天气和光线变化不是换环境",
+    "framing 只填一个": "【只填一个景别或构图】",
+    "视角只进 subject_and_pov": "framing 不得包含 POV/第三视角",
+    "看不见不等于解除": "镜头看不见不等于事实解除",
+    "脱衣必须 replace": "脱下一件或多件衣物也必须 outfit_change=replace",
+    "脱衣后仍穿集合": "写当前仍穿着的完整集合",
+    "全脱才 clear": "全部衣物都已脱下时才 clear",
+    "脱下衣物归场景": "写入场景附着物",
+    "掀起不算脱下": "只是掀起、拉开或局部移位则 outfit unchanged",
+    "emotion 可留空": "emotion 留空",
+    "不可见心理不出表情": "不要把'宠溺/幸福/起床气'直接变成 smile、blush",
+    "拍摄者判定": "自拍/POV 判定看拍摄者",
+    "性行为用原名": "乳交就写乳交、口交就写口交、足交就写足交",
+    "不新增性行为": "不得自行升级或增加新的性行为",
+    "睡醒效果归 effect": "刚睡醒造成的蓬松乱发",
+    "身份匿名化": "先执行会话身份匿名化",
+}
+
+
+def test_deleted_visual_director_policy_lost_no_constraint() -> None:
+    """删掉重复注入的协议块，但它的每一条约束都必须仍在 Planner 可读文本里。"""
+
+    planner_text = _planner_facing_text()
+    missing = [
+        label
+        for label, marker in DELETED_VISUAL_DIRECTOR_CLAUSES.items()
+        if marker not in planner_text
+    ]
+    assert not missing, f"合并 _VISUAL_DIRECTOR_POLICY 时丢失了约束：{missing}"
+
+
+def test_visual_director_policy_is_not_reinjected() -> None:
+    """协议块与 action_require 落在同一段文本，重复注入只会互相稀释。"""
+
+    assert not hasattr(plugin_module, "_VISUAL_DIRECTOR_POLICY")
+    assert "单帧视觉导演协议" not in _planner_facing_text()
+
+
+def test_identity_rule_appears_once_in_planner_text() -> None:
+    """身份匿名化规则曾在 description 和 action_require 各写一份完整副本。"""
+
+    planner_text = _planner_facing_text()
+    rule = plugin_module._CHAT_PARTICIPANT_IDENTITY_RULE
+    assert planner_text.count(rule) == 1, "身份匿名化规则被重复注入"
+    # 星号条目仍要把它顶到高注意力区，只是改为指针而非整段复制
+    assert "填写任何 action_data 字段前，先执行本工具描述开头的会话身份匿名化规则" in planner_text
+
+
+def test_planner_visual_state_only_carries_runtime_values() -> None:
+    """状态块只发本轮才知道的值；判定规则由 action_require 常驻，不再复述。"""
+
+    class _Stable:
+        effects = ("wet hair",)
+        scene_effects = ("coat on chair",)
+        last_framing = ("medium shot",)
+
+    rendered = plugin_module._build_planner_visual_state(_Stable())
+    assert "wet hair" in rendered
+    assert "coat on chair" in rendered
+    assert "medium shot" in rendered
+    assert "effect_change" not in rendered, "状态块又开始复述 effect_change 判定规则"
+    assert "must_show" not in rendered, "状态块又开始复述镜头柔性变化规则"
+    # 规则本体仍必须在 Planner 常驻文本里
+    planner_text = _planner_facing_text()
+    assert "只延续剧情尚未解除的跨图临时效果" in planner_text
+    assert "优先换一个合适景别或朝向" in planner_text

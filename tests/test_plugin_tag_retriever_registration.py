@@ -1019,21 +1019,8 @@ def test_private_planner_does_not_receive_group_draw_policy(
     updated_definitions = result["modified_kwargs"]["tool_definitions"]
     assert len(updated_definitions) == 1
     description = updated_definitions[0]["function"]["description"]
-    assert "单帧视觉导演协议" in description
-    assert "action 必须写成关系行" in description
-    assert "`A → B：动作`（有向互动）" in description
-    assert "禁止'被'字句和'他/她'代词" in description
-    assert "自身动作只能用 `A：动作`" in description
-    assert "同一物理地点仅发生昼夜、天气或光线变化" in description
-    assert "framing 只能填一个景别或构图" in description
-    assert "刚睡醒造成的蓬松乱发" in description
-    assert "特写看不见睡衣时 outfit_change 仍为 unchanged" in description
-    assert "emotion 可以留空" in description
-    assert "自拍表示女生本人持手机/相机" in description
-    assert "乳交就写乳交、口交就写口交、足交就写足交" in description
-    assert "脱下一件或多件衣物也必须 outfit_change=replace" in description
-    assert "当前仍穿着的完整集合" in description
-    assert "全部衣物都已脱下时才 clear" in description
+    # 单帧视觉导演规则已合并进 action_require（SDK 折入工具详细描述，见
+    # test_prompt_contract.py 的 Planner 侧断言），这个钩子只负责按会话类型追加策略
     assert "群聊专属出图规则" not in description
 
 
@@ -1290,19 +1277,9 @@ def test_planner_draw_switch_off_rejects_direct_action_before_creating_invocatio
 
 
 def _nai_web_draw_action_parameters() -> dict[str, str]:
-    """从源码里取 action_parameters 字面量，避开 SDK 装饰器的运行期依赖。"""
+    """直接读模块常量；提成常量后不再需要从源码里 eval 字面量。"""
 
-    source = (Path(__file__).resolve().parents[1] / "plugin.py").read_text(encoding="utf-8")
-    start = source.index("{", source.index("action_parameters={"))
-    depth = 0
-    for index in range(start, len(source)):
-        if source[index] == "{":
-            depth += 1
-        elif source[index] == "}":
-            depth -= 1
-            if depth == 0:
-                return eval(source[start:index + 1])  # noqa: S307 - 纯字面量
-    raise AssertionError("未找到 action_parameters 字面量")
+    return plugin_module._NAI_DRAW_ACTION_PARAMETERS
 
 
 def test_action_field_demands_relation_lines_instead_of_prose() -> None:
