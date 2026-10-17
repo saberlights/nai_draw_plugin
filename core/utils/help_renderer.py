@@ -134,6 +134,8 @@ HELP_DOC: HelpDoc = HelpDoc(
             accent2="#3bd17f",
             items=(
                 ("/nai set [代号]", "查看 / 切换模型"),
+                ("/nai chami", "切换 Chami / NewAPI 生图后端"),
+                ("/nai 签到", "手动执行 Chami 网页每日签到（仅管理员）"),
                 ("/nai size [代号]", "查看 / 切换尺寸：竖/v、横/h、方/s"),
                 ("/nai art [编号]", "查看 / 切换当前模型的画师风格预设"),
                 ("/nai models", "拉取 NewAPI 网关实时可用模型"),
@@ -153,10 +155,13 @@ HELP_DOC: HelpDoc = HelpDoc(
                 ("/nai on", "开启图片自动撤回（仅管理员）"),
                 ("/nai off", "关闭图片自动撤回（仅管理员）"),
                 ("/nai 撤回", "撤回最近一张本插件发送的图片"),
-                ("/nai 反推", "把引用图反推成 Danbooru tag"),
+                ("/nai 反推", "把引用图反推成 prompt（走当前路径）"),
+                ("/nai 反推路径 [值]", "查看 / 切换反推路径：auto、meta、wd14、llm"),
             ),
             hint=(
-                "反推：PNG 原图秒级精确还原；非原图走 WD14 在线 Space 兜底（30~120s 仅正向）。"
+                "反推四条路径：auto=元数据命中即秒回、否则 WD14 兜底；meta=只读元数据不联网；"
+                "wd14=在线 Space 出 Danbooru tag（30~120s）；llm=视觉模型出英文自然语言描述（适配 V5）。"
+                "路径切换会话级粘性，也可 /nai 反推 <路径> 只对本次生效。"
             ),
         ),
         HelpSection(

@@ -2,6 +2,9 @@ import asyncio
 import base64
 import json
 import re
+import secrets
+import io
+import zipfile
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlsplit
 
@@ -46,6 +49,8 @@ _ALLOWED_NOISE_SCHEDULES: frozenset = frozenset(NOISE_SCHEDULES)
 
 # NewAPI 绘图请求只能走 OpenAI 兼容的 chat/completions 端点（文档 §3）
 _NAI_CHAT_ENDPOINT: str = "/v1/chat/completions"
+_CHAMI_IMAGE_ENDPOINT: str = "http://chami.yyqzx.com/image/chami"
+_CHAMI_WEB_BASE_URL: str = "http://chami.yyqzx.com"
 
 # 网关临时故障的可重试状态码（§15）
 _RETRYABLE_STATUS_CODES: frozenset = frozenset({429, 500, 502, 503, 504})
@@ -65,6 +70,10 @@ _SEEDS_COMMENT_PATTERN = re.compile(r"<!--\s*seeds:\s*(\[[^\]]*])\s*-->")
 # <!-- vibe_cache_ids:[{"index":0,"cache_id":"AbCdEf..."},...] -->
 _VIBE_CACHE_COMMENT_PATTERN = re.compile(r"<!--\s*vibe_cache_ids:\s*(\[.*?])\s*-->")
 
+# 在解析 JSON/Base64 前限制响应，避免低内存宿主同时保留多份大对象。
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+_MAX_IMAGE_BYTES = 12 * 1024 * 1024
+
 # NewAPI 模型列表端点（文档 §2）
 _NAI_MODELS_ENDPOINT: str = "/v1/models"
 
@@ -77,7 +86,8 @@ class NaiWebClient:
     ``![image_0](data:image/png;base64,...)`` 形式回传。
     """
 
-    _DEFAULT_REQUEST_TIMEOUT = 600.0
+    _DEFAULT_REQUEST_TIMEOUT = 180.0
+    _MAX_REQUEST_TIMEOUT = 180.0
     _DEFAULT_MAX_TOKENS = 100000
     _MAX_RESPONSE_RETRY_ATTEMPTS = 2
     _MAX_TRANSPORT_RETRY_ATTEMPTS = 3
@@ -149,7 +159,7 @@ class NaiWebClient:
             return cls._DEFAULT_REQUEST_TIMEOUT
         if timeout <= 0:
             return cls._DEFAULT_REQUEST_TIMEOUT
-        return timeout
+        return min(timeout, cls._MAX_REQUEST_TIMEOUT)
 
     @classmethod
     def _resolve_max_tokens(cls, model_config: Dict[str, Any]) -> int:
@@ -876,6 +886,164 @@ class NaiWebClient:
         }
 
     @staticmethod
+    def _resolve_chami_model(model_name: str) -> str:
+        """Chami 复用当前 NewAPI 配置中的模型名，不做猜测映射。"""
+        return str(model_name or "").strip()
+
+    @staticmethod
+    def _resolve_chami_sampler(raw_sampler: Any) -> str:
+        """Chami 复用当前 NewAPI 配置中的采样器名称。"""
+        return str(raw_sampler or "").strip()
+
+    @classmethod
+    def _build_chami_request_body(
+        cls,
+        prompt: str,
+        model_name: str,
+        inner: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """把共用的内部参数转换为 Chami 的 NovelAI 原生请求体。"""
+        width, height = inner["size"]
+        seed = inner.get("seed")
+        if not isinstance(seed, int) or seed < 0:
+            seed = secrets.randbelow(2**32)
+        noise_schedule = inner.get("noise_schedule") or "native"
+        if ("diffusion-4" in model_name or "diffusion-5" in model_name) and noise_schedule == "native":
+            noise_schedule = "karras"
+        parameters: Dict[str, Any] = {
+            "params_version": 3,
+            "width": width,
+            "height": height,
+            "scale": inner["scale"],
+            "sampler": cls._resolve_chami_sampler(inner.get("sampler")),
+            "steps": inner["steps"],
+            "n_samples": inner.get("n_samples", 1),
+            "ucPreset": 2,
+            "qualityToggle": bool(inner.get("qualityToggle", True)),
+            "autoSmea": False,
+            "dynamic_thresholding": False,
+            "controlnet_strength": 1,
+            "legacy": False,
+            "add_original_image": True,
+            "cfg_rescale": inner.get("cfg_rescale", 0.18),
+            "noise_schedule": noise_schedule,
+            "seed": seed,
+            "negative_prompt": inner.get("negative_prompt", ""),
+            "extra_noise_seed": secrets.randbelow(2**32),
+            "deliberate_euler_ancestral_bug": False,
+            "prefer_brownian": True,
+            "normalize_reference_strength_multiple": True,
+            "inpaintImg2ImgStrength": 1.0,
+            "use_coords": bool(inner.get("use_coords", True)),
+        }
+        if "diffusion-5" not in model_name and "diffusion-4" not in model_name:
+            parameters["sm"] = bool(inner.get("sm", False))
+            parameters["sm_dyn"] = bool(inner.get("sm_dyn", False))
+            parameters["uc"] = inner.get("negative_prompt", "")
+        if "diffusion-4" in model_name or "diffusion-5" in model_name:
+            parameters["legacy_v3_extend"] = False
+            parameters["legacy_uc"] = False
+            parameters["v4_prompt"] = {
+                "caption": {"base_caption": prompt, "char_captions": []},
+                "use_coords": bool(inner.get("use_coords", True)),
+                "use_order": True,
+            }
+            parameters["v4_negative_prompt"] = {
+                "caption": {
+                    "base_caption": inner.get("negative_prompt", ""),
+                    "char_captions": [],
+                },
+                "legacy_uc": False,
+            }
+        reference_images: List[str] = []
+        i2i_payload = inner.get("i2i")
+        if isinstance(i2i_payload, dict) and i2i_payload.get("image"):
+            reference_images.append(str(i2i_payload["image"]))
+        for item in inner.get("character_references") or []:
+            if isinstance(item, dict) and item.get("image"):
+                reference_images.append(str(item["image"]))
+        if reference_images:
+            parameters["reference_image_multiple"] = reference_images[:3]
+        if inner.get("variety_boost"):
+            parameters["skip_cfg_above_sigma"] = 58
+        return {
+            "input": prompt,
+            "model": cls._resolve_chami_model(model_name),
+            "action": "generate",
+            "parameters": parameters,
+            "use_new_shared_trial": True,
+        }
+
+    async def chami_sign_in(
+        self,
+        username: str,
+        password: str,
+        *,
+        proxy_mode: str = "auto",
+        request_timeout: float = 30.0,
+    ) -> Tuple[bool, str]:
+        """使用独立网页会话登录 Chami 并执行一次每日签到。"""
+        if not str(username or "").strip() or not str(password or ""):
+            return False, "Chami 网页账号或密码未配置"
+        try:
+            result = await self._run_blocking(
+                self._perform_chami_sign_in,
+                str(username).strip(),
+                str(password),
+                proxy_mode,
+                request_timeout,
+                cancel_result=None,
+            )
+            return result
+        except requests.RequestException as exc:
+            return False, f"Chami 网页请求失败: {exc}"
+
+    @staticmethod
+    def _perform_chami_sign_in(
+        username: str,
+        password: str,
+        proxy_mode: str,
+        request_timeout: float,
+    ) -> Tuple[bool, str]:
+        trust_env = proxy_mode == "inherit"
+        session = requests.Session()
+        session.trust_env = trust_env
+        try:
+            login_response = session.post(
+                f"{_CHAMI_WEB_BASE_URL}/login",
+                data={
+                    "username_or_email": username,
+                    "password": password,
+                    "real_ip": "",
+                },
+                headers={"Accept": "text/html"},
+                timeout=request_timeout,
+                allow_redirects=True,
+            )
+            if login_response.url.rstrip("/") != f"{_CHAMI_WEB_BASE_URL}/dashboard":
+                return False, "Chami 网页登录失败，请检查用户名或密码"
+
+            sign_response = session.post(
+                f"{_CHAMI_WEB_BASE_URL}/sign_in",
+                data={},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=request_timeout,
+                allow_redirects=False,
+            )
+            try:
+                payload = sign_response.json()
+            except ValueError:
+                payload = {}
+            message = payload.get("message") if isinstance(payload, dict) else None
+            if sign_response.status_code != 200:
+                return False, str(message or f"HTTP {sign_response.status_code}")
+            if not isinstance(payload, dict) or payload.get("status") != "success":
+                return False, str(message or "签到失败，Chami 返回了未知响应")
+            return True, str(message or "签到成功")
+        finally:
+            session.close()
+
+    @staticmethod
     def _build_request_headers(api_key: str) -> Dict[str, str]:
         headers = {
             "Accept": "application/json",
@@ -897,6 +1065,38 @@ class NaiWebClient:
                 token = token.split(" ", 1)[1].strip()
             headers["Authorization"] = f"Bearer {token}"
         return headers
+
+    @staticmethod
+    def _build_chami_request_headers(api_key: str) -> Dict[str, str]:
+        headers = {
+            "Accept": "application/x-zip-compressed",
+            "Content-Type": "application/json",
+        }
+        token = (api_key or "").strip()
+        if token:
+            if token.lower().startswith("bearer "):
+                token = token.split(" ", 1)[1].strip()
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _parse_chami_response(self, response: requests.Response) -> Tuple[bool, str]:
+        if response.status_code != 200:
+            return False, self._extract_error_message(response)
+        image_bytes = response.content
+        if image_bytes.startswith(b"PK\x03\x04"):
+            with zipfile.ZipFile(io.BytesIO(image_bytes)) as archive:
+                image_names = [
+                    name for name in archive.namelist()
+                    if name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                ]
+                if not image_names:
+                    return False, "Chami ZIP 响应中没有图片"
+                image_bytes = archive.read(image_names[0])
+        if not image_bytes:
+            return False, "Chami 返回空图片"
+        if len(image_bytes) > _MAX_IMAGE_BYTES:
+            return False, "Chami 返回图片过大，已拒绝处理"
+        return True, base64.b64encode(image_bytes).decode("ascii")
 
     @staticmethod
     def _same_origin(first_url: str, second_url: str) -> bool:
@@ -1108,14 +1308,19 @@ class NaiWebClient:
         """
         # 重置上次响应抽出的 vibe cache 注释，避免上次的状态污染本次落库
         self._last_response_vibe_cache_ids = []
+        request_id = secrets.token_hex(6)
+        logger.info("%s 生图任务开始: request_id=%s stage=prepare", self.log_prefix, request_id)
 
         try:
+            backend = str(model_config.get("backend") or "newapi").strip().lower()
+            if backend not in {"newapi", "chami"}:
+                return False, f"不支持的生图后端: {backend}"
+
             base_url = str(model_config.get("base_url") or "").rstrip("/")
-            if not base_url:
+            if not base_url and backend == "newapi":
                 return False, "base_url 未配置"
 
-            # NewAPI 文档 §3 强制 chat/completions 端点，不再读 nai_endpoint 配置
-            url = f"{base_url}{_NAI_CHAT_ENDPOINT}"
+            url = _CHAMI_IMAGE_ENDPOINT if backend == "chami" else f"{base_url}{_NAI_CHAT_ENDPOINT}"
 
             model_name = self._resolve_model_name(model_config)
             # 模型不支持 characters[] 时把角色段拍平回 prompt，绝不丢角色信息
@@ -1149,9 +1354,13 @@ class NaiWebClient:
                 logger.error(f"{self.log_prefix} (NewAPI) 请求被前置校验拒绝: {reject_reason}")
                 return False, reject_reason
 
-            max_tokens = self._resolve_max_tokens(model_config)
-            body = self._build_request_body(model_name, inner_params, max_tokens)
-            headers = self._build_request_headers(model_config.get("api_key") or "")
+            if backend == "chami":
+                body = self._build_chami_request_body(inner_params["prompt"], model_name, inner_params)
+                headers = self._build_chami_request_headers(model_config.get("chami_api_key") or "")
+            else:
+                max_tokens = self._resolve_max_tokens(model_config)
+                body = self._build_request_body(model_name, inner_params, max_tokens)
+                headers = self._build_request_headers(model_config.get("api_key") or "")
             proxy_mode = self._resolve_proxy_mode(model_config)
             request_timeout = self._resolve_request_timeout(model_config)
 
@@ -1165,8 +1374,9 @@ class NaiWebClient:
             if "character_references" in inner_params:
                 extra_modes.append(f"char_ref({len(inner_params['character_references'])})")
             modes_text = ",".join(extra_modes) if extra_modes else "-"
+            max_tokens = self._resolve_max_tokens(model_config) if backend == "newapi" else 0
             logger.info(
-                f"{self.log_prefix} (NewAPI) 请求URL: {url}, model={model_name}, "
+                f"{self.log_prefix} ({backend}) 请求URL: {url}, model={model_name}, "
                 f"size={size_value}, steps={inner_params['steps']}, "
                 f"scale={inner_params['scale']}, sampler={inner_params['sampler']}, "
                 f"seed={inner_params.get('seed')}, characters={character_count}, "
@@ -1186,8 +1396,33 @@ class NaiWebClient:
                 request_timeout=request_timeout,
             )
             try:
-                success, result = self._parse_response(response)
+                response_size = len(getattr(response, "content", b"") or b"")
+                logger.info(
+                    "%s 生图任务阶段: request_id=%s stage=response_received bytes=%d",
+                    self.log_prefix,
+                    request_id,
+                    response_size,
+                )
+                if response_size > _MAX_RESPONSE_BYTES:
+                    logger.error(
+                        "%s 生图响应超过插件上限: request_id=%s bytes=%d limit=%d",
+                        self.log_prefix,
+                        request_id,
+                        response_size,
+                        _MAX_RESPONSE_BYTES,
+                    )
+                    return False, "生图响应过大，已拒绝解析"
+                success, result = (
+                    self._parse_chami_response(response)
+                    if backend == "chami"
+                    else self._parse_response(response)
+                )
                 if success:
+                    logger.info(
+                        "%s 生图任务完成: request_id=%s stage=parsed",
+                        self.log_prefix,
+                        request_id,
+                    )
                     if vibe_persist_plan:
                         self._persist_vibe_cache(model_name, vibe_persist_plan)
                     return success, result
@@ -1207,10 +1442,10 @@ class NaiWebClient:
                 response.close()
 
         except requests.RequestException as exc:
-            logger.error(f"{self.log_prefix} (NewAPI) 网络异常: {exc}")
+            logger.error("%s 生图任务失败: request_id=%s stage=http error=%r", self.log_prefix, request_id, exc)
             return False, self._format_request_exception(exc)
         except Exception as exc:
-            logger.error(f"{self.log_prefix} (NewAPI) 请求异常: {exc!r}", exc_info=True)
+            logger.error("%s 生图任务失败: request_id=%s stage=unknown error=%r", self.log_prefix, request_id, exc, exc_info=True)
             return False, f"NewAPI 请求失败: {str(exc)[:160]}"
 
     # ========== 模型列表（文档 §2） ==========
@@ -1542,6 +1777,8 @@ class NaiWebClient:
             image_base64 = matches[0].group("data")
             try:
                 image_bytes = base64.b64decode(image_base64, validate=False)
+                if len(image_bytes) > _MAX_IMAGE_BYTES:
+                    return False, "NewAPI 返回图片过大，已拒绝处理"
                 logger.info(
                     f"{self.log_prefix} (NewAPI) 图片生成成功，大小 {len(image_bytes)} bytes"
                 )

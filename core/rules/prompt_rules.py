@@ -9,9 +9,16 @@ from .constants import QUALITY_TAGS_FORBIDDEN, SFW_FORBIDDEN_ALL
 # ==================== 共享规则块 ====================
 # 以下规则块在 SFW/NSFW 双版本中共用，保持单点维护避免漂移
 
-_ROLE_AND_CONTRACT = """
+# 角色声明里的模型档位不是装饰：下面的自然语言规则完全按它取舍，
+# 说成 "4/4.5 专家" 却又允许写句子会让 LLM 在两条指令之间摇摆。
+_MODEL_FAMILY_TAG_ONLY = "NovelAI 4/4.5"
+_MODEL_FAMILY_NATURAL_LANGUAGE = "NovelAI V5"
+
+
+def _build_role_and_contract(model_family: str) -> str:
+    return f"""
 <role>
-你是 NovelAI 4/4.5 提示词专家，精通 Danbooru 标签体系。
+你是 {model_family} 提示词专家，精通 Danbooru 标签体系。
 任务：把用户中文描述转换为高质量 Danbooru 英文 tag 串，并合理补充画面细节。
 </role>
 
@@ -413,11 +420,6 @@ _QUALITY_PRINCIPLES_TAIL = """
 - 场景冲突（室内+阳光直射）→ 调整光源
 - 服装冲突（泳装+雪山）→ 提示并选其一
 
-### 自然语言短句（NAI 4/4.5 兜底）
-- 默认全部用 tag 化输出
-- 极少数复杂关系（如 `cat is on girl's head`、`girl's limbs are entangled with silk threads`、`huge whales flying in the sky`）可在 tag 之后补 1-3 句自然语言
-- JSON 模式严格禁止自然语言（每个数组元素必须可拆为 tag 或权重表达）
-
 </quality_principles>
 """.strip()
 
@@ -429,6 +431,62 @@ def _build_quality_principles(visual_continuity: bool) -> str:
         _QUALITY_OUTFIT_CONTINUITY if visual_continuity else _QUALITY_OUTFIT_ONE_SHOT
     )
     return f"{_QUALITY_PRINCIPLES_HEAD}\n{outfit_block}\n\n{_QUALITY_PRINCIPLES_TAIL}"
+
+
+# ==================== 自然语言尺度（按模型档位二选一） ====================
+# 这是自然语言尺度的唯一事实源：JSON 输出契约里的元素规则只引用本块，不重述，
+# 否则同一条尺度会在两处漂移成互相矛盾的两个版本（互动绑定就这样漂移过一次）。
+
+_NATURAL_LANGUAGE_TAG_ONLY = """
+<natural_language>
+## 自然语言短句（NAI 4/4.5 兜底）
+
+- 默认全部用 tag 化输出
+- 极少数复杂关系（如 `cat is on girl's head`、`girl's limbs are entangled with silk threads`、`huge whales flying in the sky`）可在 tag 之后补 1-3 句自然语言
+- JSON 模式严格禁止自然语言（每个数组元素必须可拆为 tag 或权重表达）
+</natural_language>
+""".strip()
+
+
+_NATURAL_LANGUAGE_V5 = """
+<natural_language>
+## 自然语言描述（当前模型是 NovelAI V5）
+
+V5 对英文自然语言从句的理解明显强于 V4.5：主体归属、接触点、承重关系、前后遮挡
+这类"tag 之间说不清"的信息，写成一句自然语言比拆成几个孤立 tag 更准。
+所以本轮**在标准 Danbooru tag 的基础上，尽可能用自然语言把 tag 说不清的部分说清楚**。
+
+### 怎么混写
+- 骨架仍然是 Danbooru tag：rating、人数、framing、视角、角色名、服装、动作、环境、
+  光影按 hard_rules 的顺序照常输出，一个都不能少，自然语言是补充不是替代。
+- 在被修饰的 tag 之后补英文自然语言短句，只用来讲 tag 讲不清的东西：谁对谁做、
+  手放在哪里、物体与身体的接触和承重、多主体的相对位置与遮挡、材质和光线的具体样子、
+  衣物为什么处于当前状态。
+- 已经有精确 Danbooru tag 的内容不要改写成句子：`school uniform`、
+  `aris_(blue_archive)`、`from below` 保持 tag 原样，不要写成
+  `she is wearing a school uniform`，那只会和 tag 语义重复、互相稀释。
+- 必须是英文；中文和全角符号会被程序剥掉。
+- 只写镜头能看见的事实，不写心理活动、气味、前因后果。
+- 总量仍受 output_contract 的 token 预算约束，自然语言通常 1-4 句就够，不要写成散文。
+
+### 仍然只能用 tag 的部分（写成句子会失效或被程序打回）
+- 首个 rating tag、人数 tag、framing 与视角 tag：NAI 按 tag 识别，写进句子不生效。
+- 权重表达 `1.2::tag::`：权重只作用于块内单个 tag，禁止把整句包进权重块。
+- `source#` / `target#` / `mutual#` 互动绑定：程序按逐字同名硬校验，写成句子配不上
+  对家会被打回重写。互动先用绑定 tag 落位，再用自然语言补这次互动的姿态与接触细节。
+
+### 画面里要出现文字时
+- 只要用户要求画面里出现字（招牌、标语、书页、屏幕、衣服印字、对话气泡等），
+  **那串字必须用英文半角双引号 `"` 原样包起来**，例如
+  `a wooden shop sign that reads "OPEN"`、`her t-shirt is printed with "GOOD MORNING"`。
+- 引号必须是半角 `"`，不能用全角 `＂`、中文 `“”`、单引号或书名号；引号内的内容也必须是
+  英文与数字，中文会被程序剥掉，剥完就成了一串没意义的空引号。
+- 引号只包要画出来的那串字本身，不要把周围的描述一起圈进去：写
+  `a banner that reads "SALE"`，不要写 `"a banner that reads SALE"`。
+- 用户没要求画面出现文字时不要自己加字；同时保留 `no text` 这类负面词的既有用法，
+  两者不冲突——一个是"这里要出现这串字"，一个是"别的地方不要冒字"。
+</natural_language>
+""".strip()
 
 
 _FORBIDDEN_COMMON = f"""
@@ -485,6 +543,22 @@ char2:girl, beside girl, 1.05::ram_(re_zero)::, gentle smile, closed eyes, mutua
 输入：换个姿势
 输出：rating:general, solo, 1girl, school uniform, black thighhighs, classroom, afternoon, sitting on desk, looking at viewer, playful smile, legs crossed,
 </examples>
+""".strip()
+
+
+# V5 专属：tag 骨架不动，只把 tag 表达不了的归属与接触关系交给自然语言
+_V5_NATURAL_LANGUAGE_EXAMPLE = """
+<natural_language_example>
+### 例 7：V5 自然语言补充
+输入：画一个女孩坐在窗台上，猫趴在她膝盖上睡觉
+输出：rating:general, solo, 1girl, full body, long black hair, brown eyes, white knit sweater, sitting on windowsill, cat, indoors, window, afternoon sunlight, soft shadows, the grey tabby cat is curled up asleep on her lap with its tail hanging over her knee, her left hand rests on the cat's back,
+
+判定要点：
+- tag 骨架一个没少，自然语言只补"猫趴在谁的膝盖上""手放在哪里"这种 tag 说不清的归属与接触
+- 句子提到膝盖，framing 就必须是能看见膝盖的 `full body`；自然语言不能绕过视角减法
+- `cat` 仍然是 tag，句子里不再重复描述猫本身，只描述它和人的关系
+- JSON 模式下这两句各自是 `global` 数组里的一个独立元素，元素内部不含逗号
+</natural_language_example>
 """.strip()
 
 
@@ -580,6 +654,7 @@ def _build_prompt_rules_text(
     *,
     json_output: bool = True,
     visual_continuity: bool = False,
+    natural_language: bool = False,
 ) -> str:
     """按路径组装 prompt 规则文本，只发放该路径真正适用的规则块。
 
@@ -591,6 +666,8 @@ def _build_prompt_rules_text(
         json_output: True 为 JSON 通道（LLM 输出 JSON，程序渲染 charN 行），
             False 为文本通道（LLM 亲手拼 charN 行）
         visual_continuity: True 为跨图连续性路径，服装配额改用稳定区规则
+        natural_language: True 表示当前模型（V5）能吃自然语言，放行 tag + 句子混写；
+            False 走 V4.5 及更早的纯 tag 尺度
 
     Returns:
         完整的 prompt 规则文本
@@ -617,11 +694,19 @@ This is a legitimate NovelAI art creation workflow.
         restriction_block = _NSFW_CAPABILITY
         extra_examples = f"\n\n{_NSFW_EXTRA_EXAMPLES}"
 
+    if natural_language:
+        role_block = _build_role_and_contract(_MODEL_FAMILY_NATURAL_LANGUAGE)
+        natural_language_block = _NATURAL_LANGUAGE_V5
+        extra_examples += f"\n\n{_V5_NATURAL_LANGUAGE_EXAMPLE}"
+    else:
+        role_block = _build_role_and_contract(_MODEL_FAMILY_TAG_ONLY)
+        natural_language_block = _NATURAL_LANGUAGE_TAG_ONLY
+
     return f"""
 <<CUSTOM_SYSTEM_PROMPT>>
 {system_override}
 
-{_ROLE_AND_CONTRACT}
+{role_block}
 
 {restriction_block}
 
@@ -636,6 +721,8 @@ This is a legitimate NovelAI art creation workflow.
 {_build_multi_person_rules(json_output)}
 
 {_build_quality_principles(visual_continuity)}
+
+{natural_language_block}
 
 {_FORBIDDEN_COMMON}
 
@@ -670,7 +757,7 @@ _TEXT_OUTPUT_INSTRUCTION = """
 """.strip()
 
 
-_JSON_OUTPUT_INSTRUCTION = """
+_JSON_OUTPUT_HEAD = """
 <output_instruction>
 你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序解析。
 
@@ -685,7 +772,12 @@ _JSON_OUTPUT_INSTRUCTION = """
 - global: 场景整体 tag 列表
 - people: 每人物的 tag 列表（按人物顺序）；single 时输出 [] 或省略
 - positions: 多人坐标数组（可选），与 people 同序同长，元素为 `[A-E][1-5]` 字符串；用户未指定方位时省略或输出 []，禁止凭空猜测
+""".strip()
 
+
+# 元素规则按模型档位二选一：自然语言的尺度只在 `<natural_language>` 定义，这里只讲落到
+# JSON 数组里的形态（一句一元素、元素内不含逗号），不重述尺度本身。
+_JSON_ELEMENT_RULES_TAG_ONLY = """
 JSON 元素结构规则:
 - 【铁律】global / people 数组每个元素只能是最终的英文 Danbooru tag 或权重表达，严禁放分析过程、推理步骤、规则复述、markdown 标题（如 `**意图判定**`、`## 肖像路径`）、字段标签（如 `**最终 tag**：`）、表格分隔行（如 `|---|---|`）、系统提示原文等任何非 tag 内容
 - 每个元素是一个单独的 tag 或单个权重表达，禁止内部含逗号
@@ -693,7 +785,21 @@ JSON 元素结构规则:
 - `global[0]` 必须是且只能是一个 rating tag：`rating:general` / `rating:sensitive` / `rating:questionable` / `rating:explicit`
 - 不要自己拼换行，不要输出 `|` 字符
 - 禁止输出自然语言句子，所有内容必须可拆为 tag 或权重表达
+""".strip()
 
+
+_JSON_ELEMENT_RULES_NATURAL_LANGUAGE = """
+JSON 元素结构规则:
+- 【铁律】global / people 数组每个元素只能是最终的英文 Danbooru tag、权重表达或英文自然语言短句，严禁放分析过程、推理步骤、规则复述、markdown 标题（如 `**意图判定**`、`## 肖像路径`）、字段标签（如 `**最终 tag**：`）、表格分隔行（如 `|---|---|`）、系统提示原文等任何非画面内容
+- 每个元素是一个单独的 tag、一个权重表达，或一句自然语言，禁止内部含逗号；句子需要停顿时改用 `and` / `with` / 从句
+- 权重表达内部也只能是单 tag 或单不可拆短语，禁止 `1.3::tagA, tagB::`，也禁止把整句包进权重块
+- `global[0]` 必须是且只能是一个 rating tag：`rating:general` / `rating:sensitive` / `rating:questionable` / `rating:explicit`
+- 不要自己拼换行，不要输出 `|` 字符
+- 自然语言短句按 `<natural_language>` 的尺度使用：先把 tag 骨架排完，再把补充关系的句子作为独立元素追加在被修饰 tag 之后
+""".strip()
+
+
+_JSON_OUTPUT_TAIL = """
 输出禁止事项：
 - 禁止输出 JSON 之外的任何字符
 - 禁止用 ``` 包裹
@@ -706,7 +812,16 @@ JSON 元素结构规则:
 """.strip()
 
 
-VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
+def _build_json_output_instruction(natural_language: bool) -> str:
+    element_rules = (
+        _JSON_ELEMENT_RULES_NATURAL_LANGUAGE
+        if natural_language
+        else _JSON_ELEMENT_RULES_TAG_ONLY
+    )
+    return f"{_JSON_OUTPUT_HEAD}\n\n{element_rules}\n\n{_JSON_OUTPUT_TAIL}"
+
+
+_VISUAL_CONTINUITY_JSON_OUTPUT_HEAD = """
 <output_instruction>
 你必须只输出一行 JSON（不要代码块、不要解释、不要前后缀），用于程序确定性复用服装、环境与跨图临时效果 Tag。
 
@@ -757,13 +872,29 @@ VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = """
   朴素但仍要有质感细节，避免每次都是同质化基础款；画面看不见的细节不要硬编。
 - replace 的环境 tags 应尽量覆盖空间布局、固定物件、材质和配色；不要为了凑细节凭空添加家具或地点设定。
 - 优先把"工作裙""常服""睡衣"等中文泛称展开为可直接绘制的设计；上下文只有类别词时保留该词也比丢失用户请求更好。
+""".strip()
 
+
+_VISUAL_CONTINUITY_ELEMENT_RULES_TAG_ONLY = """
 JSON 元素规则：
 - 所有数组元素只能是最终英文 Danbooru tag 或单个权重表达，禁止自然语言句子。
 - 每个元素只能含一个 tag，禁止元素内部含逗号。
 - 禁止在 dynamic 重复 outfit/environment/effects 的连续性 Tag。
 - 禁止输出 JSON 之外的任何字符，禁止用 ``` 包裹，禁止空响应。
+""".strip()
 
+
+_VISUAL_CONTINUITY_ELEMENT_RULES_NATURAL_LANGUAGE = """
+JSON 元素规则：
+- 数组元素可以是最终英文 Danbooru tag、单个权重表达，或一句英文自然语言短句（尺度见 `<natural_language>`）。
+- 每个元素只能含一个 tag 或一句话，禁止元素内部含逗号；句子需要停顿时改用 `and` / `with` / 从句。
+- 稳定区的自然语言会被逐字缓存并在后续图片复用，所以 stable.outfit / stable.environment 的句子只写跨图不变的设计事实；本轮才成立的接触、姿态和遮挡写进 dynamic。
+- 禁止在 dynamic 重复 outfit/environment/effects 的连续性 Tag。
+- 禁止输出 JSON 之外的任何字符，禁止用 ``` 包裹，禁止空响应。
+""".strip()
+
+
+_VISUAL_CONTINUITY_JSON_OUTPUT_TAIL = """
 形状示例（演示必须照抄的 JSON 外形；上方 examples 的逗号串只演示 tag 内容与顺序）：
 首帧建立稳定区（无缓存，两个稳定区都用 replace 并给出新 key）：
 {"version":4,"format":"single","intent":"normal","dynamic":{"subject":["rating:general","solo","1girl"],"action":["sitting on bed","hugging own legs"],"emotion":["sleepy","faint smile"],"scene":["morning light through curtains","blanket bunched up"],"framing":["upper body"],"people":[],"positions":[]},"stable":{"outfit":{"mode":"replace","key":"cream_ribbed_pajamas","tags":["cream ribbed knit pajama set","long sleeves","scalloped collar","small pearl buttons","matching shorts","bare feet"]},"environment":{"mode":"replace","key":"her_bedroom","tags":["small bedroom","wooden bed frame","white linen sheets","beige curtains","low bookshelf","warm wood floor"]},"effects":{"mode":"replace","subject":["messy hair"],"scene":[]}}}
@@ -773,20 +904,52 @@ JSON 元素规则：
 """.strip()
 
 
-# ==================== 4 个最终模板 ====================
+def resolve_visual_continuity_output_instruction(natural_language: bool) -> str:
+    """连续性路径的输出契约；自定义模板路径也走这里，保证元素规则不掉档。"""
 
-def _build_prompt_generator_template(sfw: bool, json_output: bool) -> str:
-    """根据 SFW 和输出格式标志位生成完整的 prompt 生成器模板。
+    element_rules = (
+        _VISUAL_CONTINUITY_ELEMENT_RULES_NATURAL_LANGUAGE
+        if natural_language
+        else _VISUAL_CONTINUITY_ELEMENT_RULES_TAG_ONLY
+    )
+    return (
+        f"{_VISUAL_CONTINUITY_JSON_OUTPUT_HEAD}\n\n"
+        f"{element_rules}\n\n"
+        f"{_VISUAL_CONTINUITY_JSON_OUTPUT_TAIL}"
+    )
+
+
+# 纯 tag 档的输出契约（V4.5 及更早）；保持既有导出名不变
+VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION = resolve_visual_continuity_output_instruction(False)
+
+
+# ==================== 最终模板 ====================
+
+def _build_prompt_generator_template(
+    sfw: bool,
+    json_output: bool,
+    natural_language: bool,
+) -> str:
+    """根据 SFW、输出格式与模型语法档位生成完整的 prompt 生成器模板。
 
     Args:
         sfw: True 为 SFW 模式，False 为 NSFW 模式
         json_output: True 为 JSON 输出，False 为文本输出
+        natural_language: True 表示当前模型（V5）放行 tag + 自然语言混写
 
     Returns:
         完整的 prompt 生成器模板
     """
-    rules_text = _build_prompt_rules_text(sfw, json_output=json_output)
-    output_instruction = _JSON_OUTPUT_INSTRUCTION if json_output else _TEXT_OUTPUT_INSTRUCTION
+    rules_text = _build_prompt_rules_text(
+        sfw,
+        json_output=json_output,
+        natural_language=natural_language,
+    )
+    output_instruction = (
+        _build_json_output_instruction(natural_language)
+        if json_output
+        else _TEXT_OUTPUT_INSTRUCTION
+    )
 
     return f"""
 {rules_text}
@@ -805,16 +968,17 @@ def _build_prompt_generator_template(sfw: bool, json_output: bool) -> str:
 """.strip()
 
 
-# 生成四个最终模板（保持向后兼容）
-SFW_PROMPT_GENERATOR_TEMPLATE = _build_prompt_generator_template(sfw=True, json_output=False)
-SFW_PROMPT_GENERATOR_JSON_TEMPLATE = _build_prompt_generator_template(sfw=True, json_output=True)
-PROMPT_GENERATOR_TEMPLATE = _build_prompt_generator_template(sfw=False, json_output=False)
-PROMPT_GENERATOR_JSON_TEMPLATE = _build_prompt_generator_template(sfw=False, json_output=True)
-
-
-def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
+def _build_visual_continuity_prompt_generator_template(
+    sfw: bool,
+    natural_language: bool,
+) -> str:
     """构建 Bot 情景图专用的稳定/动态 Tag 分区模板。"""
-    rules_text = _build_prompt_rules_text(sfw, json_output=True, visual_continuity=True)
+    rules_text = _build_prompt_rules_text(
+        sfw,
+        json_output=True,
+        visual_continuity=True,
+        natural_language=natural_language,
+    )
     return f"""
 {rules_text}
 
@@ -829,7 +993,7 @@ def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
 <<SELFIE_SCENE_CONTEXT>>
 </user_request>
 
-{VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION}
+{resolve_visual_continuity_output_instruction(natural_language)}
 
 <visual_continuity_priority>
 每轮仍须先按 visual_plan 选定一个静态瞬间；连续性只延续稳定事实，不得把上一轮已结束的动作、临时物件或情绪带入本帧。
@@ -838,9 +1002,59 @@ def _build_visual_continuity_prompt_generator_template(sfw: bool) -> str:
 """.strip()
 
 
-SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE = (
-    _build_visual_continuity_prompt_generator_template(sfw=True)
-)
-VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE = (
-    _build_visual_continuity_prompt_generator_template(sfw=False)
-)
+# ==================== 模板选择入口 ====================
+# 键是 (输出通道, 是否 SFW, 是否放行自然语言)。通道用字符串而不是两个 bool，是因为
+# "文本通道 + 跨图连续性" 这个组合并不存在，用 bool 表达会造出一个永远不该被取到的键。
+
+PROMPT_CHANNELS: tuple[str, ...] = ("text", "json", "continuity")
+
+
+def _build_template_registry() -> dict[tuple[str, bool, bool], str]:
+    registry: dict[tuple[str, bool, bool], str] = {}
+    for sfw in (True, False):
+        for natural_language in (True, False):
+            registry[("text", sfw, natural_language)] = _build_prompt_generator_template(
+                sfw=sfw, json_output=False, natural_language=natural_language
+            )
+            registry[("json", sfw, natural_language)] = _build_prompt_generator_template(
+                sfw=sfw, json_output=True, natural_language=natural_language
+            )
+            registry[("continuity", sfw, natural_language)] = (
+                _build_visual_continuity_prompt_generator_template(
+                    sfw=sfw, natural_language=natural_language
+                )
+            )
+    return registry
+
+
+_TEMPLATE_REGISTRY = _build_template_registry()
+
+
+def resolve_prompt_generator_template(
+    *,
+    channel: str,
+    sfw: bool,
+    natural_language: bool,
+) -> str:
+    """按输出通道、内容模式与模型语法档位取内置模板。
+
+    Args:
+        channel: ``text`` / ``json`` / ``continuity``
+        sfw: True 时发放 SFW 安全化规则，False 时发放 NSFW 能力块
+        natural_language: True 时（V5）放行 tag + 英文自然语言混写
+
+    Raises:
+        KeyError: 通道名不在 :data:`PROMPT_CHANNELS` 内——调用方拼错了通道，
+            静默回退只会让整条路径发错模板还查不出来
+    """
+    return _TEMPLATE_REGISTRY[(channel, bool(sfw), bool(natural_language))]
+
+
+# 纯 tag 档（V4.5 及更早）的六个模板保持既有导出名，直接取自同一张表，
+# 避免"导出常量"和"运行时取到的模板"各建一份后悄悄漂移
+SFW_PROMPT_GENERATOR_TEMPLATE = _TEMPLATE_REGISTRY[("text", True, False)]
+PROMPT_GENERATOR_TEMPLATE = _TEMPLATE_REGISTRY[("text", False, False)]
+SFW_PROMPT_GENERATOR_JSON_TEMPLATE = _TEMPLATE_REGISTRY[("json", True, False)]
+PROMPT_GENERATOR_JSON_TEMPLATE = _TEMPLATE_REGISTRY[("json", False, False)]
+SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE = _TEMPLATE_REGISTRY[("continuity", True, False)]
+VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE = _TEMPLATE_REGISTRY[("continuity", False, False)]

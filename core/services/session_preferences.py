@@ -10,6 +10,7 @@ from typing import Any
 class SessionPreference:
     admin_mode: bool | None = None
     selected_model: str | None = None
+    selected_backend: str | None = None
     # 画师预设索引按模型配置节隔离：{config_section: index}。
     # 原先是一个不带模型维度的裸 int，切模型时索引会串到另一个模型的预设上
     # （V4.5 选了 #5，切 V3 只有 2 个预设 → 越界回落，且该模型自己配的
@@ -20,6 +21,7 @@ class SessionPreference:
     prompt_show_enabled: bool | None = None
     tag_retriever_show_enabled: bool | None = None
     character_reference_type: str | None = None
+    retag_path: str | None = None
 
 
 class SessionPreferences:
@@ -47,22 +49,26 @@ class SessionPreferences:
             return {
                 "admin_mode": None,
                 "model": None,
+                "backend": None,
                 "artist_index": {},
                 "size": None,
                 "recall": None,
                 "prompt_show": None,
                 "tag_retriever_show": None,
                 "character_reference_type": None,
+                "retag_path": None,
             }
         return {
             "admin_mode": entry.admin_mode,
             "model": entry.selected_model,
+            "backend": entry.selected_backend,
             "artist_index": dict(entry.selected_artist_index),
             "size": entry.selected_size,
             "recall": entry.recall_enabled,
             "prompt_show": entry.prompt_show_enabled,
             "tag_retriever_show": entry.tag_retriever_show_enabled,
             "character_reference_type": entry.character_reference_type,
+            "retag_path": entry.retag_path,
         }
 
     def clear(self, key: str) -> None:

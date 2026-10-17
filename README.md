@@ -7,7 +7,7 @@
 - `/nai0` 直接英文标签生图（跳过 LLM）
 - `/nai i2i` 图生图（引用回复一张图，§20.1）
 - `/nai vibe` / `/nai ref` 命名图库：把常用参考图存为命名条目，跨重启保留；vibe = §20.3 风格/氛围迁移，ref = §20.4 角色参考（仅 V4.5）
-- `/nai 反推` 图片反推 prompt（PNG 元数据 → WD14 在线 Space 兜底）
+- `/nai 反推` 图片反推 prompt，四条可切换路径（PNG 元数据 / WD14 在线 Space / LLM 视觉模型出英文自然语言描述）
 - `/nai models` 拉取网关实时可用模型清单
 - Planner Action 根据聊天情景主动出图
 - 自拍模式（24 关键词、5 类型）、Tag 检索增强、NSFW 过滤、自动撤回、管理员模式
@@ -23,7 +23,8 @@ Vibe / 角色参考的命名图库在群聊按 `group_id` 共享、私聊按 `us
 1. **MaiBot 主程序**：`host_application` 要求 `>=0.10.0`，SDK 要求 `2.x`（见 `_manifest.json`）。
 2. **NewAPI 网关账号**：自行准备一个支持 NovelAI 模型转发的 NewAPI 兼容服务（OpenAI 协议、`POST /v1/chat/completions`），拿到 `base_url` + `api_key`。每次绘图按 token 计费（1 Anlas ≈ 10000 tokens）。
 3. **一个智商还可以的 LLM 翻译/规划模型**：`/nai` 自然语言生图依赖 LLM 把中文描述转成 Danbooru tag。**强烈建议接 GPT-4o / Claude 3.5 Sonnet / DeepSeek-V3 这一档以上**——低端模型（如 7B 级开源小模型）容易丢主体、瞎编 tag、不遵守 NAI 权重语法，出图质量会断崖式下跌。模型在 `[prompt_generator]` / `[prompt_generator.custom_model]` 里配置，留空则走 MaiBot 全局 task model。
-4. **代理（仅当使用 `/nai 反推`）**：WD14 在线兜底走 HuggingFace Space，**国内必须开梯子**。在 `[retag].wd14_proxy` 显式填代理（如 `http://127.0.0.1:7890`），或继承 `HTTPS_PROXY` 环境变量。不开代理基本必超时。若只想用 PNG 元数据反推（无需联网），把 `wd14_enabled = false` 关掉兜底即可。
+4. **代理（仅当 `/nai 反推` 走 WD14 路径）**：WD14 在线兜底走 HuggingFace Space，**国内必须开梯子**。在 `[retag].wd14_proxy` 显式填代理（如 `http://127.0.0.1:7890`），或继承 `HTTPS_PROXY` 环境变量。不开代理基本必超时。若只想用 PNG 元数据反推（无需联网），把 `wd14_enabled = false` 关掉兜底即可。
+5. **一个能读图的视觉模型（仅当 `/nai 反推` 走 `llm` 路径）**：LLM 反推要求模型看图后写出穷尽画面细节的英文长描述，**建议接 Gemini 2.5 Pro / GPT-4o / Claude 这一档**。在 `[retag].llm_custom_model` 里钉模型列表，或用 `[retag].llm_model_name` 指向宿主已定义的任务名，都留空则走宿主 `vlm` 任务。
 
 ## 依赖
 
@@ -98,7 +99,8 @@ default_model = "nai-diffusion-4-5-full"
 | `/nai ref [@<名字>] <描述>` | 使用默认或单次指定的角色参考图（仅 V4.5，**仅管理员**） |
 | `/nai0 ref [@<名字>] <英文 tags>` | 角色参考直发英文 tags（不过 LLM，**仅管理员**） |
 | `/nai ref类型 [character\|style\|both]` | 不带参数查看当前类型；带参数切换 §20.4 提取目标（**仅管理员，会话级**） |
-| `/nai 反推` | 回引/同发一张图，反推 Danbooru tag（原图秒回，非原图走 WD14） |
+| `/nai 反推 [auto\|meta\|wd14\|llm]` | 回引/同发一张图反推；不带参数走会话选定的路径，带参数只对本次生效 |
+| `/nai 反推路径 [auto\|meta\|wd14\|llm]` | 不带参数查看当前反推路径；带参数会话级粘性切换 |
 | `/nai set [3/f3/4c/4/4.5c/4.5/5c/5]` | 查看/切换模型（画师预设按模型独立，切换不串用） |
 | `/nai size [竖/横/方]` | 查看/切换尺寸（832x1216 / 1216x832 / 1024x1024） |
 | `/nai art [编号]` | 查看/切换当前模型的画师风格预设 |
@@ -144,7 +146,7 @@ default_model = "nai-diffusion-4-5-full"
 [prompt_generator] / [prompt_generator.custom_model]     # 提示词生成 LLM
 [action_guard]                                           # Planner 出图触发保护
 [random_scene] / [tag_retriever]                         # 随机场景 / Tag 检索
-[retag]                                                  # 图片反推（PNG 元数据 + WD14 兜底）
+[retag] / [retag.llm_custom_model]                       # 图片反推（元数据 / WD14 / LLM 视觉模型）
 [i2i] / [vibe] / [character_reference]                   # 图生图各模式可调参数（§20.1/§20.3/§20.4）
 [components] / [prompt_show] / [nsfw_filter]
 [auto_recall] / [admin] / [custom_prompt]
@@ -251,15 +253,43 @@ min_score = 0.6
 
 ### 图片反推
 
-`/nai 反推`：回引一张图（或在同一条消息内发图带命令）→ 把图反推成 Danbooru tag。**只输出正向 prompt，不返回负面**。
+`/nai 反推`：回引一张图（或在同一条消息内发图带命令）→ 把图反推成可直接回灌 `/nai0` 的 prompt。
 
-两级链路：
+四条路径，`/nai 反推路径 <值>` 会话级粘性切换，`/nai 反推 <值>` 只对本次生效：
+
+| 路径 | 干什么 | 输出形态 | 耗时 |
+|------|--------|----------|------|
+| `auto`（默认） | PNG 元数据命中即返回，未命中走 WD14 兜底 | Danbooru tag | 秒级 / 30~120s |
+| `meta` | 只读 PNG 元数据，完全不联网 | Danbooru tag | 秒级 |
+| `wd14` | 只走 WD14 在线 Space | Danbooru tag | 30~120s |
+| `llm` | 视觉模型逐项转写画面 | **英文自然语言长描述** | 30~90s |
+
+tag 类路径（`auto` / `meta` / `wd14`）**只输出正向 prompt，不返回负面**：
 1. **PNG 元数据**（NAI Comment JSON / SD WebUI `parameters`）— 原图秒级精确还原，画师串都齐
-2. **WD14 在线 Space**（仅当上一步未命中）— 三个 HF Space 串行轮询，前一个失败才打扰下一个，整体最坏 ~360s
+2. **WD14 在线 Space** — 三个 HF Space 串行轮询，前一个失败才打扰下一个，整体最坏 ~360s
+
+`llm` 路径是给 V5 用的：V5 对英文自然语言从句的理解明显强于 V4.5，所以这条路径不出 tag，
+而是让视觉模型把画面穷尽转写成一段英文描述。提示词的核心是**逐件独立成项**：识别到的每一件
+东西（每件衣物、每个配饰、每个持物、每处装饰、每个背景道具）都必须拿到一份专属描述，五件事
+一件不能少——是什么 / 在哪 / 当前状态 / 材质颜色纹样光泽 / 挂在它上面的装饰逐个计数定位。
+其中**递归条款**是关键：挂在一件东西上的装饰本身也是一件东西，所以袜口的蝴蝶结要有自己的颜色、
+系在哪条腿的哪一侧、飘带垂到哪。外面套一张 13 项扫描网格（人数 / 脸与视线微表情 / 发型 /
+逐件服装与穿着状态 / **腿部服饰** / **鞋履** / 配饰从头到脚扫 / 四肢逐一 / 接触承重遮挡 /
+背景逐层含虚化前景与文字原样转写 / 光源与阴影落点 / 视角构图 / 画风媒介）保证不漏整片区域，
+最后再跑一遍收尾自检。会话开着 NSFW 过滤时发温和版指令，关掉时解锁直白描述。
+
+输出**没有长度上限**：长度由画面里的 item 数推出来，复杂立绘常达 600~900 词。太长时回灌
+`/nai0` 前自行裁剪即可——NAI 对过长 prompt 靠后的内容权重会衰减。
+
+`llm` 路径几个要注意的点：
+- 它**不做元数据兜底**。显式选它就是要自然语言，拿一串 tag 顶包只会让人以为反推成功了
+- 输出是纯自然语言，不带 tag 头。NAI 只按 tag 识别 `rating:` / 人数 / 视角，需要时请自行在开头补
+- 每次都实打实调一次视觉模型，`auto` 不会顺手触发它
 
 ```toml
 [retag]
 enabled = true
+default_path = "auto"             # auto / meta / wd14 / llm；会话内可用 /nai 反推路径 切换
 cache_ttl_seconds = 3600          # 入站图缓存保留秒数；过期后回引旧图就失效
 image_cache_per_stream = 20
 
@@ -273,6 +303,19 @@ wd14_retry_delay = 0.5
 
 # 关键：国内务必配代理，留空则继承 HTTPS_PROXY 环境变量
 wd14_proxy = "http://127.0.0.1:7890"
+
+llm_enabled = true                # 关掉后 /nai 反推 llm 直接报错，不会静默回落到 WD14
+llm_model_name = ""               # 宿主模型任务名；留空用 vlm 任务；配了下面的 custom_model 则本项不生效
+llm_max_tokens = 3000             # 复杂立绘常达 600~900 词；填太小会从中间静默截断
+llm_temperature = 0.3             # 转写任务不是创作，太高会开始编画面里没有的东西
+llm_timeout = 120.0
+llm_prompt_template = ""          # 留空用内置契约；填了则整体取代，输出形态自负其责
+
+[retag.llm_custom_model]          # 钉一个能读图的强模型，绕过宿主 vlm 任务
+model_list = []
+max_tokens = 3000
+temperature = 0.3
+slow_threshold = 60.0
 ```
 
 默认轮询三个 HF Space（不渲染进 config.toml，代码内置：`animetimm/dbv4-full-witha-playground` / `pixai-labs/pixai-tagger-demo` / `DraconicDragon/PixAI-Tagger-v0.9-ONNX`）。想换成自部署的 Space，手动加：
@@ -350,15 +393,19 @@ Curated 之间就不同（V4.5 Curated 独有 `-0.8::feet::, rating:general`，F
 
 各模型的能力与语法差异：
 
-| 模型 | 多角色 | 角色参考 | 氛围转移 | 数值权重 `1.5::t::` | 负数值 `-1::t::` | SMEA |
-|---|---|---|---|---|---|---|
-| V5 Full / Curated | ✅ 上限 22 | ❌ | ❌ | ✅ | ✅ | ❌ |
-| V4.5 Full / Curated | ✅ 上限 6 | ✅ | ✅ | ✅ | ✅ | ❌ |
-| V4 Full / Curated | ✅ 上限 6 | ❌ | ✅ | ✅ | ❌ | ❌ |
-| V3 Anime / Furry | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ |
+| 模型 | 多角色 | 角色参考 | 氛围转移 | 数值权重 `1.5::t::` | 负数值 `-1::t::` | SMEA | 自然语言提示词 |
+|---|---|---|---|---|---|---|---|
+| V5 Full / Curated | ✅ 上限 22 | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
+| V4.5 Full / Curated | ✅ 上限 6 | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| V4 Full / Curated | ✅ 上限 6 | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| V3 Anime / Furry | ❌ | ❌ | ✅ | ❌ | ❌ | ✅ | ❌ |
 
 > V5 的角色参考与氛围转移是官方尚未随发布上线的能力，不是插件缺失。
 > V5 的官方质量词配方 NovelAI 也还没公布，`custom_prompt_add` 默认留空。
+> 「自然语言提示词」指 `/nai` 的 LLM 提示词生成规则按当前模型分档：选到 V5 时，
+> LLM 会在标准 Danbooru tag 骨架之上补英文自然语言短句，用来讲清 tag 讲不清的
+> 主体归属、接触点和前后遮挡；rating、人数、framing、`source#`/`target#` 互动绑定
+> 仍然只能是 tag。V4.5 及更早仍走纯 tag 档——喂长句只会稀释每个 tag 的权重。
 
 从 1.x 升级时插件会在启动时自动迁移 `[model_nai3]` / `[model_nai4]` / `[model_nai4_5]`
 到新结构，原文件备份为 `config.toml.pre-2.0.0`。画师预设与各段提示词原样搬运；
@@ -402,7 +449,13 @@ A: 支持。三种链路：
 - `/nai ref ...` — §20.4 角色参考（仅 V4.5 模型，自动降级），命令族结构与 vibe 对称（存/图库/删/选/@/裸命令）
 
 **Q: `/nai 反推` 经常超时怎么办？**
-A: 国内访问 HF Space 必须配代理 — 在 `[retag]` 里填 `wd14_proxy = "http://127.0.0.1:7890"`（或你的代理端口）。如果只想用 PNG 元数据反推（不依赖网络），把 `wd14_enabled = false` 关掉 WD14 兜底，非原图直接返回失败。
+A: 国内访问 HF Space 必须配代理 — 在 `[retag]` 里填 `wd14_proxy = "http://127.0.0.1:7890"`（或你的代理端口）。如果只想用 PNG 元数据反推（不依赖网络），`/nai 反推路径 meta` 切到只读元数据，或把 `wd14_enabled = false` 关掉 WD14 兜底，非原图直接返回失败。
+
+**Q: 反推出来的英文描述回灌 `/nai0` 之后，人数和视角跟原图对不上？**
+A: `llm` 路径输出的是纯自然语言，而 NAI 只按 tag 识别 `rating:` / `1girl` / `from below` 这几类——写在句子里不生效。把它们作为 tag 补在描述最前面即可（`rating:sensitive, 1girl, solo, from below, <描述>`）。这是选定输出形态时的已知取舍，命令回执里也会提示。
+
+**Q: `/nai 反推 llm` 报"视觉模型返回空描述"？**
+A: 三种可能：模型不支持读图（换一个真正的视觉模型）、模型触发了内容拒答（会话里 `/nai nsfw off` 关掉过滤会发解锁版指令）、`llm_max_tokens` 太小把描述截断成空（默认 3000，不要往下调）。
 
 ## 项目结构
 
@@ -418,7 +471,8 @@ nai_draw_plugin/
 │   ├── clients/           # NewAPI 网关 + Danbooru online 客户端
 │   ├── commands/          # 命令实现（部分逻辑已合并进 plugin.py）
 │   ├── mixins/            # 自动撤回 / 模型配置等可复用 Mixin
-│   ├── rules/             # prompt_rules / selfie_rules
+│   ├── retag/             # 反推路径编排 + PNG 元数据 / WD14 客户端 / 图片缓存
+│   ├── rules/             # prompt_rules / selfie_rules / caption_rules（LLM 反推提示词）
 │   ├── services/          # session_state / prompt_memory / tag_retriever 等
 │   └── utils/             # 输出解析、后处理、tag_data_builder 等
 └── tests/
@@ -433,6 +487,36 @@ GPL-v3.0-or-later
 Rabbit
 
 ## 更新日志
+
+### v2.1.0 (2026-08-31)
+
+**LLM 图片反推：视觉模型出英文自然语言描述（适配 V5）**
+
+- 新增 `llm` 反推路径：把图交给视觉模型，产出一段穷尽画面细节的英文自然语言长描述，可直接回灌 `/nai0`。V5 对英文自然语言从句的理解明显强于 V4.5，主体归属、接触点、承重关系、前后遮挡这类"tag 之间说不清"的信息，写成句子比拆成孤立 tag 更准
+- 反推提示词（`core/rules/caption_rules.py`）的核心是**逐件独立成项**：识别到的每一件东西都要拿到专属描述，必须给全「是什么 / 在哪 / 当前状态 / 材质颜色纹样光泽 / 挂在它上面的装饰逐个计数定位」五项，且**装饰本身也是一件东西**（袜口的蝴蝶结要写出颜色、系在哪条腿哪一侧、飘带垂到哪）。重复出现的小装饰必须逐个计数定位，成对物件（袜 / 鞋 / 袖 / 耳 / 手）左右分写，禁止 `shoes`、`accessories` 这类裸类名
+- 外层是一张 13 项扫描网格，只负责「该往哪看」：人数 / 脸与视线微表情 / 发型 / 逐件服装与穿着状态（"open" 不算状态，要说开到什么程度、露出什么）/ **腿部服饰**（袜口构造、蝴蝶结在哪条腿哪一侧、飘带长度、左右差异）/ **鞋履**（材质光泽、厚底跟高、每只鞋的装饰）/ 配饰从头到脚逐站扫 / 四肢逐一 / 接触承重遮挡 / 背景按景深逐层含虚化前景、可辨认文字原样加引号转写 / 光源方向与阴影落在什么面上 / 视角构图 / 画风媒介
+- 结尾跑一遍**收尾自检**（裸类名、装饰计数、成对左右、文字转写、虚化前景、服装状态六条），只输出修好的最终描述
+- 长度是 item 数推出来的派生量而非写死的下限，且**明确无上限**：初版写死 "at least 200 words"，模型稳定写到 231 词就收笔；现在按场景复杂度分档 250 / 450 / 600 起，并告诉模型「贴着下限 = 你概括了」
+- 硬禁止 `seems` / `appears to be` 这类模糊措辞、心理活动与画外内容
+- 会话 NSFW 开关决定发哪一版 system_override：开着发温和版，关掉解锁直白的解剖与衣物状态描述——不解锁的话视觉模型会用委婉语把关键信息糊过去，反推等于白做
+- **`/nai 反推` 从写死的两级瀑布改成四条可选路径**：`auto`（元数据 → WD14，历史行为，仍是默认）/ `meta`（只读元数据，不联网）/ `wd14`（只走在线 Space）/ `llm`
+- 新增 `/nai 反推路径 [值]`：不带参数查看当前路径与可选值，带参数会话级粘性切换；`/nai 反推 <值>` 只对本次生效，不改粘性选定
+- `llm` 路径**不做元数据兜底**，失败原样暴露原因：显式选它就是要自然语言，拿一串 tag 顶包只会让人以为反推成功了；同理 `auto` 也永远不会顺手触发视觉模型
+- 反推回执按结果形态分支：tag 结果报 tag 数，自然语言结果报词数，并提示 `rating` / 人数 / 视角 NAI 只按 tag 识别、需要时自行补
+
+**配置**
+
+- `[retag]` 新增 `default_path` / `llm_enabled` / `llm_model_name` / `llm_max_tokens`（默认 3000；逐件穷尽的描述在复杂立绘上常达 600~900 词，填小了会被静默截断成半句）/ `llm_temperature` / `llm_timeout` / `llm_prompt_template`
+- 新增 `[retag.llm_custom_model]`：钉一组能读图的模型绕过宿主 `vlm` 任务，形状与 `[prompt_generator.custom_model]` 一致，WebUI「检索与反推」页签可编辑
+- `default_path` 在 WebUI 为下拉；配置里写了非法值会直接抛错，不会静默按 `auto` 跑
+
+**细节**
+
+- 抽出 `core/services/pinned_task_orchestrator.py`：提示词生成与图片反推共用同一个"钉住 TaskConfig"的编排器，两条链路的自定义模型配置形状因此保持一致
+- 图片格式按字节头嗅探（PNG / JPEG / GIF / BMP / WEBP），不再硬写 `png`——入站图以 JPEG 居多，格式报错会让部分网关拒收整个请求
+- 视觉模型输出复用提示词链路同一个 CJK + 全角清洗函数；模型夹带中文、把描述当代码块输出、整段中文（清洗后为空）三种情况都能正确处理，最后一种当失败抛出而不是送一个空 prompt 给 NAI
+- 自定义模型路径绕过了宿主的图片自动放大，captioner 自己补 `normalize_image_base64_for_model`，表情包尺寸的小图不会被视觉模型拒识
+- 修复 `/nai 反推路径 <值>` 会被通用画图命令吞掉：`nai_draw` 的负向预查写的是 `反推(?:\s|$)`，而"反推"后面跟的是"路"，断言不成立，整条消息会被当成"画一张 反推路径 llm"送去出图
 
 ### v2.0.0 (2026-08-25)
 

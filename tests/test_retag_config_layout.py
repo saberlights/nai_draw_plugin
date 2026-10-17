@@ -223,3 +223,62 @@ api = "/predict_image"
     # 同时 schema 里得保留 wd14_spaces 字段定义，否则 Runner 可能直接丢弃用户输入
     schema_retag = NaiPicPlugin.config_schema["retag"]
     assert "wd14_spaces" in schema_retag, "schema 必须保留 wd14_spaces 以支持高级覆盖"
+
+
+def test_default_config_carries_llm_path_fields() -> None:
+    """llm 反推路径的配置字段必须进默认配置，否则用户在 config.toml 里根本看不到。"""
+    plugin = NaiPicPlugin()
+    retag = plugin.get_default_config()["retag"]
+
+    assert retag["default_path"] == "auto", "新装默认必须仍是 auto，不能悄悄改成花钱的 llm"
+    assert retag["llm_enabled"] is True
+    assert retag["llm_model_name"] == ""
+    assert retag["llm_prompt_template"] == ""
+    # 逐件穷尽的描述在复杂立绘上常达 600~900 词；默认 max_tokens 给太小会把描述
+    # 从中间静默截断（截断的半截文本不会报错，会照常发给用户）
+    assert retag["llm_max_tokens"] >= 2500
+    assert retag["llm_custom_model"]["max_tokens"] == retag["llm_max_tokens"], (
+        "custom_model 的 max_tokens 必须与 llm_max_tokens 同步，"
+        "否则钉了自定义模型的用户会撞上一个和文档不一致的上限"
+    )
+    assert retag["llm_temperature"] <= 0.5
+    assert retag["llm_custom_model"]["model_list"] == []
+
+
+def test_webui_default_path_is_a_select_over_all_paths() -> None:
+    from plugins.nai_draw_plugin.core.retag import REVERSE_PATHS
+
+    plugin = NaiPicPlugin()
+    schema = plugin.get_webui_config_schema(plugin_id="nai_draw_plugin")
+
+    field = schema["sections"]["retag"]["fields"]["default_path"]
+    assert field["ui_type"] == "select"
+    assert field["choices"] == list(REVERSE_PATHS)
+
+
+def test_webui_exposes_retag_llm_custom_model_section() -> None:
+    """反推自定义视觉模型要有独立嵌套节，否则 Dashboard 编不了 dict 字段。"""
+    plugin = NaiPicPlugin()
+    schema = plugin.get_webui_config_schema(plugin_id="nai_draw_plugin")
+
+    section = schema["sections"]["retag.llm_custom_model"]
+    assert set(section["fields"]) == {
+        "model_list",
+        "max_tokens",
+        "temperature",
+        "slow_threshold",
+    }
+
+    retrieval_tab = next(
+        tab for tab in schema["layout"]["tabs"] if tab["id"] == "retrieval"
+    )
+    assert "retag.llm_custom_model" in retrieval_tab["sections"]
+
+
+def test_rendered_config_documents_all_four_paths() -> None:
+    text = _render_default_config_text()
+
+    assert "# 反推默认走哪条路径" in text
+    for path in ("auto", "meta", "wd14", "llm"):
+        assert path in text
+    assert "/nai 反推路径" in text, "分组标题应告诉用户怎么在会话里切路径"

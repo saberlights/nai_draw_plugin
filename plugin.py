@@ -15,7 +15,16 @@ from .core.constants import NAI_PIC_IMAGE_DISPLAY_MARKER
 from .core.data_paths import PLUGIN_DATA_DIR
 from .core.config_migration import migrate_to_v2
 from .core.plugin_config import PLUGIN_CONFIG
-from .core.retag import ImageCacheService, ReverseService, WD14Client
+from .core.retag import (
+    ImageCacheService,
+    KIND_NATURAL_LANGUAGE,
+    PATH_LLM,
+    REVERSE_PATH_LABELS,
+    REVERSE_PATHS,
+    ReverseService,
+    WD14Client,
+    normalize_path,
+)
 from .core.reply_command_text import normalize_reply_command_text
 from .core.services.background_task_supervisor import BackgroundTaskSupervisor
 from .core.services.blocking_io_runner import BlockingIORunner
@@ -25,6 +34,7 @@ from .core.services.group_access_policy import (
     tool_definition_name,
     without_tool,
 )
+from .core.services.llm_image_captioner import MaiBotImageCaptioner
 from .core.services.session_state import session_state
 from .core.services.tag_retriever import get_tag_retriever, reset_tag_retriever
 from .runtime_recall import (
@@ -448,6 +458,8 @@ class NaiPicPlugin(MaiBotPlugin):
         )
         self._wd14_io = BlockingIORunner(thread_name_prefix="nai-wd14-io")
         self._active_invocations: WeakSet[NaiInvocation] = WeakSet()
+        # 生图会占用远程连接、HTTP worker 和较大的图片 payload；插件实例内只允许一个任务。
+        self._generation_slot_held = False
         self._generation_admission_policy = GenerationAdmissionPolicy(
             state=session_state,
             logger=logger,
@@ -584,7 +596,7 @@ class NaiPicPlugin(MaiBotPlugin):
         )
 
     def _refresh_retag_runtime(self) -> None:
-        """刷新反推链路的运行时单例（图缓存 TTL、WD14 客户端）。"""
+        """刷新反推链路的运行时单例（图缓存 TTL、WD14 客户端、视觉模型）。"""
         plugin_config = self.get_plugin_config_data()
         retag_config = plugin_config.get("retag") if isinstance(plugin_config, dict) else None
         if not isinstance(retag_config, dict):
@@ -631,12 +643,38 @@ class NaiPicPlugin(MaiBotPlugin):
             enabled=wd14_enabled,
         )
 
+        # llm 路径关掉时把 captioner 置回 None，让 ReverseService 明确报"未启用"，
+        # 而不是留着一个旧实例继续偷偷干活
+        if retag_config.get("llm_enabled", True):
+            captioner = MaiBotImageCaptioner(
+                log_prefix=self.plugin_name,
+                model_name=str(retag_config.get("llm_model_name", "") or ""),
+                custom_model=retag_config.get("llm_custom_model"),
+                max_tokens=int(retag_config.get("llm_max_tokens", 3000) or 3000),
+                temperature=float(retag_config.get("llm_temperature", 0.3) or 0.3),
+                timeout=float(retag_config.get("llm_timeout", 120.0) or 120.0),
+                prompt_template=str(retag_config.get("llm_prompt_template", "") or ""),
+            )
+        else:
+            captioner = None
+        self._reverse_service.update_captioner(captioner)
+
     def _close_invocation(self, invocation: NaiInvocation) -> None:
         """关闭一次 Invocation 并从卸载兜底集合移除。"""
         try:
             invocation.close()
         finally:
             self._active_invocations.discard(invocation)
+
+    def _try_acquire_generation_slot(self) -> bool:
+        """非阻塞取得全局生图槽位；忙时拒绝，不在内存中排队。"""
+        if getattr(self, "_generation_slot_held", False):
+            return False
+        self._generation_slot_held = True
+        return True
+
+    def _release_generation_slot(self) -> None:
+        self._generation_slot_held = False
 
     def _run_invocation_in_background(
         self,
@@ -652,13 +690,18 @@ class NaiPicPlugin(MaiBotPlugin):
             name=name,
             on_failure=on_failure,
             finalize=(
-                lambda: self._close_invocation(invocation)
-                if invocation is not None
-                else None
+                lambda: (
+                    self._close_invocation(invocation)
+                    if invocation is not None
+                    else None,
+                    self._release_generation_slot(),
+                )
             ),
         )
         if task is None and invocation is not None:
             self._close_invocation(invocation)
+        if task is None:
+            self._release_generation_slot()
         return task is not None
 
     @HookHandler(
@@ -951,7 +994,12 @@ class NaiPicPlugin(MaiBotPlugin):
         name: str = "nai-image-generation",
         on_failure: Any = None,
     ) -> bool:
-        """在后台启动图片生成任务，并阻止同会话重复启动。"""
+        """在后台启动图片生成任务，并阻止全局及同会话重复启动。"""
+        if not self._try_acquire_generation_slot():
+            if invocation is not None:
+                self._close_invocation(invocation)
+            return False
+
         if not stream_id:
             return self._run_invocation_in_background(
                 coroutine_factory,
@@ -962,6 +1010,7 @@ class NaiPicPlugin(MaiBotPlugin):
 
         pending_owner = session_state.acquire_pending_image_generation(stream_id)
         if pending_owner is None:
+            self._release_generation_slot()
             if invocation is not None:
                 self._close_invocation(invocation)
             return False
@@ -971,6 +1020,7 @@ class NaiPicPlugin(MaiBotPlugin):
                 if invocation is not None:
                     self._close_invocation(invocation)
             finally:
+                self._release_generation_slot()
                 session_state.release_pending_image_generation(stream_id, pending_owner)
 
         task = self._background_tasks.start(
@@ -991,7 +1041,17 @@ class NaiPicPlugin(MaiBotPlugin):
         *,
         invocation: NaiInvocation,
     ) -> bool:
-        """后台执行显式生图命令，允许同会话内并发处理多个用户请求。"""
+        """后台执行显式生图命令；插件实例内同一时间只运行一个请求。"""
+        if not self._try_acquire_generation_slot():
+            self._close_invocation(invocation)
+            if stream_id:
+                await self.ctx.send.text(
+                    "当前已有图片正在生成，请等待完成后再试。",
+                    stream_id,
+                    storage_message=False,
+                )
+            return False
+
         async def _acknowledge() -> bool:
             if not stream_id:
                 return True
@@ -1003,29 +1063,62 @@ class NaiPicPlugin(MaiBotPlugin):
                 )
             )
 
-        return await self._background_tasks.submit(
-            coroutine_factory,
-            before_start=_acknowledge,
-            name="nai-command-generation",
-            on_failure=(
-                lambda _exc: self.ctx.send.text(
-                    "图片生成任务意外中断，请稍后重试。",
-                    stream_id,
-                    storage_message=False,
-                )
-                if stream_id
-                else None
-            ),
-            finalize=lambda: self._close_invocation(invocation),
-        )
+        try:
+            return await self._background_tasks.submit(
+                coroutine_factory,
+                before_start=_acknowledge,
+                name="nai-command-generation",
+                on_failure=(
+                    lambda _exc: self.ctx.send.text(
+                        "图片生成任务意外中断，请稍后重试。",
+                        stream_id,
+                        storage_message=False,
+                    )
+                    if stream_id
+                    else None
+                ),
+                finalize=lambda: (
+                    self._close_invocation(invocation),
+                    self._release_generation_slot(),
+                ),
+            )
+        except BaseException:
+            self._release_generation_slot()
+            raise
 
-    async def _run_retag(self, *, stream_id: str, user_id: str) -> tuple[bool, str | None, bool]:
-        """执行 `/nai 反推`：取目标图 → 反推 → 把结果发回会话。"""
+    async def _run_retag(
+        self,
+        *,
+        stream_id: str,
+        user_id: str,
+        path_override: str = "",
+    ) -> tuple[bool, str | None, bool]:
+        """执行 `/nai 反推`：取目标图 → 按路径反推 → 把结果发回会话。
+
+        Args:
+            stream_id: 会话 ID
+            user_id: 触发命令的用户 ID
+            path_override: 命令里带的单次路径参数；空串表示用会话粘性选定
+        """
         plugin_config = self.get_plugin_config_data()
         retag_config = plugin_config.get("retag") if isinstance(plugin_config, dict) else None
         if not isinstance(retag_config, dict) or not retag_config.get("enabled", True):
             await self.ctx.send.text("❌ /nai 反推 已在配置中关闭", stream_id, storage_message=False)
             return False, "反推未启用", True
+
+        get_config = self._make_config_getter(plugin_config)
+        try:
+            if path_override:
+                path = normalize_path(path_override)
+            else:
+                path = session_state.get_retag_path("stream", stream_id, get_config)
+        except ValueError as exc:
+            await self.ctx.send.text(
+                f"❌ {exc}\n\n{self._render_retag_path_options()}",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "反推路径不合规", True
 
         image_base64 = self._image_cache_service.resolve_image_base64(
             stream_id=stream_id,
@@ -1047,12 +1140,18 @@ class NaiPicPlugin(MaiBotPlugin):
             await self.ctx.send.text(f"❌ 图片解码失败: {exc}", stream_id, storage_message=False)
             return False, "图片解码失败", True
 
-        await self.ctx.send.text("🔍 正在反推 tag，请稍候...", stream_id, storage_message=False)
+        waiting_text = (
+            "🔍 正在用视觉模型反推画面细节，请稍候（穷尽描述通常要 30~90s）..."
+            if path == PATH_LLM
+            else "🔍 正在反推 tag，请稍候..."
+        )
+        await self.ctx.send.text(waiting_text, stream_id, storage_message=False)
 
-        result = await self._reverse_service.reverse(image_bytes)
+        sfw = session_state.is_nsfw_filter_enabled("stream", stream_id, get_config)
+        result = await self._reverse_service.reverse(image_bytes, path=path, sfw=sfw)
         if result.source == "failed" or not result.prompt:
             await self.ctx.send.text(
-                "❌ 反推失败：" + (result.detail or "未知原因") + "\n（仅 PNG 元数据命中或 WD14 可用时才能拿到 tag）",
+                f"❌ 反推失败（路径 {path}）：{result.detail or '未知原因'}",
                 stream_id,
                 storage_message=False,
             )
@@ -1061,13 +1160,86 @@ class NaiPicPlugin(MaiBotPlugin):
         source_label = {
             "metadata": "📦 PNG 元数据",
             "wd14": "🔍 WD14 在线 Space",
+            "llm": "🧠 视觉模型自然语言",
         }.get(result.source, result.source)
 
+        if result.kind == KIND_NATURAL_LANGUAGE:
+            # 自然语言结果没有 tag 概念，报词数；rating / 人数 / 视角 NAI 只认 tag，
+            # 纯句子表达不了，这一点必须在回执里说清楚，否则用户会以为反推漏了信息
+            scale = f"{len(result.prompt.split())} 词"
+            usage_hint = (
+                "💡 可直接用于 /nai0 <prompt>，建议配合 V5 模型\n"
+                "   rating / 人数 / 视角 NAI 只按 tag 识别，需要时请自行在开头补 tag"
+            )
+        else:
+            scale = f"{len(result.tags)} 个 tag"
+            usage_hint = "💡 可直接用于 /nai0 <prompt>"
+
         await self.ctx.send.text(
-            f"✅ 反推完成（{source_label}，{len(result.tags)} 个 tag）\n\n{result.prompt}\n\n💡 可直接用于 /nai0 <prompt>",
+            f"✅ 反推完成（{source_label}，{scale}）\n\n{result.prompt}\n\n{usage_hint}",
             stream_id,
         )
         return True, "反推成功", True
+
+    async def _run_retag_path_switch(
+        self,
+        *,
+        stream_id: str,
+        user_id: str,
+        path_value: str,
+    ) -> tuple[bool, str | None, bool]:
+        """执行 `/nai 反推路径 [值]`：无参查看当前路径，带参会话级粘性切换。"""
+        del user_id
+        plugin_config = self.get_plugin_config_data()
+        get_config = self._make_config_getter(plugin_config)
+
+        if not path_value:
+            current = session_state.get_retag_path("stream", stream_id, get_config)
+            await self.ctx.send.text(
+                f"当前反推路径：{current}（{REVERSE_PATH_LABELS[current]}）\n\n"
+                f"{self._render_retag_path_options()}",
+                stream_id,
+                storage_message=False,
+            )
+            return True, "显示反推路径", True
+
+        try:
+            normalized = session_state.set_retag_path("stream", stream_id, path_value)
+        except ValueError as exc:
+            await self.ctx.send.text(
+                f"❌ {exc}\n\n{self._render_retag_path_options()}",
+                stream_id,
+                storage_message=False,
+            )
+            return False, "反推路径不合规", True
+
+        await self.ctx.send.text(
+            f"✅ 已把本会话的反推路径切换为：{normalized}（{REVERSE_PATH_LABELS[normalized]}）",
+            stream_id,
+            storage_message=False,
+        )
+        return True, "已切换反推路径", True
+
+    @staticmethod
+    def _make_config_getter(plugin_config: dict[str, Any]) -> Callable[..., Any]:
+        """把合并后的配置字典包成 session_state 期望的点分路径读取器。"""
+        def get_config(key: str, default: Any = None) -> Any:
+            current: Any = plugin_config
+            for part in str(key or "").split("."):
+                if not isinstance(current, dict) or part not in current:
+                    return default
+                current = current[part]
+            return current
+
+        return get_config
+
+    @staticmethod
+    def _render_retag_path_options() -> str:
+        """渲染反推路径的可选值说明，命令回显与错误提示共用。"""
+        lines = [f"/nai 反推路径 {path} - {REVERSE_PATH_LABELS[path]}" for path in REVERSE_PATHS]
+        return "使用方法（切换后本会话粘性生效）:\n" + "\n".join(lines) + (
+            "\n\n也可用 /nai 反推 <路径> 只对本次生效，不改粘性选定"
+        )
 
     def _config_path(self) -> str:
         """返回当前插件实例对应的配置文件路径。"""
@@ -1154,8 +1326,8 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @Command(
         "nai_admin_control_command",
-        description="NAI 管理命令：/nai <st|sp|set|art|size|ban|unban|banlist|help>",
-        pattern=r"^(?:.*，说：\s*)?/nai\s+(?P<action>st|sp|set|art|size|ban|unban|banlist|help)(?:\s+(?P<param>.+))?$",
+        description="NAI 管理命令：/nai <st|sp|set|chami|签到|art|size|ban|unban|banlist|help>",
+        pattern=r"^(?:.*，说：\s*)?/nai\s+(?P<action>st|sp|set|chami|签到|art|size|ban|unban|banlist|help)(?:\s+(?P<param>.+))?$",
     )
     async def handle_nai_admin_control_command(
         self,
@@ -1274,23 +1446,66 @@ class NaiPicPlugin(MaiBotPlugin):
 
     @Command(
         "nai_retag_command",
-        description="图片反推：/nai 反推（PNG 元数据 → WD14 兜底，只输出正向 prompt）",
-        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+反推(?:\s+.*)?$",
+        description="图片反推：/nai 反推 [auto|meta|wd14|llm]（不带参数走会话选定的路径）",
+        # 路径参数只吃 REVERSE_PATHS 里的词，其余尾随内容照旧忽略（历史行为，
+        # `/nai 反推 这张图` 这种口语写法不该被当成非法路径打回）。
+        # `(?!路径)` 不能省：尾随通配会让本 pattern 连 `/nai 反推路径 llm` 一起吃掉，
+        # 把粘性切换命令变成一次反推。
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+反推(?!路径)(?:\s+(?P<path>auto|meta|wd14|llm)(?:\s|$))?(?:\s*.*)?$",
     )
     async def handle_nai_retag_command(
         self,
         stream_id: str = "",
         user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> tuple[bool, str | None, bool]:
-        """处理 `/nai 反推`。
+        """处理 `/nai 反推 [路径]`。
 
         反推链路全部走插件内单例，命令本身不接 Invocation。
         """
         del kwargs
+        path_override = str((matched_groups or {}).get("path", "") or "").strip()
+        # 反推可能超过宿主命令 RPC 的 60s 上限，交给已有监督器管理生命周期。
+        task = self._background_tasks.start(
+            lambda: self._run_retag(
+                stream_id=stream_id,
+                user_id=user_id,
+                path_override=path_override,
+            ),
+            name="nai-retag",
+            on_failure=lambda exc: self.ctx.send.text(
+                f"❌ 反推任务意外中断：{exc}",
+                stream_id,
+                storage_message=False,
+            ),
+        )
+        if task is None:
+            return False, "插件正在卸载，无法启动反推", True
+        return True, "已开始反推", True
+
+    @Command(
+        "nai_retag_path_command",
+        description="切换反推路径：/nai 反推路径 [auto|meta|wd14|llm]（会话级粘性，不带参数查看当前值）",
+        pattern=r"^(?:(?:\[[^\]]*\]\s*)|(?:[^/\n]*，说：\s*))*/nai\s+反推路径(?:\s+(?P<path>\S+))?\s*$",
+    )
+    async def handle_nai_retag_path_command(
+        self,
+        stream_id: str = "",
+        user_id: str = "",
+        matched_groups: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[bool, str | None, bool]:
+        """处理 `/nai 反推路径 [值]`。"""
+        del kwargs
+        path_value = str((matched_groups or {}).get("path", "") or "").strip()
         return await self._background_tasks.run(
-            lambda: self._run_retag(stream_id=stream_id, user_id=user_id),
-            name="nai-retag-foreground",
+            lambda: self._run_retag_path_switch(
+                stream_id=stream_id,
+                user_id=user_id,
+                path_value=path_value,
+            ),
+            name="nai-retag-path-foreground",
         )
 
     @Command(
@@ -1300,7 +1515,9 @@ class NaiPicPlugin(MaiBotPlugin):
         # vibe/ref 后面可接 CJK 后缀（存/图库/删/选），
         # 所以用 ``(?:\b|[一-鿿])`` 覆盖空格后置和中文后缀两种情形，避免 ``vibe存`` 被
         # 通用命令吞掉（vibe\b 在 latin→CJK 边界不成立）
-        pattern=r"^(?:.*，说：\s*)?/nai(?:\s+|(?=随机(?:自拍)?(?:\s|$)))(?!on$|off$|st$|sp$|set\b|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|planner\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
+        # 反推同理：``反推(?:\s|$)`` 在 ``/nai 反推路径 llm`` 上不成立（后面跟的是"路"），
+        # 会被通用画图命令整条吞掉去画图，所以显式把 ``反推路径`` 也排除掉
+        pattern=r"^(?:.*，说：\s*)?/nai(?:\s+|(?=随机(?:自拍)?(?:\s|$)))(?!on$|off$|st$|sp$|set\b|chami\b|签到(?:\s|$)|art\b|size\b|ban\b|unban\b|banlist\b|help\b|pt\s|tag\s|nsfw\b|planner\b|models$|i2i\b|ref(?:\b|[一-鿿])|vibe(?:\b|[一-鿿])|撤回(?:\s|$)|反推路径(?:\s|$)|反推(?:\s|$))(?P<description>[\s\S]+)$",
     )
     async def handle_nai_draw(
         self,

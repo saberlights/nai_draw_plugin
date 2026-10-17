@@ -5,9 +5,14 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from src.common.logger import get_logger
-from src.config.model_configs import TaskConfig
-from src.llm_models.utils_model import LLMOrchestrator
 from src.services import llm_service
+
+from .pinned_task_orchestrator import (
+    PinnedTaskLLMOrchestrator,
+    build_pinned_task_config,
+    coerce_float,
+    coerce_int,
+)
 
 
 logger = get_logger("nai_draw_plugin")
@@ -26,28 +31,6 @@ class LLMTextGenerator(Protocol):
         default_temperature: float,
         default_max_tokens: int,
     ) -> str | None: ...
-
-
-class _PinnedTaskLLMOrchestrator(LLMOrchestrator):
-    """为插件自定义模型固定 TaskConfig，绕过宿主任务名选择。"""
-
-    def __init__(self, task_config: TaskConfig, request_type: str = "") -> None:
-        self._pinned_task_config = task_config
-        super().__init__(task_name="planner", request_type=request_type)
-
-    def _get_task_config_or_raise(self) -> TaskConfig:
-        return self._pinned_task_config
-
-    def _refresh_task_config(self) -> TaskConfig:
-        latest = self._pinned_task_config
-        if latest is not self.model_for_task:
-            self.model_for_task = latest
-        if list(self.model_usage.keys()) != latest.model_list:
-            self.model_usage = {
-                model: self.model_usage.get(model, (0, 0, 0))
-                for model in latest.model_list
-            }
-        return self.model_for_task
 
 
 class MaiBotLLMTextGenerator:
@@ -128,20 +111,15 @@ class MaiBotLLMTextGenerator:
         max_tokens: int,
     ) -> str | None:
         try:
-            raw_models = custom_model.get("model_list", [])
-            model_items = raw_models if isinstance(raw_models, list) else [raw_models]
-            model_list = [str(item).strip() for item in model_items if str(item).strip()]
-            if not model_list:
+            pinned_task = build_pinned_task_config(
+                custom_model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            if pinned_task is None:
                 return None
 
-            pinned_task = TaskConfig(
-                model_list=model_list,
-                max_tokens=self._as_int(custom_model.get("max_tokens"), max_tokens),
-                temperature=self._as_float(custom_model.get("temperature"), temperature),
-                slow_threshold=self._as_float(custom_model.get("slow_threshold"), 30.0),
-                selection_strategy="random",
-            )
-            orchestrator = _PinnedTaskLLMOrchestrator(
+            orchestrator = PinnedTaskLLMOrchestrator(
                 pinned_task,
                 request_type=request_type,
             )
@@ -167,14 +145,8 @@ class MaiBotLLMTextGenerator:
 
     @staticmethod
     def _as_float(value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
+        return coerce_float(value, default)
 
     @staticmethod
     def _as_int(value: Any, default: int) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
+        return coerce_int(value, default)

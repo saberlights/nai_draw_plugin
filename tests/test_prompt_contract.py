@@ -17,12 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from plugins.nai_draw_plugin import plugin as plugin_module
 from plugins.nai_draw_plugin.core.rules.prompt_rules import (
     INTERACTION_BINDING_RULES,
+    PROMPT_CHANNELS,
     PROMPT_GENERATOR_JSON_TEMPLATE,
     PROMPT_GENERATOR_TEMPLATE,
     SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
     SFW_PROMPT_GENERATOR_TEMPLATE,
     SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
     VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
+    resolve_prompt_generator_template,
 )
 from plugins.nai_draw_plugin.core.services.visual_continuity import (
     _interaction_binding_failure,
@@ -34,6 +36,7 @@ from plugins.nai_draw_plugin.core.utils.prompt_output_parser import (
 )
 
 
+# 纯 tag 档（V4.5 及更早）
 ALL_TEMPLATES = {
     "text_sfw": SFW_PROMPT_GENERATOR_TEMPLATE,
     "text_nsfw": PROMPT_GENERATOR_TEMPLATE,
@@ -42,6 +45,29 @@ ALL_TEMPLATES = {
     "continuity_sfw": SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
     "continuity_nsfw": VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
 }
+
+# 自然语言档（V5）。同一批契约断言必须对它一并成立——V5 放行的只是自然语言，
+# rating 首 tag、绑定协议、按通道裁剪这些硬约束一条都不能因为换档而消失。
+V5_TEMPLATES = {
+    f"{channel}_{'sfw' if sfw else 'nsfw'}_v5": resolve_prompt_generator_template(
+        channel=channel, sfw=sfw, natural_language=True
+    )
+    for channel in PROMPT_CHANNELS
+    for sfw in (True, False)
+}
+
+ALL_TEMPLATES.update(V5_TEMPLATES)
+
+
+def _names(channel: str) -> tuple[str, ...]:
+    """某个输出通道下的全部模板名（SFW/NSFW × 纯 tag/自然语言）。
+
+    按通道裁剪的断言必须覆盖同通道的每一档，否则新增一档就能绕过闸门。
+    """
+
+    matched = tuple(name for name in ALL_TEMPLATES if name.startswith(f"{channel}_"))
+    assert matched, f"通道 {channel} 没有匹配到任何模板，命名约定可能已改"
+    return matched
 
 
 # ==================== 示例必须通过程序自己的绑定校验 ====================
@@ -175,7 +201,7 @@ def test_v3_shape_examples_round_trip_through_the_real_parser() -> None:
     """JSON 路径的形状示例必须能被 parse_prompt_from_structured_output 渲染出提示词。"""
 
     checked = 0
-    for name in ("json_sfw", "json_nsfw"):
+    for name in _names("json"):
         for raw, parsed in _extract_json_objects(ALL_TEMPLATES[name]):
             if parsed.get("version") != 3:
                 continue
@@ -194,7 +220,7 @@ def test_v4_shape_examples_pass_the_real_continuity_resolver() -> None:
     """连续性路径的形状示例必须能过 resolve，且 keep 示例要真的复用上一帧缓存。"""
 
     checked = 0
-    for name in ("continuity_sfw", "continuity_nsfw"):
+    for name in _names("continuity"):
         previous = None
         examples = [
             (raw, parsed)
@@ -228,19 +254,19 @@ def test_text_format_block_only_reaches_the_text_channel() -> None:
     """JSON 路径由程序渲染 charN 行，喂文本格式块会诱导 LLM 直接吐 charN 文本。"""
 
     text_fence = "char1:[人物1 tag],"
-    for name in ("text_sfw", "text_nsfw"):
+    for name in _names("text"):
         assert text_fence in ALL_TEMPLATES[name], f"{name} 丢失文本输出格式块"
-    for name in ("json_sfw", "json_nsfw", "continuity_sfw", "continuity_nsfw"):
+    for name in _names("json") + _names("continuity"):
         assert text_fence not in ALL_TEMPLATES[name], f"{name} 仍在教 LLM 直接输出 charN 文本"
 
 
 def test_positions_rules_only_reach_json_channels() -> None:
     """positions 只有 JSON 通道能承载（文本反解路径 has_coords 恒为 False）。"""
 
-    for name in ("json_sfw", "json_nsfw", "continuity_sfw", "continuity_nsfw"):
+    for name in _names("json") + _names("continuity"):
         assert "多人坐标（positions，可选）" in ALL_TEMPLATES[name], f"{name} 丢失坐标规则"
         assert "元素只能是 `[A-E][1-5]` 字符串字面量" in ALL_TEMPLATES[name]
-    for name in ("text_sfw", "text_nsfw"):
+    for name in _names("text"):
         assert "多人坐标（positions，可选）" not in ALL_TEMPLATES[name], (
             f"{name} 是文本通道，positions 永远不会被解析"
         )
@@ -251,11 +277,11 @@ def test_outfit_quota_and_continuity_rule_never_coexist() -> None:
 
     one_shot = "适度：默认 1-2 个关键服装词"
     continuity = "首次建立时必须输出完整、具体、可见的整套穿搭"
-    for name in ("text_sfw", "text_nsfw", "json_sfw", "json_nsfw"):
+    for name in _names("text") + _names("json"):
         template = ALL_TEMPLATES[name]
         assert one_shot in template, f"{name} 丢失一次性出图的服装配额"
         assert continuity not in template
-    for name in ("continuity_sfw", "continuity_nsfw"):
+    for name in _names("continuity"):
         template = ALL_TEMPLATES[name]
         assert continuity in template, f"{name} 丢失稳定区完整穿搭要求"
         assert one_shot not in template, f"{name} 仍带互相矛盾的一次性配额"
@@ -391,6 +417,12 @@ TEMPLATE_SIZE_CEILINGS = {
     "json_nsfw": 20_230,
     "continuity_sfw": 20_600,
     "continuity_nsfw": 23_590,
+    "text_sfw_v5": 16_520,
+    "text_nsfw_v5": 19_510,
+    "json_sfw_v5": 18_680,
+    "json_nsfw_v5": 21_680,
+    "continuity_sfw_v5": 22_110,
+    "continuity_nsfw_v5": 25_100,
 }
 
 PLANNER_TEXT_CEILING = 9_385

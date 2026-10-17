@@ -13,11 +13,12 @@
 ``-0.8::feet::, rating:general``，Furry V3 只用花括号语法），Curated 的数据集也更小，
 适用的画师串不一样。共用一个配置节就没法分别配画师预设。
 
-字段依据分三类，改这张表时请保持标注：
+字段依据分四类，改这张表时请保持标注：
 - 【已核实】能在 docs.novelai.net 或官方公告里找到原文依据
 - 【沿用现状】不改变本插件既有行为，仅从常量搬到这里
 - 【网关相关】取决于 NewAPI 兼容网关的实现，公开文档未定义，仅作 WebUI 候选项用，
   不做请求前拦截（避免用一张没核实的白名单把合法请求拦下）
+- 【实测经验】官方文档没有逐条给出配方，来自本项目实际出图对比得到的结论
 """
 from typing import Dict, NamedTuple, Optional, Tuple
 
@@ -92,6 +93,11 @@ class ModelSpec(NamedTuple):
     # appears in the prompt, the stronger its effect"（/image/tags/），所以 V3 及更早
     # 的质量词要放在 prompt 末尾
     quality_tags_at_end: bool
+    # 【实测经验】V5 对英文自然语言从句的理解明显强于 V4.5：主体归属、接触点、
+    # 前后遮挡这类 tag 之间说不清的关系，写成一句自然语言比拆成几个孤立 tag 更准。
+    # V4.5 及更早仍是纯 tag 模型，喂长句只会稀释每个 tag 的权重，所以这个开关只对
+    # V5 打开——它控制的是提示词生成模板要不要放行自然语言，不是请求字段。
+    natural_language_prompt: bool
 
     # ---- 官方推荐默认值 ----
     # 【已核实】/image/qualitytags/ 逐模型给出的质量词配方。V5 官方尚未公布配方，留空。
@@ -117,6 +123,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=True,
         negative_numeric_emphasis=True,
         quality_tags_at_end=False,
+        natural_language_prompt=True,
         default_quality_tags="",
         default_guidance=5.0,
         default_steps=28,
@@ -135,6 +142,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=True,
         negative_numeric_emphasis=True,
         quality_tags_at_end=False,
+        natural_language_prompt=True,
         default_quality_tags="",
         default_guidance=5.0,
         default_steps=28,
@@ -153,6 +161,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=True,
         negative_numeric_emphasis=True,
         quality_tags_at_end=False,
+        natural_language_prompt=False,
         default_quality_tags="location, very aesthetic, masterpiece, no text",
         default_guidance=5.0,
         default_steps=28,
@@ -171,6 +180,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=True,
         negative_numeric_emphasis=True,
         quality_tags_at_end=False,
+        natural_language_prompt=False,
         default_quality_tags="location, masterpiece, no text, -0.8::feet::, rating:general",
         default_guidance=5.0,
         default_steps=28,
@@ -189,6 +199,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=True,
         negative_numeric_emphasis=False,
         quality_tags_at_end=False,
+        natural_language_prompt=False,
         default_quality_tags="no text, best quality, very aesthetic, absurdres",
         default_guidance=5.0,
         default_steps=28,
@@ -207,6 +218,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=True,
         negative_numeric_emphasis=False,
         quality_tags_at_end=False,
+        natural_language_prompt=False,
         default_quality_tags="rating:general, amazing quality, very aesthetic, absurdres",
         default_guidance=5.0,
         default_steps=28,
@@ -225,6 +237,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=False,
         negative_numeric_emphasis=False,
         quality_tags_at_end=True,
+        natural_language_prompt=False,
         default_quality_tags="best quality, amazing quality, very aesthetic, absurdres",
         default_guidance=3.5,
         default_steps=25,
@@ -243,6 +256,7 @@ MODEL_SPECS: Tuple[ModelSpec, ...] = (
         numeric_emphasis=False,
         negative_numeric_emphasis=False,
         quality_tags_at_end=True,
+        natural_language_prompt=False,
         default_quality_tags="{best quality}, {amazing quality}",
         default_guidance=3.5,
         default_steps=25,
@@ -265,6 +279,7 @@ _UNKNOWN_MODEL = ModelSpec(
     numeric_emphasis=False,
     negative_numeric_emphasis=False,
     quality_tags_at_end=False,
+    natural_language_prompt=False,
     default_quality_tags="",
     default_guidance=5.0,
     default_steps=28,
@@ -359,3 +374,8 @@ def supports_vibe_transfer(model_name: str) -> bool:
 def supports_smea(model_name: str) -> bool:
     """是否还提供 SMEA 类增强（仅 V3 及更早；V4 起该字段无效）。"""
     return resolve_spec(model_name).smea
+
+
+def supports_natural_language_prompt(model_name: str) -> bool:
+    """提示词是否可以在标准 Danbooru tag 之上混写英文自然语言（仅 V5）。"""
+    return resolve_spec(model_name).natural_language_prompt

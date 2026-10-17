@@ -352,6 +352,9 @@ class NaiInvocation(ModelConfigMixin):
             show_tag_candidates=self._is_tag_retriever_show_enabled(),
             log_prefix=self.log_prefix,
             force_sfw=self._force_group_planner_sfw,
+            # 提示词模板要按模型分档（V5 放行自然语言），这里解析的是与 _get_model_config
+            # 同一个会话选定模型，避免"按 V4.5 写提示词、按 V5 发请求"的错位
+            model_name=self._resolve_active_model_name(),
         )
         random_scene_config = self.get_config("random_scene", {})
         self._random_scene_planner = RandomScenePlanner(
@@ -2367,9 +2370,13 @@ class NaiInvocation(ModelConfigMixin):
             return True, "显示帮助信息", True
 
         is_admin = session_state.is_admin_user(user_id, self.get_config)
-        if action in {"st", "sp", "set", "ban", "unban", "banlist"} and not is_admin:
+        if action in {"st", "sp", "set", "chami", "签到", "ban", "unban", "banlist"} and not is_admin:
             if action == "set":
                 await self.send_text("❌ 只有管理员可以切换生图模型", storage_message=False)
+            elif action == "chami":
+                await self.send_text("❌ 只有管理员可以切换生图后端", storage_message=False)
+            elif action == "签到":
+                await self.send_text("❌ 只有管理员可以执行 Chami 签到", storage_message=False)
             elif action in {"ban", "unban", "banlist"}:
                 await self.send_text("❌ 只有管理员可以管理黑名单", storage_message=False)
             else:
@@ -2396,6 +2403,28 @@ class NaiInvocation(ModelConfigMixin):
                 "🔓 现在所有人都可使用 NAI 命令"
             )
             return True, "管理员模式已关闭", True
+
+        if action == "签到":
+            username = self.get_config("model.chami_web_username", "")
+            password = self.get_config("model.chami_web_password", "")
+            proxy_mode = self.get_config("model.nai_proxy_mode", "auto")
+            timeout = self.get_config("model.nai_request_timeout", 30.0)
+            success, message = await self.api_client.chami_sign_in(
+                username,
+                password,
+                proxy_mode=proxy_mode,
+                request_timeout=min(float(timeout), 60.0),
+            )
+            prefix = "✅" if success else "❌"
+            await self.send_text(f"{prefix} Chami {message}", storage_message=False)
+            return success, message, True
+
+        if action == "chami":
+            current_backend = session_state.get_selected_backend(platform, chat_id) or "newapi"
+            backend = "newapi" if current_backend == "chami" else "chami"
+            session_state.set_selected_backend(platform, chat_id, backend)
+            await self.send_text(f"✅ 已切换到生图后端: {backend}")
+            return True, f"已切换到生图后端 {backend}", True
 
         # 模型代号映射与展示文案统一取自模型注册表，避免"加了模型忘记改帮助文案"
         model_mappings = dict(ALIAS_TO_MODEL_ID)

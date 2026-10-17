@@ -45,6 +45,7 @@ from plugins.nai_draw_plugin.core.model_capabilities import (
     spec_for_section,
     supports_character_reference,
     supports_multi_character,
+    supports_natural_language_prompt,
     supports_smea,
     supports_vibe_transfer,
 )
@@ -176,6 +177,26 @@ def test_v3_质量词放末尾() -> None:
     assert resolve_spec("nai-diffusion-3").quality_tags_at_end is True
     assert resolve_spec("nai-diffusion-3-furry").quality_tags_at_end is True
     assert resolve_spec("nai-diffusion-4-full").quality_tags_at_end is False
+
+
+def test_自然语言提示词仅_v5() -> None:
+    """V5 能吃自然语言从句，V4.5 及更早喂长句只会稀释每个 tag 的权重。
+
+    这个开关决定提示词生成模板发哪一档规则，放宽到 V4.5 会直接让老模型出图变糊。
+    """
+    capable = {spec.model_id for spec in MODEL_SPECS if spec.natural_language_prompt}
+    assert capable == {"nai-diffusion-5-full", "nai-diffusion-5-curated"}
+    assert supports_natural_language_prompt("nai-diffusion-5-full") is True
+    assert supports_natural_language_prompt("nai-diffusion-5-curated") is True
+    assert supports_natural_language_prompt("nai-diffusion-4-5-full") is False
+    assert supports_natural_language_prompt("nai-diffusion-4-full") is False
+    assert supports_natural_language_prompt("nai-diffusion-3") is False
+    # 裸版本名与大小写都要能命中，否则 /nai set 5 之后规则悄悄掉档
+    assert supports_natural_language_prompt("nai-diffusion-5") is True
+    assert supports_natural_language_prompt("NAI-Diffusion-5-Curated") is True
+    # 未知模型按保守档处理：宁可少发规则，也不给老模型灌自然语言
+    assert supports_natural_language_prompt("brand-new-model") is False
+    assert supports_natural_language_prompt("") is False
 
 
 def test_unknown_model_denies_new_capabilities_but_keeps_vibe() -> None:

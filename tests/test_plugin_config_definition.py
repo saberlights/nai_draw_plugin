@@ -194,7 +194,8 @@ def test_webui_uses_password_controls_only_for_secret_fields() -> None:
         for field_name, field in section["fields"].items()
         if not field["hidden"] and field["ui_type"] == "password"
     }
-    assert password_fields == {"model.api_key"}
+    assert password_fields == {"model.api_key", "model.chami_api_key", "model.chami_web_password"}
+    assert webui["sections"]["model"]["fields"]["chami_web_username"]["ui_type"] == "text"
     assert webui["sections"]["model"]["fields"]["nai_max_tokens"]["ui_type"] == "number"
     assert webui["sections"]["prompt_generator"]["fields"]["max_tokens"]["ui_type"] == "number"
 

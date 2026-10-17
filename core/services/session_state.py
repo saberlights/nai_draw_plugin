@@ -11,6 +11,7 @@
 - NSFW过滤
 - 提示词显示
 - Danbooru 检索结果显示
+- 反推路径
 
 替代原来分散在各个 Command 类中的状态字典
 """
@@ -23,6 +24,7 @@ from .transient_generation_state import TransientGenerationState
 from .visual_continuity import StableVisualTags
 from .visual_continuity_store import visual_continuity_store
 from ..model_capabilities import resolve_config_section
+from ..retag.reverser import PATH_AUTO, normalize_path as normalize_retag_path
 
 logger = get_logger("nai_draw_plugin")
 
@@ -149,6 +151,18 @@ class SessionStateManager:
         key = self._make_key(platform, chat_id)
         self._preferences.update(key, selected_model=model)
         logger.info(f"[nai_pic] 会话 {key} 已切换模型: {model}")
+
+    def get_selected_backend(self, platform: str, chat_id: str) -> Optional[str]:
+        """获取指定会话选定的生图后端。"""
+        key = self._make_key(platform, chat_id)
+        preference = self._preferences.get(key)
+        return preference.selected_backend if preference is not None else None
+
+    def set_selected_backend(self, platform: str, chat_id: str, backend: str) -> None:
+        """设置指定会话的生图后端。"""
+        key = self._make_key(platform, chat_id)
+        self._preferences.update(key, selected_backend=backend)
+        logger.info(f"[nai_pic] 会话 {key} 已切换生图后端: {backend}")
 
     # ==================== 画师串选择 ====================
 
@@ -480,6 +494,34 @@ class SessionStateManager:
         key = self._make_key(platform, chat_id)
         self._preferences.update(key, character_reference_type=normalized)
         logger.info(f"[nai_pic] 会话 {key} 角色参考类型已切换: {normalized}")
+
+    # ==================== 反推路径 ====================
+
+    def get_retag_path(
+        self,
+        platform: str,
+        chat_id: str,
+        get_config: Callable,
+    ) -> str:
+        """读取本会话粘性选定的反推路径，未选过则回退 ``[retag].default_path``。"""
+        key = self._make_key(platform, chat_id)
+        preference = self._preferences.get(key)
+        if preference is not None and preference.retag_path is not None:
+            return preference.retag_path
+        # 配置里写了非法值时不要静默吞掉：让它抛出来，用户才知道自己的 default_path 打错了
+        return normalize_retag_path(get_config("retag.default_path", PATH_AUTO))
+
+    def set_retag_path(self, platform: str, chat_id: str, path_value: str) -> str:
+        """设置本会话的反推路径；非法值 raises ValueError。
+
+        Returns:
+            归一化后实际写入的路径标识
+        """
+        normalized = normalize_retag_path(path_value)
+        key = self._make_key(platform, chat_id)
+        self._preferences.update(key, retag_path=normalized)
+        logger.info(f"[nai_pic] 会话 {key} 反推路径已切换: {normalized}")
+        return normalized
 
     # ==================== 调试/管理 ====================
 

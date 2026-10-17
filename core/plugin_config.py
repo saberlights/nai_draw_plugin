@@ -21,6 +21,7 @@ from .model_capabilities import (
     resolve_config_section,
     spec_for_section,
 )
+from .retag.reverser import REVERSE_PATHS
 
 
 def _merge_config_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -52,9 +53,10 @@ _WEBUI_TEXTAREA_FIELDS = {
     "nai_artist_prompt",
     "filter_tags",
     "prompt_template",
+    "llm_prompt_template",
     "system_prompt",
 }
-_WEBUI_PASSWORD_FIELDS = {"api_key"}
+_WEBUI_PASSWORD_FIELDS = {"api_key", "chami_api_key", "chami_web_password"}
 _WEBUI_SAMPLER_CHOICES = list(SAMPLERS)
 # noise_schedule 故意**不做** select：它的"留空 = 不发送该字段、让网关取默认"是一个有效
 # 且用户需要能切回去的状态，而 Dashboard 的 Select 基于 Radix，SelectItem 不接受空字符串
@@ -151,6 +153,11 @@ _WEBUI_FIELD_OVERRIDES: dict[str, dict[str, Any]] = {
     "tag_retriever.min_score": _WEBUI_SLIDER_0_1,
     "retag.wd14_threshold": _WEBUI_SLIDER_0_1,
     "retag.wd14_character_threshold": _WEBUI_SLIDER_0_1,
+    "retag.default_path": {
+        "input_type": "select",
+        "ui_type": "select",
+        "choices": list(REVERSE_PATHS),
+    },
     "i2i.strength": {
         **_WEBUI_SLIDER_0_1,
         "min": 0.01,
@@ -803,7 +810,7 @@ class PluginConfigDefinition:
     """以一个 Schema 驱动默认值、WebUI 和带注释 TOML 的深配置 Module。"""
 
     plugin_name = "nai_draw_plugin"
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     plugin_author = "saberlight"
     # 配置文件顶部说明，渲染时挂在所有 section 之前（写 config.toml 时按行加 # 前缀）。
     config_file_header = (
@@ -865,8 +872,12 @@ class PluginConfigDefinition:
         "components": "========== 功能开关 ==========",
         "retag": (
             "========== 图片反推（/nai 反推） ==========\n"
-            "PNG 元数据可命中 → 直接读 prompt；不可命中 → 用 WD14 在线 Space 兜底（需安装 gradio_client）。\n"
-            "只输出正向 prompt，不返回负面。"
+            "四条路径，default_path 决定默认走哪条，会话内可用 /nai 反推路径 <值> 切换：\n"
+            "  auto  PNG 元数据可命中 → 直接读 prompt；不可命中 → WD14 在线 Space 兜底\n"
+            "  meta  只读 PNG 元数据，完全不联网\n"
+            "  wd14  只走 WD14 在线 Space（需安装 gradio_client）\n"
+            "  llm   视觉模型反推，产出英文自然语言描述，适配 V5\n"
+            "tag 类路径只输出正向 prompt，不返回负面。"
         ),
         "i2i": (
             "========== 图生图参数（/nai i2i / vibe / ref） ==========\n"
@@ -948,7 +959,7 @@ class PluginConfigDefinition:
         {
             "id": "retrieval",
             "title": "检索与反推",
-            "sections": ["tag_retriever", "retag"],
+            "sections": ["tag_retriever", "retag", "retag.llm_custom_model"],
         },
     ]
     config_webui_nested_sections = {
@@ -964,6 +975,13 @@ class PluginConfigDefinition:
             "source_field": "custom_model",
             "title": "随机场景自定义模型",
             "description": "覆盖随机场景生成使用的模型列表与生成参数；留空模型列表时继承提示词生成配置。",
+            "field_descriptions": _WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS,
+        },
+        "retag.llm_custom_model": {
+            "source_section": "retag",
+            "source_field": "llm_custom_model",
+            "title": "反推自定义视觉模型",
+            "description": "覆盖 llm 反推路径使用的模型列表与生成参数；模型必须支持读图，留空时使用 llm_model_name 指定的宿主任务。",
             "field_descriptions": _WEBUI_CUSTOM_MODEL_FIELD_DESCRIPTIONS,
         },
     }
@@ -995,7 +1013,7 @@ class PluginConfigDefinition:
             ),
             "config_version": ConfigField(
                 type=str,
-                default="2.0.0",
+                default="2.1.0",
                 description="插件配置版本号；由插件自行维护，请勿手动修改"
             ),
             "enabled": ConfigField(
@@ -1046,6 +1064,24 @@ class PluginConfigDefinition:
                 type=str,
                 default="",
                 description="NewAPI 鉴权密钥；可填以 sk- 开头的 OpenAI 风格 Bearer Token，由服务提供方给出",
+                required=False
+            ),
+            "chami_api_key": ConfigField(
+                type=str,
+                default="",
+                description="Chami 组合 API Key；填写 16 位用户 API Key + 内部 NAI Key，作为 Bearer Token 发送",
+                required=False
+            ),
+            "chami_web_username": ConfigField(
+                type=str,
+                default="",
+                description="Chami 网页签到用户名或邮箱；仅 /nai 签到时使用",
+                required=False
+            ),
+            "chami_web_password": ConfigField(
+                type=str,
+                default="",
+                description="Chami 网页签到密码；仅 /nai 签到时使用",
                 required=False
             ),
             "available_models": ConfigField(
@@ -1341,6 +1377,11 @@ class PluginConfigDefinition:
                 default=True,
                 description="是否启用 /nai 反推 命令；可填 true / false；PNG 元数据命中走元数据，否则用 WD14 兜底，只输出正向 prompt"
             ),
+            "default_path": ConfigField(
+                type=str,
+                default="auto",
+                description="反推默认走哪条路径；可填 auto / meta / wd14 / llm；auto=元数据→WD14 兜底，meta=只读元数据不联网，wd14=只走在线 Space，llm=视觉模型出英文自然语言描述；会话内可用 /nai 反推路径 <值> 临时切换"
+            ),
             "cache_ttl_seconds": ConfigField(
                 type=int,
                 default=3600,
@@ -1411,6 +1452,46 @@ class PluginConfigDefinition:
                     },
                 ],
                 description="可并发轮询的 HF Space 列表；填 [{name, type, api}] 数组；name 是 HF Space 全名，type 决定 payload 结构，api 是 Space 入口"
+            ),
+            "llm_enabled": ConfigField(
+                type=bool,
+                default=True,
+                description="是否启用 llm 反推路径；可填 true / false；关闭后 /nai 反推 llm 直接报错，不会悄悄回落到 WD14"
+            ),
+            "llm_model_name": ConfigField(
+                type=str,
+                default="",
+                description="llm 反推使用的宿主模型任务名；可填 model_config 中已定义的任务名，留空则用 vlm 任务；下面配了 llm_custom_model 时本项不生效"
+            ),
+            "llm_max_tokens": ConfigField(
+                type=int,
+                default=3000,
+                description="llm 反推响应的最大 token；可填正整数；反推要求逐件穷尽画面细节，复杂立绘输出常达 600~900 词，填太小会把描述从中间静默截断（截断的半截描述不会报错，会照常发给你）"
+            ),
+            "llm_temperature": ConfigField(
+                type=float,
+                default=0.3,
+                description="llm 反推 LLM 温度；可填非负浮点数；反推是转写任务不是创作，建议 0.2~0.5，太高会开始编画面里没有的东西"
+            ),
+            "llm_timeout": ConfigField(
+                type=float,
+                default=120.0,
+                description="llm 反推单次请求超时；单位秒，可填正数；穷尽描述输出很长，留够余量"
+            ),
+            "llm_prompt_template": ConfigField(
+                type=str,
+                default="",
+                description="自定义反推提示词；可填多行字符串，留空使用内置契约（纯英文自然语言 + 逐件独立成项铁律 + 13 项扫描网格）；填了则整体取代内置契约，输出形态自负其责"
+            ),
+            "llm_custom_model": ConfigField(
+                type=dict,
+                default={
+                    "model_list": [],
+                    "max_tokens": 3000,
+                    "temperature": 0.3,
+                    "slow_threshold": 60.0
+                },
+                description="反推自定义视觉模型配置；填 {model_list, max_tokens, temperature, slow_threshold}；model_list 中的模型名必须在系统 model_config 中已定义且支持读图；留空表示使用上面的 llm_model_name"
             ),
         },
         "i2i": {

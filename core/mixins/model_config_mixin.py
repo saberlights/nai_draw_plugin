@@ -96,6 +96,8 @@ class ModelConfigMixin:
 
         platform, chat_id, _ = self._get_chat_identity()
 
+        selected_backend = session_state.get_selected_backend(platform, chat_id)
+
         # 获取模型名称（优先使用会话选择）
         model_name = self._resolve_active_model_name()
 
@@ -105,6 +107,8 @@ class ModelConfigMixin:
 
         # 合并配置：连接层 → 共享默认 → 模型专属
         merged_config = dict(base_config)
+        if selected_backend:
+            merged_config["backend"] = selected_backend
         if model_name:
             merged_config["default_model"] = model_name
 

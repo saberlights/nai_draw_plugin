@@ -9,15 +9,11 @@ from typing import Any, Protocol
 
 from src.common.logger import get_logger
 
+from ..model_capabilities import supports_natural_language_prompt
 from ..rules.prompt_rules import (
     INTERACTION_BINDING_RULES,
-    PROMPT_GENERATOR_JSON_TEMPLATE,
-    PROMPT_GENERATOR_TEMPLATE,
-    SFW_PROMPT_GENERATOR_JSON_TEMPLATE,
-    SFW_PROMPT_GENERATOR_TEMPLATE,
-    SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
-    VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION,
-    VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE,
+    resolve_prompt_generator_template,
+    resolve_visual_continuity_output_instruction,
 )
 from ..rules.selfie_rules import (
     detect_explicit_image_request,
@@ -73,6 +69,7 @@ class PromptGenerationWorkflow:
         show_tag_candidates: bool,
         log_prefix: str,
         force_sfw: bool = False,
+        model_name: str = "",
     ) -> None:
         self._config = config
         self._stream_id = stream_id
@@ -81,6 +78,8 @@ class PromptGenerationWorkflow:
         self._show_tag_candidates = show_tag_candidates
         self._log_prefix = log_prefix
         self._force_sfw = bool(force_sfw)
+        # 本次调用实际生效的模型名；决定提示词模板发纯 tag 档还是自然语言档
+        self._model_name = str(model_name or "")
 
     async def generate(
         self,
@@ -109,24 +108,19 @@ class PromptGenerationWorkflow:
             self._stream_id,
             self._get_config,
         )
+        # V5 能吃自然语言，V4.5 及更早只能吃纯 tag；模板按当前模型分档发放
+        natural_language = supports_natural_language_prompt(self._model_name)
         if use_visual_continuity:
-            default_template = (
-                SFW_VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE
-                if nsfw_filter_enabled
-                else VISUAL_CONTINUITY_PROMPT_GENERATOR_TEMPLATE
-            )
+            channel = "continuity"
         elif output_format == "json":
-            default_template = (
-                SFW_PROMPT_GENERATOR_JSON_TEMPLATE
-                if nsfw_filter_enabled
-                else PROMPT_GENERATOR_JSON_TEMPLATE
-            )
+            channel = "json"
         else:
-            default_template = (
-                SFW_PROMPT_GENERATOR_TEMPLATE
-                if nsfw_filter_enabled
-                else PROMPT_GENERATOR_TEMPLATE
-            )
+            channel = "text"
+        default_template = resolve_prompt_generator_template(
+            channel=channel,
+            sfw=nsfw_filter_enabled,
+            natural_language=natural_language,
+        )
 
         previous_prompt = ""
         previous_request = ""
@@ -167,7 +161,7 @@ class PromptGenerationWorkflow:
             prompt_template = (
                 f"{custom_template}\n\n{INTERACTION_BINDING_RULES}\n\n"
                 f"<<VISUAL_CONTINUITY_CONTEXT>>\n\n"
-                f"{VISUAL_CONTINUITY_JSON_OUTPUT_INSTRUCTION}"
+                f"{resolve_visual_continuity_output_instruction(natural_language)}"
             )
         else:
             prompt_template = custom_template or default_template

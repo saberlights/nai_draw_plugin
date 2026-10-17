@@ -343,3 +343,84 @@ def test_generic_nai0_pattern_skips_vibe_and_ref_subcommands() -> None:
         assert nai0.match(sample) is None, f"通用 /nai0 不应吞掉 {sample!r}"
     # 但正常 /nai0 <英文 tags> 仍需匹配
     assert nai0.match("/nai0 1girl, hatsune miku, smile") is not None
+
+
+# ── 反推路径命令 pattern ─────────────────────────────────────────────────
+
+
+def test_retag_command_captures_optional_path_argument() -> None:
+    """`/nai 反推 <路径>` 的单次覆盖参数要能被解析出来。"""
+    patterns = _load_command_patterns()
+    regex = _compile(patterns["nai_retag_command"])
+
+    for sample, expected in [
+        ("/nai 反推", None),
+        ("/nai 反推 auto", "auto"),
+        ("/nai 反推 meta", "meta"),
+        ("/nai 反推 wd14", "wd14"),
+        ("/nai 反推 llm", "llm"),
+    ]:
+        match = regex.match(sample)
+        assert match is not None, f"nai_retag_command 应匹配 {sample!r}"
+        assert match.group("path") == expected, f"{sample!r} 的 path 解析错误"
+
+
+def test_retag_command_ignores_non_path_trailing_text() -> None:
+    """历史行为：`/nai 反推 这张图` 这类口语尾巴照旧忽略，不当成非法路径。"""
+    patterns = _load_command_patterns()
+    match = _compile(patterns["nai_retag_command"]).match("/nai 反推 这张图")
+
+    assert match is not None
+    assert match.group("path") is None
+
+
+def test_retag_path_command_matches_query_and_switch() -> None:
+    patterns = _load_command_patterns()
+    regex = _compile(patterns["nai_retag_path_command"])
+
+    query = regex.match("/nai 反推路径")
+    assert query is not None
+    assert query.group("path") is None
+
+    switch = regex.match("/nai 反推路径 llm")
+    assert switch is not None
+    assert switch.group("path") == "llm"
+
+
+def test_retag_path_command_forwards_illegal_value_for_business_validation() -> None:
+    """非法值要匹配进命令、由业务层给出"可选值"提示，而不是 pattern 直接不认。"""
+    patterns = _load_command_patterns()
+    match = _compile(patterns["nai_retag_path_command"]).match("/nai 反推路径 vlm")
+
+    assert match is not None
+    assert match.group("path") == "vlm"
+
+
+def test_retag_path_command_is_not_swallowed_by_other_commands() -> None:
+    """回归点：`反推(?:\\s|$)` 在 `/nai 反推路径 llm` 上不成立（后面跟的是"路"）。
+
+    修之前，通用画图命令的负向预查放行这条消息，`/nai 反推路径 llm` 会被当成
+    "画一张 反推路径 llm" 送去出图；反推命令自身的尾随通配也会把它吃成一次反推。
+    """
+    patterns = _load_command_patterns()
+
+    assert _matching_command_names(patterns, "/nai 反推路径 llm") == ["nai_retag_path_command"]
+    assert _matching_command_names(patterns, "/nai 反推路径") == ["nai_retag_path_command"]
+
+
+def test_retag_command_still_owns_plain_retag() -> None:
+    patterns = _load_command_patterns()
+
+    assert _matching_command_names(patterns, "/nai 反推") == ["nai_retag_command"]
+    assert _matching_command_names(patterns, "/nai 反推 llm") == ["nai_retag_command"]
+
+
+def test_chami_checkin_command_matches_and_generic_draw_skips_it() -> None:
+    patterns = _load_command_patterns()
+    admin = _compile(patterns["nai_admin_control_command"])
+    generic = _compile(patterns["nai_draw"])
+
+    match = admin.match("/nai 签到")
+    assert match is not None
+    assert match.group("action") == "签到"
+    assert generic.match("/nai 签到") is None

@@ -47,6 +47,89 @@ def test_prompt_merge_keeps_rating_before_configured_prefixes() -> None:
     assert prompt == "rating:general, best quality, artist:example, solo, 1girl, smile"
 
 
+def test_chami_request_maps_internal_model_name() -> None:
+    body = NaiWebClient._build_chami_request_body(
+        "1girl",
+        "nai-diffusion-4-5-full",
+        {"size": [832, 1216], "scale": 5.0, "sampler": "k_euler", "steps": 28},
+    )
+
+    assert body["model"] == "nai-diffusion-4-5-full"
+
+
+def test_chami_request_keeps_newapi_sampler_name() -> None:
+    body = NaiWebClient._build_chami_request_body(
+        "1girl",
+        "novelai-v3",
+        {
+            "size": [832, 1216],
+            "scale": 5.0,
+            "sampler": "k_euler_ancestral",
+            "steps": 28,
+        },
+    )
+
+    assert body["parameters"]["sampler"] == "k_euler_ancestral"
+
+
+def test_build_chami_request_body_reuses_existing_inner_parameters() -> None:
+    body = NaiWebClient._build_chami_request_body(
+        "1girl, best quality",
+        "novelai-v3",
+        {
+            "size": [832, 1216],
+            "scale": 5.5,
+            "sampler": "k_dpmpp_2m",
+            "steps": 28,
+            "n_samples": 1,
+            "negative_prompt": "lowres",
+            "seed": 123,
+            "cfg_rescale": 0.18,
+            "qualityToggle": True,
+            "variety_boost": True,
+        },
+    )
+
+    assert body["input"] == "1girl, best quality"
+    assert body["model"] == "novelai-v3"
+    assert body["action"] == "generate"
+    assert body["parameters"]["width"] == 832
+    assert body["parameters"]["height"] == 1216
+    assert body["parameters"]["steps"] == 28
+    assert body["parameters"]["seed"] == 123
+    assert body["parameters"]["skip_cfg_above_sigma"] == 58
+
+
+def test_parse_chami_error_response_preserves_server_message() -> None:
+    response = types.SimpleNamespace(
+        status_code=403,
+        text='{"error":{"message":"invalid combined key"}}',
+        json=lambda: {"error": {"message": "invalid combined key"}},
+    )
+    client = NaiWebClient(log_prefix="test", run_blocking=lambda *_args, **_kwargs: None)
+
+    success, result = client._parse_chami_response(response)
+
+    assert success is False
+    assert result == "HTTP 403: invalid combined key"
+
+
+def test_parse_chami_zip_response_extracts_first_image() -> None:
+    import io
+    import zipfile
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        archive.writestr("image_0.png", b"png-bytes")
+
+    response = types.SimpleNamespace(status_code=200, content=output.getvalue())
+    client = NaiWebClient(log_prefix="test", run_blocking=lambda *_args, **_kwargs: None)
+    success, result = client._parse_chami_response(response)
+
+    assert success is True
+    assert result == "cG5nLWJ5dGVz"
+
+
 def test_http_sessions_are_created_lazily_and_closed_when_initialized(monkeypatch) -> None:
     created: list[tuple[bool, _RecordingSession]] = []
 
@@ -1073,3 +1156,80 @@ def test_request_retry_closes_intermediate_response(monkeypatch) -> None:
     assert response is final
     assert first.close_calls == 1
     assert final.close_calls == 0
+
+
+def test_chami_sign_in_logs_in_and_posts_daily_checkin(monkeypatch) -> None:
+    calls = []
+
+    class _Response:
+        def __init__(self, status_code, url, payload=None):
+            self.status_code = status_code
+            self.url = url
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        trust_env = True
+
+        def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/login"):
+                return _Response(200, "http://chami.yyqzx.com/dashboard")
+            return _Response(200, url, {"status": "success", "message": "已签到"})
+
+        def close(self):
+            calls.append(("closed", {}))
+
+    monkeypatch.setattr(
+        "plugins.nai_draw_plugin.core.clients.nai_web_client.requests.Session",
+        _Session,
+    )
+    success, message = NaiWebClient._perform_chami_sign_in(
+        "demo-user", "demo-password", "direct", 12.0
+    )
+
+    assert (success, message) == (True, "已签到")
+    assert calls[0][0] == "http://chami.yyqzx.com/login"
+    assert calls[0][1]["data"] == {
+        "username_or_email": "demo-user",
+        "password": "demo-password",
+        "real_ip": "",
+    }
+    assert calls[1][0] == "http://chami.yyqzx.com/sign_in"
+    assert calls[1][1]["data"] == {}
+    assert calls[-1][0] == "closed"
+
+
+def test_chami_v3_payload_includes_legacy_negative_prompt_fields() -> None:
+    body = NaiWebClient._build_chami_request_body(
+        "1girl",
+        "nai-diffusion-3-furry",
+        {"size": [832, 1216], "scale": 5.0, "sampler": "k_euler_ancestral", "steps": 28, "negative_prompt": "lowres"},
+    )
+
+    assert body["parameters"]["uc"] == "lowres"
+    assert body["parameters"]["sm"] is False
+    assert body["parameters"]["sm_dyn"] is False
+
+
+def test_chami_v5_uses_same_native_prompt_structure_as_v45() -> None:
+    body = NaiWebClient._build_chami_request_body(
+        "1girl, solo",
+        "nai-diffusion-5-full",
+        {
+            "size": [832, 1216],
+            "scale": 6.0,
+            "sampler": "k_euler_ancestral",
+            "steps": 28,
+            "negative_prompt": "lowres",
+            "noise_schedule": "karras",
+        },
+    )
+
+    assert body["model"] == "nai-diffusion-5-full"
+    assert body["parameters"]["legacy_v3_extend"] is False
+    assert body["parameters"]["legacy_uc"] is False
+    assert body["parameters"]["v4_prompt"]["caption"]["base_caption"] == "1girl, solo"
+    assert body["parameters"]["v4_negative_prompt"]["caption"]["base_caption"] == "lowres"

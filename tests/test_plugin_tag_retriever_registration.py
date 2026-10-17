@@ -202,7 +202,9 @@ def test_refresh_retag_runtime_injects_wd14_runner(monkeypatch: pytest.MonkeyPat
     plugin._reverse_service = types.SimpleNamespace(
         update_wd14_client=lambda client: captured.setdefault("client", client),
         update_wd14_thresholds=lambda **_kwargs: None,
+        update_captioner=lambda captioner: captured.setdefault("captioner", captioner),
     )
+    plugin.plugin_name = "nai_draw_plugin"
     plugin.get_plugin_config_data = lambda: {"retag": {"wd14_enabled": True}}
     captured: dict[str, object] = {}
 
@@ -216,6 +218,38 @@ def test_refresh_retag_runtime_injects_wd14_runner(monkeypatch: pytest.MonkeyPat
 
     assert captured["client"].__class__ is _CapturingWD14Client
     assert captured["kwargs"]["run_blocking"] is run_wd14
+    # llm_enabled 缺省为 True：反推链路必须拿到一个真实 captioner，而不是 None
+    assert isinstance(captured["captioner"], plugin_module.MaiBotImageCaptioner)
+
+
+def test_refresh_retag_runtime_clears_captioner_when_llm_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``llm_enabled = false`` 必须把 captioner 置回 None。
+
+    留着旧实例会让关掉开关后 ``/nai 反推 llm`` 继续照常出图，用户以为关了其实没关。
+    """
+    plugin = object.__new__(NaiPicPlugin)
+    captured: dict[str, object] = {}
+
+    async def run_wd14(function, *args, **kwargs):
+        return function(*args)
+
+    plugin._wd14_io = types.SimpleNamespace(run=run_wd14)
+    plugin._image_cache_service = types.SimpleNamespace(update_config=lambda **_kwargs: None)
+    plugin._reverse_service = types.SimpleNamespace(
+        update_wd14_client=lambda _client: None,
+        update_wd14_thresholds=lambda **_kwargs: None,
+        update_captioner=lambda captioner: captured.__setitem__("captioner", captioner),
+    )
+    plugin.plugin_name = "nai_draw_plugin"
+    plugin.get_plugin_config_data = lambda: {
+        "retag": {"wd14_enabled": False, "llm_enabled": False}
+    }
+
+    plugin._refresh_retag_runtime()
+
+    assert captured["captioner"] is None
 
 
 def test_reply_auto_draw_hook_is_not_exposed() -> None:
@@ -330,13 +364,21 @@ class _BlockingPreflightInvocation(_DummyInvocation):
         return None
 
 
-def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_nai_draw_rejects_global_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin.ctx = types.SimpleNamespace(send=_DummySend())
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
 
     invocation = _DummyInvocation()
+    release = asyncio.Event()
+
+    async def blocking_draw(description: str) -> tuple[bool, str | None, bool]:
+        invocation.draw_calls.append(description)
+        await release.wait()
+        return True, description, True
+
+    invocation.handle_nai_draw = blocking_draw  # type: ignore[method-assign]
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
         return invocation
@@ -352,6 +394,7 @@ def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: py
             stream_id="stream-1",
             matched_groups={"description": "初音未来"},
         )
+        release.set()
         await asyncio.sleep(0)
         await plugin._background_tasks.shutdown()
         return first, second
@@ -359,22 +402,30 @@ def test_handle_nai_draw_allows_multiple_commands_in_same_stream(monkeypatch: py
     first, second = asyncio.run(_run())
 
     assert first == (True, "已开始生成图片", True)
-    assert second == (True, "已开始生成图片", True)
-    assert invocation.draw_calls == ["初音未来", "初音未来"]
+    assert second == (False, "", True)
+    assert invocation.draw_calls == ["初音未来"]
     assert invocation.close_calls == 2
     assert plugin.ctx.send.text_calls == [
         ("收到，正在生成图片，请稍候...", "stream-1", False),
-        ("收到，正在生成图片，请稍候...", "stream-1", False),
+        ("当前已有图片正在生成，请等待完成后再试。", "stream-1", False),
     ]
 
 
-def test_handle_nai0_draw_allows_multiple_commands_in_same_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_nai0_draw_rejects_global_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
     plugin = object.__new__(NaiPicPlugin)
     plugin.ctx = types.SimpleNamespace(send=_DummySend())
     plugin._background_tasks = BackgroundTaskSupervisor(logger=plugin_module.logger)
     plugin._active_invocations = WeakSet()
 
     invocation = _DummyInvocation()
+    release = asyncio.Event()
+
+    async def blocking_nai0(tags: str) -> tuple[bool, str | None, bool]:
+        invocation.nai0_calls.append(tags)
+        await release.wait()
+        return True, tags, True
+
+    invocation.handle_nai0_draw = blocking_nai0  # type: ignore[method-assign]
 
     async def fake_create_invocation(*args: Any, **kwargs: Any) -> _DummyInvocation:
         return invocation
@@ -390,6 +441,7 @@ def test_handle_nai0_draw_allows_multiple_commands_in_same_stream(monkeypatch: p
             stream_id="stream-2",
             matched_groups={"tags": "1girl, hatsune miku"},
         )
+        release.set()
         await asyncio.sleep(0)
         await plugin._background_tasks.shutdown()
         return first, second
@@ -397,12 +449,12 @@ def test_handle_nai0_draw_allows_multiple_commands_in_same_stream(monkeypatch: p
     first, second = asyncio.run(_run())
 
     assert first == (True, "已开始生成图片", True)
-    assert second == (True, "已开始生成图片", True)
-    assert invocation.nai0_calls == ["1girl, hatsune miku", "1girl, hatsune miku"]
+    assert second == (False, "", True)
+    assert invocation.nai0_calls == ["1girl, hatsune miku"]
     assert invocation.close_calls == 2
     assert plugin.ctx.send.text_calls == [
         ("收到，正在生成图片，请稍候...", "stream-2", False),
-        ("收到，正在生成图片，请稍候...", "stream-2", False),
+        ("当前已有图片正在生成，请等待完成后再试。", "stream-2", False),
     ]
 
 
@@ -901,12 +953,13 @@ def test_unload_cancels_retag_before_closing_wd14_runner(
     monkeypatch.setattr(plugin, "_run_retag", blocking_retag)
 
     async def scenario() -> None:
-        task = asyncio.create_task(
-            plugin.handle_nai_retag_command(stream_id="stream-retag", user_id="user-retag")
+        result = await asyncio.wait_for(
+            plugin.handle_nai_retag_command(stream_id="stream-retag", user_id="user-retag"),
+            timeout=0.1,
         )
-        await started.wait()
+        assert result == (True, "已开始反推", True)
+        await asyncio.wait_for(started.wait(), timeout=1)
         await plugin.on_unload()
-        assert task.cancelled()
 
     asyncio.run(scenario())
 
